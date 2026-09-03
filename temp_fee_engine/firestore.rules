@@ -1,0 +1,68 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function profile() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function isOwner() { return signedIn() && (
+      request.auth.token.email == 'jeevanshilporg@gmail.com' || 
+      (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && profile().role == 'Owner')
+    ); }
+    function sameSchool(schoolId) { return signedIn() && (isOwner() || (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && profile().schoolId == schoolId)); }
+    function isAdmin() { return signedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) && profile().role == 'Administrator'; }
+    function isPrincipal() { return signedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) && profile().role == 'Principal'; }
+    function isAccountant() { return signedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) && profile().role == 'Accountant'; }
+    function canAdjustFees() { return signedIn() && (isOwner() || isAdmin() || isAccountant() || (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && profile().customPermissions.adjustFees == true)); }
+
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isOwner());
+      allow write: if isOwner() && request.resource.data.role in ['Teacher', 'Senior Teacher', 'Accountant', 'Principal', 'Administrator'];
+    }
+
+    match /students/{id} {
+      allow read, update, delete: if signedIn() && sameSchool(resource.data.schoolId);
+      allow create: if signedIn() && sameSchool(request.resource.data.schoolId);
+    }
+    match /staff/{id} {
+      allow read: if signedIn() && sameSchool(resource.data.schoolId);
+      allow create: if isOwner() || (signedIn() && (isAdmin() || isPrincipal()) && sameSchool(request.resource.data.schoolId));
+      allow update, delete: if isOwner() || (signedIn() && isAdmin() && sameSchool(resource.data.schoolId));
+    }
+    match /invoices/{id} {
+      allow read: if signedIn() && sameSchool(resource.data.schoolId);
+      allow create: if signedIn() && sameSchool(request.resource.data.schoolId);
+      allow update, delete: if isOwner() || (signedIn() && (isAdmin() || isAccountant()) && sameSchool(resource.data.schoolId));
+    }
+
+    match /fee_adjustments/{id} {
+      allow read: if signedIn() && sameSchool(resource.data.schoolId);
+      allow create: if canAdjustFees() && sameSchool(request.resource.data.schoolId);
+      allow update, delete: if isOwner() || isAdmin();
+    }
+    match /student_ledger/{id} {
+      allow read: if signedIn() && sameSchool(resource.data.schoolId);
+      allow create: if signedIn() && sameSchool(request.resource.data.schoolId);
+      allow update, delete: if isOwner() || (signedIn() && (isAdmin() || isAccountant()) && sameSchool(resource.data.schoolId));
+    }
+    match /attendance_logs/{id} {
+      allow read: if signedIn() && sameSchool(resource.data.schoolId);
+      allow create: if signedIn() && sameSchool(request.resource.data.schoolId);
+    }
+    match /exam_marks/{id} {
+      allow read: if signedIn() && sameSchool(resource.data.schoolId);
+      allow create: if signedIn() && sameSchool(request.resource.data.schoolId);
+    }
+    match /class_assignments/{id} {
+      allow read: if signedIn() && sameSchool(resource.data.schoolId);
+      allow create: if signedIn() && sameSchool(request.resource.data.schoolId);
+      allow update, delete: if signedIn() && (isOwner() || (isAdmin() || isPrincipal())) && sameSchool(resource.data.schoolId);
+    }
+    match /staff_attendance/{id} {
+      allow read: if signedIn() && sameSchool(resource.data.schoolId);
+      allow create: if signedIn() && sameSchool(request.resource.data.schoolId);
+    }
+    match /payroll/{id} {
+      allow read: if signedIn() && (isOwner() || ((isAdmin() || isPrincipal()) && sameSchool(resource.data.schoolId)));
+      allow create: if signedIn() && (isOwner() || ((isAdmin() || isPrincipal()) && sameSchool(request.resource.data.schoolId)));
+    }
+  }
+}

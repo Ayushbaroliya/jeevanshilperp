@@ -1,0 +1,42 @@
+import { initializeApp, deleteApp } from "firebase/app";
+import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut } from "firebase/auth";
+import { getFirestore, enableIndexedDbPersistence } from "firebase/firestore";
+
+const firebaseConfig = {
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY || "AIzaSyADdvQI-awTVAR9i9TWqSB-7iW1FJ1uZig",
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || "jeevanshilporg-51db8.firebaseapp.com",
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || "jeevanshilporg-51db8",
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || "jeevanshilporg-51db8.firebasestorage.app",
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || "671231951469",
+  appId: import.meta.env.VITE_FIREBASE_APP_ID || "1:671231951469:web:29fd475e64855fc5c6f564"
+};
+
+export const app = initializeApp(firebaseConfig);
+export const auth = getAuth(app);
+export const db = getFirestore(app);
+
+export const staffAuthEmail = (contact) => `${String(contact).trim().toLowerCase().replace(/[^a-z0-9._-]/g, '')}@jeevanshilpgroup.local`;
+
+// Uses a secondary Firebase app so creating a staff account does not sign the current admin out.
+export const createStaffAuthAccount = async (contact, password) => {
+  const secondary = initializeApp(firebaseConfig, `staff-creator-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const secondaryAuth = getAuth(secondary);
+  try {
+    const credential = await createUserWithEmailAndPassword(secondaryAuth, staffAuthEmail(contact), password);
+    await signOut(secondaryAuth);
+    return credential.user;
+  } finally {
+    await deleteApp(secondary);
+  }
+};
+
+export { signInWithEmailAndPassword, signOut };
+
+// Enable robust offline capabilities. Authentication still remains server-authoritative.
+enableIndexedDbPersistence(db).catch((err) => {
+  if (err.code === 'failed-precondition') {
+    console.warn('Offline persistence unavailable: multiple tabs are open.');
+  } else if (err.code === 'unimplemented') {
+    console.warn('Offline persistence unavailable: browser does not support it.');
+  }
+});

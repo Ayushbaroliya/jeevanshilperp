@@ -1,0 +1,137 @@
+:root {
+  /* Darker Warm Lemon & Olive Palette (Totally Reversible) */
+  --bg-primary: #F0EAD6;
+  /* Darker Light Warm Lemon */
+  --bg-secondary: #F7F4E9;
+  --bg-sidebar: #323B20;
+  /* Darker Olive */
+
+  --text-primary: #1C220F;
+  /* Very Dark Olive */
+  --text-secondary: #465231;
+  /* Dark Medium Olive */
+  --text-sidebar: #F0EAD6;
+  /* Darker Light Lemon */
+  --text-sidebar-muted: #9BAA7C;
+  --nav-item-text: #000000;
+
+  --accent-primary: #4C5E17;
+  /* Darker Olive Accent */
+  --accent-secondary: #C19F29;
+  /* Darker Warm Lemon Accent */
+  --accent-hover: #3B4A11;
+
+  --brand-orange: #BF5700;
+  /* Burnt Orange */
+  --brand-green: #10b981;
+
+  --success: #16a34a;
+  --warning: #f59e0b;
+  --danger: #dc2626;
+
+  --border-light: #DFD9C5;
+  --border-dark: #323B20;
+
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+
+  --font-body: 'Public Sans', system-ui, sans-serif;
+  --font-mono: 'Roboto Mono', monospace;
+
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-full: 9999px;
+
+  --transition: all 0.3s ease;
+}
+
+[data-theme="dark"] {
+  /* Sleek Carbon/Graphite Dark Mode */
+  --bg-primary: #121212;
+  --bg-secondary: #1e1e1e;
+  --bg-sidebar: #000000;
+
+  --text-primary: #f5f5f5;
+  --text-secondary: #a3a3a3;
+  --text-sidebar: #f5f5f5;
+  --nav-item-text: #ffffff;
+  --text-sidebar-muted: #737373;
+
+  --accent-primary: #3b82f6;
+  --accent-secondary: #0ea5e9;
+  --accent-hover: #2563eb;
+
+  --border-light: #2d2d2d;
+  --border-dark: #404040;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font-body);
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Reset buttons and inputs */
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+  font-size: 100%;
+}
+
+button {
+  cursor: pointer;
+  border: none;
+  background: none;
+}
+
+a {
+  text-decoration: none;
+  color: inherit;
+}
+
+@media print {
+  body {
+    background-color: white !important;
+    color: black !important;
+  }
+  .sidebar, .topbar, .print-hide, button {
+    display: none !important;
+  }
+  .app-layout, .main-content, .page-container {
+    height: auto !important;
+    overflow: visible !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    display: block !important;
+  }
+  .glass-card {
+    border: none !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+    background: transparent !important;
+  }
+  .modern-table {
+    border: 1px solid #ddd;
+  }
+  .modern-table th, .modern-table td {
+    border: 1px solid #ddd;
+    color: black !important;
+    padding: 8px !important;
+  }
+  .badge {
+    border: 1px solid #999;
+    background: white !important;
+    color: black !important;
+  }
+}
