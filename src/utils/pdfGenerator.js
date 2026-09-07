@@ -7,7 +7,7 @@ import html2pdf from 'html2pdf.js';
  * @param {string} schoolName - School name for header
  */
 export function generateFeeReceipt(invoice, student, schoolName = 'Jeevan Shilp Group') {
-  const receiptNo = invoice.receiptNo || invoice.voucherNo || invoice.id?.slice(0, 12) || 'N/A';
+  const receiptNo = invoice.receiptId || invoice.receiptNo || invoice.voucherNo || invoice.id?.slice(0, 12) || 'N/A';
   const date = invoice.date || new Date().toISOString().split('T')[0];
   const amount = Number(invoice.amount || 0);
   const feeType = invoice.feeType || invoice.description || invoice.category || 'Fee Payment';
@@ -45,10 +45,17 @@ export function generateFeeReceipt(invoice, student, schoolName = 'Jeevan Shilp 
           </tr>
         </thead>
         <tbody>
-          <tr>
-            <td style="padding: 10px 14px; font-size: 13px; border-bottom: 1px solid #eee;">${feeType}</td>
-            <td style="padding: 10px 14px; text-align: right; font-size: 13px; font-weight: 700; border-bottom: 1px solid #eee;">Rs. ${amount.toLocaleString()}</td>
-          </tr>
+          ${(invoice.allocations && invoice.allocations.length > 0) ? invoice.allocations.map(alloc => `
+            <tr>
+              <td style="padding: 10px 14px; font-size: 13px; border-bottom: 1px solid #eee;">${alloc.label || alloc.componentId}</td>
+              <td style="padding: 10px 14px; text-align: right; font-size: 13px; font-weight: 700; border-bottom: 1px solid #eee;">Rs. ${Number(alloc.amount).toLocaleString()}</td>
+            </tr>
+          `).join('') : `
+            <tr>
+              <td style="padding: 10px 14px; font-size: 13px; border-bottom: 1px solid #eee;">${feeType}</td>
+              <td style="padding: 10px 14px; text-align: right; font-size: 13px; font-weight: 700; border-bottom: 1px solid #eee;">Rs. ${amount.toLocaleString()}</td>
+            </tr>
+          `}
           <tr style="background: #f8f9fa;">
             <td style="padding: 12px 14px; font-size: 14px; font-weight: 800;">Total Paid</td>
             <td style="padding: 12px 14px; text-align: right; font-size: 16px; font-weight: 900; color: #10b981;">Rs. ${amount.toLocaleString()}</td>
@@ -120,7 +127,7 @@ export function generateStudentProfilePDF(student, stats = {}) {
           </td>
           <td style="padding: 12px; text-align: center; background: #fef2f2; border-radius: 8px; width: 25%;">
             <div style="font-size: 20px; font-weight: 900; color: #ef4444;">Rs.${Number(stats.due || 0).toLocaleString()}</div>
-            <div style="font-size: 11px; color: #666; margin-top: 2px;">Outstanding</div>
+            <div style="font-size: 11px; color: #666; margin-top: 2px;">Fee Due / बाकी फीस</div>
           </td>
         </tr>
       </table>

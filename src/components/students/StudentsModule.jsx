@@ -1,19 +1,24 @@
 import React, { useState, useEffect } from 'react';
 import { ArrowLeft, Plus, FolderOpen, ChevronRight, Mic, Trash2, Edit2, X, AlertCircle, Sparkles, MessageCircle, Download, CreditCard, Calendar, BookOpen, Award, FileText, Receipt } from 'lucide-react';
-import { collection, addDoc, getDocs, query, where, doc, deleteDoc, updateDoc, orderBy } from 'firebase/firestore';
+import { collection, addDoc, getDocs, query, where, doc, deleteDoc, updateDoc, orderBy, writeBatch } from 'firebase/firestore';
 import { db } from '../../firebase';
 import { t } from '../../utils/translations';
 import SchoolFolderPicker from '../common/SchoolFolderPicker';
-import { calculateStudentDue, normalizeClassFeeSettings } from '../../utils/feeEngine';
+import { calculateStudentDue, normalizeClassFeeSettings, generateChargeSchedule, getJSPSFeeComponents, getJSICFeeComponents, applyPaymentsAndAdjustments, summarizeDues } from '../../utils/feeEngine';
 import { generateStudentProfilePDF, generateFeeReceipt } from '../../utils/pdfGenerator';
 
+const normalizeSectionQuery = (sec) => {
+  if (!sec) return '';
+  return sec.replace(/^Section\s+/i, '').trim();
+};
 
-export function StudentsDirectory({ onNavigate, lang, classes, sections, userPermissions, currentUser, onSelectStudent, selectedSchool, setSelectedSchool, classSettings = {} }) {
+export function StudentsDirectory({ onNavigate, lang, classes, sections, userPermissions, currentUser, onSelectStudent, selectedSchool, setSelectedSchool, classSettings = {}, searchQuery = '', activeAcademicYearId = '2026-2027' }) {
   const dict = t[lang] || t.en;
   const [selectedClass, setSelectedClass] = useState(null);
   const [selectedSection, setSelectedSection] = useState('All');
   const [isAddingStudent, setIsAddingStudent] = useState(false);
   const [studentName, setStudentName] = useState('');
+  const [fatherName, setFatherName] = useState('');
   const [rollNumber, setRollNumber] = useState('');
   const [parentContact, setParentContact] = useState('');
   const [addSection, setAddSection] = useState('');
@@ -23,13 +28,17 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
 
 
 
+  const [isNewAdmission, setIsNewAdmission] = useState(false);
+
   // Edit Student State
   const [editingStudent, setEditingStudent] = useState(null);
   const [editName, setEditName] = useState('');
+  const [editFatherName, setEditFatherName] = useState('');
   const [editRoll, setEditRoll] = useState('');
   const [editClass, setEditClass] = useState('');
   const [editSection, setEditSection] = useState('');
   const [editContact, setEditContact] = useState('');
+  const [editIsNewAdmission, setEditIsNewAdmission] = useState(false);
 
   const [teacherAssignments, setTeacherAssignments] = useState([]);
 
@@ -62,10 +71,31 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
     return teacherAssignments.some(assignment => {
       const classMatch = assignment.class === studentClass;
       // If assignment has no section, or section is 'All', or section matches exactly
-      const sectionMatch = !assignment.section || assignment.section === 'All' || !studentSection || studentSection === 'All' || assignment.section === studentSection;
+      const normalizedAssignmentSection = normalizeSectionQuery(assignment.section);
+      const normalizedStudentSection = normalizeSectionQuery(studentSection);
+      const sectionMatch = !assignment.section || assignment.section === 'All' || !studentSection || studentSection === 'All' || normalizedAssignmentSection === normalizedStudentSection;
       return classMatch && sectionMatch;
     });
   };
+
+  // Cleanly reset class and student directory view upon switching schools
+  useEffect(() => {
+    setSelectedClass(null);
+    setSelectedSection('All');
+    setStudents([]);
+  }, [selectedSchool]);
+
+  // Support Escape key to close modal windows
+  useEffect(() => {
+    const handleModalKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        if (editingStudent) setEditingStudent(null);
+        if (isAddingStudent) setIsAddingStudent(false);
+      }
+    };
+    window.addEventListener('keydown', handleModalKeyDown);
+    return () => window.removeEventListener('keydown', handleModalKeyDown);
+  }, [editingStudent, isAddingStudent]);
 
   useEffect(() => {
     if (isAddingStudent && sections && sections.length > 0 && !addSection) {
@@ -84,27 +114,71 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
             if (selectedSection === 'All') {
               q = query(q, where("schoolId", "==", selectedSchool), where("class", "==", selectedClass));
             } else {
-              q = query(q, where("schoolId", "==", selectedSchool), where("class", "==", selectedClass), where("section", "==", selectedSection));
+              q = query(q, where("schoolId", "==", selectedSchool), where("class", "==", selectedClass), where("section", "==", normalizeSectionQuery(selectedSection)));
             }
           } else {
             if (selectedSection === 'All') {
               q = query(q, where("class", "==", selectedClass));
             } else {
-              q = query(q, where("class", "==", selectedClass), where("section", "==", selectedSection));
+              q = query(q, where("class", "==", selectedClass), where("section", "==", normalizeSectionQuery(selectedSection)));
             }
           }
           
-          const querySnapshot = await getDocs(q);
+          const canonicalYearId = activeAcademicYearId === '2026-2027' ? 'AY_2026_27' : (activeAcademicYearId || 'AY_2026_27');
+          let chargeQuery = collection(db, 'fee_charges');
+          if (selectedSchool && selectedSchool !== 'ALL') {
+            chargeQuery = query(chargeQuery, where('schoolId', '==', selectedSchool), where('academicYearId', '==', canonicalYearId));
+          } else {
+            chargeQuery = query(chargeQuery, where('academicYearId', '==', canonicalYearId));
+          }
+
+          const queries = [
+            getDocs(q),
+            getDocs(query(collection(db, 'student_ledger'), where('type', '==', 'credit'))),
+            getDocs(query(collection(db, 'fee_adjustments'), where('status', '==', 'approved'))),
+            getDocs(chargeQuery)
+          ];
+
+          const results = await Promise.all(queries);
+          const querySnapshot = results[0];
+          const paymentSnap = results[1];
+          const adjustmentSnap = results[2];
+          const chargesSnap = results[3];
+          
+          const paymentsByStudent = {};
+          paymentSnap.forEach(d => { const p = d.data(); (paymentsByStudent[p.studentId] ||= []).push(p); });
+          
+          const adjustmentsByStudent = {};
+          adjustmentSnap.forEach(d => { const a = d.data(); (adjustmentsByStudent[a.studentId] ||= []).push(a); });
+
+          const chargesByStudent = {};
+          if (chargesSnap) {
+            chargesSnap.forEach(d => { const c = d.data(); (chargesByStudent[c.studentId] ||= []).push({ id: d.id, ...c }); });
+          }
+
           const loadedStudents = [];
-          querySnapshot.forEach((doc) => {
-            const data = doc.data();
-            console.warn("Fetched student data:", doc.id, data);
+          querySnapshot.forEach((docSnap) => {
+            const data = docSnap.data();
             if (data.status !== 'Deleted' && data.status !== 'archived') {
-              loadedStudents.push({ id: doc.id, ...data });
+              const sSettings = normalizeClassFeeSettings(classSettings[data.class] || {});
+              const result = calculateStudentDue({
+                student: { id: docSnap.id, ...data },
+                charges: chargesByStudent[docSnap.id],
+                classSettings: sSettings,
+                payments: paymentsByStudent[docSnap.id] || [],
+                adjustments: adjustmentsByStudent[docSnap.id] || []
+              });
+              const liveDue = result.totalDue;
+              loadedStudents.push({ id: docSnap.id, ...data, liveDue });
             }
           });
-          console.warn("Loaded students count:", loadedStudents.length);
-          setStudents(loadedStudents);
+          
+          // Check if Teacher has assigned classes logic
+          if (currentUser && currentUser.role === 'Teacher' && teacherAssignments.length > 0) {
+            setStudents(loadedStudents.filter(student => hasStudentEditPermission(student.class, student.section)));
+          } else {
+            setStudents(loadedStudents);
+          }
         } catch (error) {
           console.error("Error fetching students: ", error);
           setStudents([]);
@@ -113,7 +187,20 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
       };
       fetchStudents();
     }
-  }, [selectedClass, selectedSection, selectedSchool]);
+  }, [selectedClass, selectedSection, selectedSchool, teacherAssignments, classSettings]);
+
+  // Filter loaded students by the global top search bar query
+  const filteredStudents = searchQuery.trim()
+    ? students.filter(s => {
+        const q = searchQuery.trim().toLowerCase();
+        return (
+          (s.name || '').toLowerCase().includes(q) ||
+          (s.roll || '').toString().toLowerCase().includes(q) ||
+          (s.section || '').toLowerCase().includes(q) ||
+          (s.contact || '').toLowerCase().includes(q)
+        );
+      })
+    : students;
 
   // If ALL schools are selected, force user to pick a school first
   if (selectedSchool === 'ALL') {
@@ -141,7 +228,8 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
     }
 
     const targetSchool = selectedSchool !== 'ALL' ? selectedSchool : 'SCH_01';
-    const targetAcademicYear = 'AY_2025_26'; // Current academic year context
+    const targetAcademicYear = activeAcademicYearId || 'AY_2026_27'; // Current academic year context
+    const targetAcademicYearLabel = targetAcademicYear === 'AY_2026_27' ? '2026-2027' : '2025-2026';
 
     // ── 5-field Duplicate Roll-Number Guard (schoolId + academicYearId + class + section + roll) ──
     try {
@@ -150,7 +238,7 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
         where("schoolId",       "==", targetSchool),
         where("academicYearId", "==", targetAcademicYear),
         where("class",          "==", selectedClass),
-        where("section",        "==", addSection),
+        where("section",        "==", normalizeSectionQuery(addSection)),
         where("roll",           "==", rollNumber)
       );
       const dupSnap = await getDocs(dupQ);
@@ -168,9 +256,16 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
       // 1. Create Permanent Student Record
       const studentDocRef = await addDoc(collection(db, "students"), {
         name: studentName,
+        fatherName: fatherName,
+        roll: rollNumber,
         contact: parentContact,
-        createdAt: new Date().toISOString(),
-        schoolId: targetSchool
+        class: selectedClass,
+        section: normalizeSectionQuery(addSection),
+        schoolId: targetSchool,
+        isNewAdmission: isNewAdmission,
+        academicYear: targetAcademicYearLabel,
+        status: 'active',
+        createdAt: new Date().toISOString()
       });
 
       // 2. Create Yearly Enrollment Record
@@ -179,17 +274,61 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
         schoolId: targetSchool,
         academicYearId: targetAcademicYear,
         class: selectedClass,
-        section: addSection,
+        section: normalizeSectionQuery(addSection),
         roll: rollNumber,
+        fatherName: fatherName,
         status: 'Active',
         attendance: '100%',
+        isNewAdmission: isNewAdmission,
         createdAt: new Date().toISOString()
       });
+
+      // 3. Generate permanent fee_charges snapshot from class settings
+      let classFeeConfig = classSettings?.[selectedClass];
+      if (!classFeeConfig || !classFeeConfig.components || classFeeConfig.components.length === 0) {
+        const defaultComps = targetSchool === 'SCH_01'
+          ? getJSPSFeeComponents(selectedClass, targetAcademicYearLabel)
+          : getJSICFeeComponents(selectedClass, targetAcademicYearLabel);
+        classFeeConfig = { components: defaultComps };
+      }
+      const feeTemplate = normalizeClassFeeSettings(classFeeConfig, targetAcademicYearLabel);
+      const mockStudent = {
+        id: studentDocRef.id,
+        isNewAdmission: isNewAdmission,
+        academicYear: targetAcademicYearLabel
+      };
+      const initialCharges = generateChargeSchedule(mockStudent, feeTemplate, targetAcademicYearLabel);
+
+      if (initialCharges && initialCharges.length > 0) {
+        const chargeBatch = writeBatch(db);
+        for (const charge of initialCharges) {
+          const chargeRef = doc(collection(db, "fee_charges"));
+          chargeBatch.set(chargeRef, {
+            id: charge.id,
+            studentId: studentDocRef.id,
+            academicYear: targetAcademicYearLabel,
+            academicYearId: targetAcademicYear,
+            schoolId: targetSchool,
+            class: selectedClass,
+            section: normalizeSectionQuery(addSection),
+            componentId: charge.componentId,
+            label: charge.label,
+            originalAmount: charge.originalAmount,
+            dueDate: charge.dueDate,
+            status: 'unpaid',
+            allocatedPaid: 0,
+            allocatedAdjusted: 0,
+            netDue: charge.originalAmount,
+            type: charge.type || 'standard',
+            createdAt: new Date().toISOString()
+          });
+        }
+        await chargeBatch.commit();
+      }
       
       if (!keepOpen) {
         setIsAddingStudent(false);
       } else {
-        // Just flash a quick message for seamless adding
         const btn = document.getElementById('save-next-btn');
         if (btn) {
           const originalText = btn.innerText;
@@ -199,8 +338,10 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
       }
       
       setStudentName('');
+      setFatherName('');
       setRollNumber('');
       setParentContact('');
+      setIsNewAdmission(false);
 
       if (selectedClass) {
         setIsLoading(true);
@@ -208,12 +349,21 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
         if (selectedSection === 'All') {
           q = query(collection(db, "students"), where("class", "==", selectedClass));
         } else {
-          q = query(collection(db, "students"), where("class", "==", selectedClass), where("section", "==", selectedSection));
+          q = query(collection(db, "students"), where("class", "==", selectedClass), where("section", "==", normalizeSectionQuery(selectedSection)));
         }
-        const [querySnapshot, paymentSnap, adjustmentSnap] = await Promise.all([
+        const canonicalYearId = activeAcademicYearId === '2026-2027' ? 'AY_2026_27' : (activeAcademicYearId || 'AY_2026_27');
+        let chargeQuery = collection(db, 'fee_charges');
+        if (targetSchool && targetSchool !== 'ALL') {
+          chargeQuery = query(chargeQuery, where('schoolId', '==', targetSchool), where('academicYearId', '==', canonicalYearId));
+        } else {
+          chargeQuery = query(chargeQuery, where('academicYearId', '==', canonicalYearId));
+        }
+
+        const [querySnapshot, paymentSnap, adjustmentSnap, chargeSnap] = await Promise.all([
           getDocs(q),
           getDocs(query(collection(db, 'student_ledger'), where('type', '==', 'credit'))),
-          getDocs(query(collection(db, 'fee_adjustments'), where('status', '==', 'approved')))
+          getDocs(query(collection(db, 'fee_adjustments'), where('status', '==', 'approved'))),
+          getDocs(chargeQuery)
         ]);
         
         const paymentsByStudent = {};
@@ -222,13 +372,17 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
         const adjustmentsByStudent = {};
         adjustmentSnap.forEach(d => { const a = d.data(); (adjustmentsByStudent[a.studentId] ||= []).push(a); });
 
+        const chargesByStudent = {};
+        chargeSnap.forEach(d => { const c = d.data(); (chargesByStudent[c.studentId] ||= []).push({ id: d.id, ...c }); });
+
         const loadedStudents = [];
         querySnapshot.forEach((doc) => {
           const data = doc.data();
           if (data.status !== 'Deleted' && data.status !== 'archived') {
             const sSettings = normalizeClassFeeSettings(classSettings[data.class] || {});
             const result = calculateStudentDue({
-              student: data,
+              student: { id: doc.id, ...data },
+              charges: chargesByStudent[doc.id],
               classSettings: sSettings,
               payments: paymentsByStudent[doc.id] || [],
               adjustments: adjustmentsByStudent[doc.id] || []
@@ -315,10 +469,12 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
     e.stopPropagation();
     setEditingStudent(student);
     setEditName(student.name || '');
+    setEditFatherName(student.fatherName || student.parentName || '');
     setEditRoll(student.roll || '');
     setEditClass(student.class || selectedClass || 'Class 1');
     setEditSection(student.section || 'Section A');
     setEditContact(student.contact || '');
+    setEditIsNewAdmission(student.isNewAdmission === true || student.admissionType === 'new');
   };
 
   const handleSaveStudentEdit = async (e) => {
@@ -328,14 +484,13 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
     // ── Duplicate roll number guard (skip own record) ────────────────
     if (editRoll.trim()) {
       try {
-        const dupQ = query(
-          collection(db, "students"),
+        const q = query(collection(db, "students"), 
           where("schoolId", "==", editingStudent.schoolId || selectedSchool || 'SCH_01'),
           where("class",    "==", editClass),
-          where("section",  "==", editSection),
+          where("section",  "==", normalizeSectionQuery(editSection)),
           where("roll",     "==", editRoll.trim())
         );
-        const dupSnap = await getDocs(dupQ);
+        const dupSnap = await getDocs(q);
         const hasDup = dupSnap.docs.some(
           d => d.id !== editingStudent.id && d.data().status !== 'archived' && d.data().status !== 'Deleted'
         );
@@ -353,19 +508,23 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
       if (editingStudent) {
         await updateDoc(doc(db, "students", editingStudent.id), {
           name: editName,
+          fatherName: editFatherName,
           roll: editRoll,
           class: editClass,
-          section: editSection,
-          contact: editContact
+          section: normalizeSectionQuery(editSection),
+          contact: editContact,
+          isNewAdmission: editIsNewAdmission
         });
       }
       setStudents(prev => prev.map(s => s.id === editingStudent.id ? {
         ...s,
         name: editName,
+        fatherName: editFatherName,
         roll: editRoll,
         class: editClass,
-        section: editSection,
-        contact: editContact
+        section: normalizeSectionQuery(editSection),
+        contact: editContact,
+        isNewAdmission: editIsNewAdmission
       } : s));
       alert("Student information updated successfully!");
       setEditingStudent(null);
@@ -458,6 +617,17 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
                 {sections && sections.length > 0 ? sections.map(sec => <option key={sec} value={sec}>{sec}</option>) : <option>No Sections Available</option>}
               </select>
             </div>
+            <div className="form-group" style={{ gridColumn: '1 / -1', marginTop: 8 }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontWeight: 600, fontSize: 14 }}>
+                <input
+                  type="checkbox"
+                  checked={isNewAdmission}
+                  onChange={(e) => setIsNewAdmission(e.target.checked)}
+                  style={{ width: 18, height: 18, cursor: 'pointer' }}
+                />
+                <span>☐ New Admission / नया प्रवेश</span>
+              </label>
+            </div>
           </div>
 
           <div className="header-actions-responsive" style={{ marginTop: 24, justifyContent: 'flex-end', display: 'flex', gap: 12 }}>
@@ -511,11 +681,13 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
 
           {isLoading ? (
             <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-secondary)' }}>Loading students...</div>
-          ) : students.length === 0 ? (
-            <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-secondary)' }}>No students found in {selectedSection === 'All' ? 'this class' : selectedSection}.</div>
+          ) : filteredStudents.length === 0 ? (
+            <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-secondary)' }}>
+              {searchQuery.trim() ? `No students match "${searchQuery}"` : `No students found in ${selectedSection === 'All' ? 'this class' : selectedSection}.`}
+            </div>
           ) : (
             <div className="grid-responsive">
-              {students.map((student) => (
+              {filteredStudents.map((student) => (
                 <div
                   key={student.id}
                   className="glass-card flex-responsive"
@@ -531,9 +703,11 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
                     </div>
                     <div>
                       <div style={{ fontWeight: 700, fontSize: 16, color: 'var(--text-primary)' }}>{student.name}</div>
-                      <div style={{ color: 'var(--text-secondary)', fontSize: 13, marginTop: 4, display: 'flex', gap: 12, alignItems: 'center' }}>
+                      <div style={{ color: 'var(--text-secondary)', fontSize: 13, marginTop: 4, display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
                         <span>Roll: {student.roll}</span>
                         <span>Sec: {student.section}</span>
+                        <span>{student.fatherName || student.parentName ? `Father: ${student.fatherName || student.parentName}` : 'No Father Name'}</span>
+                        {student.contact && <span>📞 {student.contact}</span>}
                         <span className="badge" style={{ backgroundColor: 'var(--bg-secondary)', color: 'var(--success)', padding: '2px 8px' }}>{student.attendance || '100%'}</span>
                         <span className="badge" style={{ backgroundColor: student.liveDue > 0 ? 'rgba(239, 68, 68, 0.1)' : 'rgba(16, 185, 129, 0.1)', color: student.liveDue > 0 ? 'var(--danger)' : 'var(--success)', padding: '2px 8px' }}>
                           Dues: ₹{student.liveDue || 0}
@@ -578,7 +752,10 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
 
       {/* Edit Student Info Modal */}
       {editingStudent && (
-        <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.6)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}>
+        <div 
+          onClick={(e) => { if (e.target === e.currentTarget) setEditingStudent(null); }}
+          style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.6)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}
+        >
           <div className="glass-card" style={{ width: '100%', maxWidth: 520, padding: 28, position: 'relative' }}>
             <button onClick={() => setEditingStudent(null)} style={{ position: 'absolute', top: 16, right: 16, background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)' }}>
               <X size={20} />
@@ -598,6 +775,16 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
                     value={editName}
                     onChange={(e) => setEditName(e.target.value)}
                     required
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label" style={{ fontWeight: 700 }}>Father's Name</label>
+                  <input
+                    type="text"
+                    className="form-input"
+                    value={editFatherName}
+                    onChange={(e) => setEditFatherName(e.target.value)}
                   />
                 </div>
 
@@ -642,6 +829,18 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
                     onChange={(e) => setEditContact(e.target.value)}
                   />
                 </div>
+
+                <div className="form-group" style={{ gridColumn: '1 / -1', marginTop: 4 }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontWeight: 600, fontSize: 14 }}>
+                    <input
+                      type="checkbox"
+                      checked={editIsNewAdmission}
+                      onChange={(e) => setEditIsNewAdmission(e.target.checked)}
+                      style={{ width: 18, height: 18, cursor: 'pointer' }}
+                    />
+                    <span>☐ New Admission / नया प्रवेश</span>
+                  </label>
+                </div>
               </div>
 
               <div style={{ display: 'flex', gap: 12, justifyContent: 'flex-end', marginTop: 24 }}>
@@ -657,7 +856,7 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
 }
 
 // Senior Product Designer SaaS Redesign of Student Dashboard Profile
-export function StudentLedger({ onNavigate, lang = 'en', activeStudent, userPermissions }) {
+export function StudentLedger({ onNavigate, lang = 'en', activeStudent, userPermissions, selectedSchool, activeAcademicYearId }) {
   const dict = t[lang] || t.en;
   const [isEditingName, setIsEditingName] = useState(false);
   const [studentName, setStudentName] = useState(activeStudent?.name || 'Anjali Sharma');
@@ -674,6 +873,8 @@ export function StudentLedger({ onNavigate, lang = 'en', activeStudent, userPerm
   const [totalPaid, setTotalPaid] = useState(0);
   const [walletBalance, setWalletBalance] = useState(0);
   const [annualFee, setAnnualFee] = useState(0);
+  const [annualTuitionFee, setAnnualTuitionFee] = useState(0);
+  const [liveDue, setLiveDue] = useState(activeStudent?.liveDue ?? activeStudent?.openingArrears ?? activeStudent?.dueAmount ?? 0);
   const [paymentHistory, setPaymentHistory] = useState([]);
   const [calendarMonth, setCalendarMonth] = useState(() => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`; });
   const [calendarDays, setCalendarDays] = useState([]);
@@ -768,32 +969,98 @@ export function StudentLedger({ onNavigate, lang = 'en', activeStudent, userPerm
     if (!activeStudent?.id) return;
     const fetchFinancials = async () => {
       try {
-        const q = query(collection(db, 'invoices'), where('studentId', '==', activeStudent.id), orderBy('date', 'desc'));
-        const snap = await getDocs(q);
-        const invoices = [];
+        let invoiceQ = query(collection(db, 'invoices'), where('studentId', '==', activeStudent.id));
+        if (activeStudent.schoolId) {
+          invoiceQ = query(invoiceQ, where('schoolId', '==', activeStudent.schoolId));
+        }
+        const snap = await getDocs(invoiceQ);
+        let invoices = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+        // Fallback: If no invoices found in invoices collection, check student_ledger for credit transactions
+        if (invoices.length === 0) {
+          let ledgerQ = query(collection(db, 'student_ledger'), where('studentId', '==', activeStudent.id), where('type', '==', 'credit'));
+          if (activeStudent.schoolId) {
+            ledgerQ = query(ledgerQ, where('schoolId', '==', activeStudent.schoolId));
+          }
+          const ledgerSnap = await getDocs(ledgerQ);
+          invoices = ledgerSnap.docs.map(d => {
+            const data = d.data();
+            return {
+              id: d.id,
+              receiptNo: data.receiptNumber || data.receiptId || d.id.slice(0, 10),
+              receiptId: data.receiptNumber || data.receiptId || d.id.slice(0, 10),
+              amount: data.amount,
+              date: data.date,
+              status: 'Paid',
+              allocations: data.allocations || []
+            };
+          });
+        }
+
+        // Fetch fee adjustments (waivers) to include in the ledger history
+        let adjustmentQ = query(collection(db, 'fee_adjustments'), where('studentId', '==', activeStudent.id), where('status', '==', 'approved'));
+        if (activeStudent.schoolId) {
+          adjustmentQ = query(adjustmentQ, where('schoolId', '==', activeStudent.schoolId));
+        }
+        const [adjSnap, chargeSnap] = await Promise.all([
+          getDocs(adjustmentQ),
+          getDocs(query(collection(db, 'fee_charges'), where('studentId', '==', activeStudent.id)))
+        ]);
+
+        const rawAdjustments = adjSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+        const adjustments = rawAdjustments.map(data => ({
+          id: data.id,
+          date: data.createdAt || data.date,
+          description: `Fee Waiver (${data.reason || 'Reason not recorded'})`,
+          feeType: `Fee Waiver (${data.reason || 'Reason not recorded'})`,
+          amount: data.amount,
+          status: 'Approved',
+          type: 'waiver',
+          receiptNo: 'WAIVER-' + data.id.slice(0, 5),
+          receiptId: 'WAIVER-' + data.id.slice(0, 5)
+        }));
+
+        const combinedHistory = [...invoices, ...adjustments];
+        combinedHistory.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+
         let paid = 0;
-        snap.forEach(d => {
-          const data = d.data();
-          invoices.push({ id: d.id, ...data });
-          paid += Number(data.amount) || 0;
+        invoices.forEach(inv => {
+          paid += Number(inv.amount) || 0;
         });
         setTotalPaid(paid);
-        setPaymentHistory(invoices.slice(0, 5));
+        setPaymentHistory(combinedHistory);
 
-        // Compute annual fee from student's class settings if available
-        const studentDue = activeStudent?.liveDue ?? activeStudent?.openingArrears ?? activeStudent?.dueAmount ?? 0;
-        const annual = paid + Number(studentDue);
-        setAnnualFee(annual);
+        const dbCharges = chargeSnap.docs.map(d => ({ id: d.id, ...d.data() }));
 
-        // Wallet = overpayment (if paid > annual due)
-        const wallet = paid > annual ? paid - annual : 0;
-        setWalletBalance(wallet);
+        if (dbCharges.length > 0) {
+          const res = applyPaymentsAndAdjustments(dbCharges, invoices, rawAdjustments);
+          const summary = summarizeDues(activeStudent, res.ledger, res.advanceCredit);
+          
+          setLiveDue(summary.totalDue);
+          setTotalPaid(summary.totalPaid);
+          setWalletBalance(summary.advanceCredit);
+
+          const totalChargesAmount = dbCharges.reduce((sum, c) => sum + (Number(c.originalAmount) || 0), 0);
+          const totalTuitionAmount = dbCharges.filter(c => c.componentId === 'tuition').reduce((sum, c) => sum + (Number(c.originalAmount) || 0), 0);
+
+          setAnnualFee(totalChargesAmount);
+          setAnnualTuitionFee(totalTuitionAmount);
+        } else {
+          // Fallback if no permanent charges exist
+          const studentDue = activeStudent?.liveDue ?? activeStudent?.openingArrears ?? activeStudent?.dueAmount ?? 0;
+          setLiveDue(Number(studentDue));
+          const annual = paid + Number(studentDue);
+          setAnnualFee(annual);
+          setAnnualTuitionFee(annual);
+          const wallet = paid > annual ? paid - annual : 0;
+          setWalletBalance(wallet);
+        }
       } catch (err) {
         console.error('Error fetching financials:', err);
       }
     };
     fetchFinancials();
-  }, [activeStudent?.id]);
+  }, [activeStudent?.id, activeStudent?.schoolId]);
 
   // ── Calendar data for modal ────────────────────────────────────
   useEffect(() => {
@@ -817,7 +1084,7 @@ export function StudentLedger({ onNavigate, lang = 'en', activeStudent, userPerm
   const parentContact = activeStudent?.contact || "N/A";
   const studentId = activeStudent?.id || "N/A";
   const studentClass = activeStudent?.class || "N/A";
-  const dueAmount = activeStudent?.liveDue ?? activeStudent?.openingArrears ?? activeStudent?.dueAmount ?? 0;
+  const dueAmount = liveDue;
 
   const handleSaveName = () => {
     setIsEditingName(false);
@@ -1035,13 +1302,13 @@ export function StudentLedger({ onNavigate, lang = 'en', activeStudent, userPerm
               border: '1px solid var(--border-light)'
             }}>
               <div style={{ fontSize: 12, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 800, marginBottom: 4 }}>
-                Total Annual Tuition
+                {dict.totalTuition}
               </div>
               <div style={{ fontSize: 28, fontWeight: 900, fontFamily: 'var(--font-mono)', color: 'var(--text-primary)' }}>
                 ₹ {annualFee > 0 ? annualFee.toLocaleString() : '0'}.00
               </div>
               <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4 }}>
-                Annual Billing
+                {annualTuitionFee > 0 && annualTuitionFee !== annualFee ? `Tuition: ₹${annualTuitionFee.toLocaleString()} • Total: ₹${annualFee.toLocaleString()}` : 'Annual Billing'}
               </div>
             </div>
           </div>
@@ -1187,7 +1454,7 @@ export function StudentLedger({ onNavigate, lang = 'en', activeStudent, userPerm
         <div className="glass-card" style={{ padding: 24, borderRadius: 20 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
             <h3 style={{ fontSize: 18, fontWeight: 800, margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
-              <Receipt size={20} color="var(--brand-orange)" /> Payment & Transaction Details
+              <Receipt size={20} color="var(--brand-orange)" /> {dict.paymentLedger}
             </h3>
             <span style={{ fontSize: 12, color: 'var(--text-secondary)', fontWeight: 600 }}>
               {paymentHistory.length > 0 ? `Showing last ${paymentHistory.length} transaction(s)` : 'No transactions'}
@@ -1198,20 +1465,20 @@ export function StudentLedger({ onNavigate, lang = 'en', activeStudent, userPerm
             <table className="modern-table">
               <thead>
                 <tr>
-                  <th>Transaction Date</th>
-                  <th>Fee Reason / Category</th>
-                  <th>Receipt Voucher No</th>
+                  <th>{dict.transactionDate}</th>
+                  <th>{dict.feeCategory}</th>
+                  <th>{dict.receiptNo}</th>
                   <th>Status</th>
-                  <th style={{ textAlign: 'right' }}>Amount Paid</th>
+                  <th style={{ textAlign: 'right' }}>{dict.amountPaid}</th>
                   <th style={{ textAlign: 'right' }}>Action</th>
                 </tr>
               </thead>
               <tbody>
                 {paymentHistory.length > 0 ? paymentHistory.map((inv, i) => (
                   <tr key={inv.id || i}>
-                    <td style={{ fontFamily: 'var(--font-mono)', fontSize: 13 }}>{inv.date || 'N/A'}</td>
-                    <td style={{ fontWeight: 600 }}>{inv.feeType || inv.description || inv.category || 'Fee Payment'}</td>
-                    <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-secondary)' }}>{inv.receiptNo || inv.voucherNo || inv.id?.slice(0, 10) || 'N/A'}</td>
+                    <td style={{ fontFamily: 'var(--font-mono)', fontSize: 13 }}>{inv.date ? new Date(inv.date).toLocaleDateString() : 'N/A'}</td>
+                    <td style={{ fontWeight: 600 }}>{inv.feeType || inv.description || inv.category || (inv.allocations && inv.allocations.length > 0 ? inv.allocations.map(a => a.label || a.componentId).join(', ') : 'Fee Payment')}</td>
+                    <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-secondary)' }}>{inv.receiptId || inv.receiptNo || inv.voucherNo || inv.id?.slice(0, 10) || 'N/A'}</td>
                     <td>
                       <span className={`badge ${inv.status === 'Reversed' || inv.status === 'Cancelled' ? 'warning' : 'success'}`}>
                         {inv.status || 'Paid'}

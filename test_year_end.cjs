@@ -22,7 +22,7 @@
 
   console.log('=== Fee Engine — Penalty & Year-End Tests (Final 3-Installment Model) ===\n');
 
-  const student = { id: 'stu_999' };
+  const student = { id: 'stu_999', isNewAdmission: true };
   const currentYear = '2026-2027';
   const nextYear    = '2027-2028';
 
@@ -45,9 +45,9 @@
       },
       {
         id: 'september',
-        name: 'September Installment',
+        name: 'October Installment / अक्टूबर की किस्त',
         amount: 2000,
-        schedule: [{ dueDate: '2026-09-10', label: 'September Installment' }]
+        schedule: [{ dueDate: '2026-10-10', label: 'October Installment / अक्टूबर की किस्त' }]
       },
       {
         id: 'december',
@@ -59,33 +59,33 @@
   };
 
   // ─── Final penalty rules (business requirement) ────────────────────────────
-  // September: ₹100 Late Fee if any balance due after Sep 10 + 5 grace days
-  // December:  ₹500 Late Fee, waived if ALL applicable charges cleared
+  // October: ₹100 Late Fee if any balance due after Oct 10 + 5 grace days
+  // December: ₹500 Late Fee, waived if ALL applicable charges cleared
   const penaltyRules = [
-    { id: 'sept_late', label: 'Late Fee – September', deadline: '2026-09-10', graceDays: 5, amount: 100,  waiveIfCleared: false },
+    { id: 'sept_late', label: 'October Late Fee / अक्टूबर की लेट फीस', deadline: '2026-10-10', graceDays: 5, amount: 100,  waiveIfCleared: false },
     { id: 'dec_late',  label: 'Late Fee – December',  deadline: '2026-12-10', graceDays: 5, amount: 500,  waiveIfCleared: true  }
   ];
 
   let ledger = generateChargeSchedule(student, feeTemplate, currentYear);
   assertEqual(ledger.length, 4, 'Four charges generated: Admission + 3 installments');
 
-  // ─── Test 1: Partial September payment → Late Fee applies ──────────────────
+  // ─── Test 1: Partial October payment → Late Fee applies ──────────────────
   {
-    console.log('\n--- Test 1: Partial Sept payment → September Late Fee ---');
-    // Pay admission(1000) + July(2000) + 1500 toward September. Total = 4500.
-    // September(2000): 1500 paid, 500 remaining after Sept 10.
-    let res = applyPaymentsAndAdjustments(ledger, [{ id: 'p1', date: '2026-09-05', amount: 4500 }]);
+    console.log('\n--- Test 1: Partial Oct payment → October Late Fee ---');
+    // Pay admission(1000) + July(2000) + 1500 toward October. Total = 4500.
+    // October(2000): 1500 paid, 500 remaining after Oct 10.
+    let res = applyPaymentsAndAdjustments(ledger, [{ id: 'p1', date: '2026-10-05', amount: 4500 }]);
     ledger = res.ledger;
 
-    // Fast-forward to Sept 20 (past grace period → Sept 15)
-    const newPenalties = calculatePenalties(ledger, '2026-09-20', penaltyRules);
+    // Fast-forward to Oct 20 (past grace period → Oct 15)
+    const newPenalties = calculatePenalties(ledger, '2026-10-20', penaltyRules);
     assertEqual(newPenalties.length, 1, 'One Late Fee charge generated');
-    assertEqual(newPenalties[0].relatedRuleId, 'sept_late', 'It is the September Late Fee');
-    assertEqual(newPenalties[0].originalAmount, 100, 'September Late Fee = ₹100');
+    assertEqual(newPenalties[0].relatedRuleId, 'sept_late', 'It is the October Late Fee');
+    assertEqual(newPenalties[0].originalAmount, 100, 'October Late Fee = ₹100');
 
     // Duplicate-prevention check
     ledger = [...ledger, ...newPenalties];
-    const duplicatePenalties = calculatePenalties(ledger, '2026-09-25', penaltyRules);
+    const duplicatePenalties = calculatePenalties(ledger, '2026-10-25', penaltyRules);
     assertEqual(duplicatePenalties.length, 0, 'No duplicate Late Fee generated');
   }
 

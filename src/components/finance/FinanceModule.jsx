@@ -1,21 +1,12 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { ArrowLeft, CreditCard, Briefcase, Plus, Download, Filter, AlertCircle, Phone, MessageSquare, Printer, CheckCircle, Search, Layers, FileText, RotateCcw } from 'lucide-react';
-import { collection, getDocs, doc, runTransaction, query, where, orderBy, addDoc, getDoc, updateDoc } from 'firebase/firestore';
+import { collection, getDocs, doc, runTransaction, query, where, orderBy, addDoc, getDoc, updateDoc , writeBatch} from 'firebase/firestore';
+import * as XLSX from 'xlsx';
 import { auth, db } from '../../firebase';
 import { t } from '../../utils/translations';
 import SchoolFolderPicker from '../common/SchoolFolderPicker';
-import { generateChargeSchedule, calculateOpeningArrears, calculatePenalties, applyPaymentsAndAdjustments, summarizeDues } from '../../utils/feeEngine';
-import * as XLSX from 'xlsx';
-
-function normalizeClassFeeSettings(settings) {
-  if (!settings) return { components: [] };
-  if (Array.isArray(settings)) return { components: settings };
-  if (settings.components && Array.isArray(settings.components)) return settings;
-  const components = [];
-  if (settings.admission > 0) components.push({ id: 'admission', name: 'Admission Fee', amount: settings.admission, schedule: [{ dueDate: '2026-04-10', label: '1st Installment' }] });
-  if (settings.tuition > 0) components.push({ id: 'tuition', name: 'Tuition Fee', amount: settings.tuition, schedule: [{ dueDate: '2026-04-10', label: 'April' }, { dueDate: '2026-09-10', label: 'September' }] });
-  return { components };
-}
+import { calculateStudentDue, normalizeClassFeeSettings, calculatePenalties, applyPaymentsAndAdjustments, summarizeDues } from '../../utils/feeEngine';
+import { generateFeeReceipt } from '../../utils/pdfGenerator';
 
 function getAcademicYear() {
   return "2026-2027";
@@ -94,14 +85,21 @@ function ClasswiseDueFeesReport({ onCollectFee, onNavigate, dict, selectedSchool
     const fetchCloudDues = async () => {
       try {
         let studentQ = collection(db, "students");
-        if (selectedSchool && selectedSchool !== 'ALL') studentQ = query(studentQ, where("schoolId", "==", selectedSchool));
+        let chargeQ = collection(db, 'fee_charges');
+        if (selectedSchool && selectedSchool !== 'ALL') {
+          studentQ = query(studentQ, where("schoolId", "==", selectedSchool));
+          chargeQ = query(chargeQ, where("schoolId", "==", selectedSchool));
+        }
         
-        const [studentSnap, paymentSnap, adjustmentSnap, settingsDoc] = await Promise.all([
+        const [studentSnap, paymentSnap, adjustmentSnap, chargeSnap, settingsSnap] = await Promise.all([
           getDocs(studentQ),
-          getDocs(query(collection(db, 'student_ledger'), where('schoolId', '==', selectedSchool), where('type', '==', 'credit'))),
-          getDocs(query(collection(db, 'fee_adjustments'), where('schoolId', '==', selectedSchool), where('status', '==', 'approved'))),
+          getDocs(query(collection(db, 'student_ledger'), where('type', '==', 'credit'))),
+          getDocs(query(collection(db, 'fee_adjustments'), where('status', '==', 'approved'))),
+          getDocs(chargeQ),
           getDoc(doc(db, 'school_settings', 'settings'))
         ]);
+
+        const storedSettings = settingsSnap.exists() ? (settingsSnap.data().schoolClassSettings || {}) : {};
 
         const paymentsByStudent = {};
         paymentSnap.forEach(d => { const p = d.data(); (paymentsByStudent[p.studentId] ||= []).push({ ...p, id: d.id }); });
@@ -109,28 +107,34 @@ function ClasswiseDueFeesReport({ onCollectFee, onNavigate, dict, selectedSchool
         const adjustmentsByStudent = {};
         adjustmentSnap.forEach(d => { const a = d.data(); (adjustmentsByStudent[a.studentId] ||= []).push({ ...a, id: d.id }); });
 
-        const storedSettings = settingsDoc.exists() ? (settingsDoc.data().schoolClassSettings || {}) : {};
+        const chargesByStudent = {};
+        chargeSnap.forEach(d => { const c = d.data(); (chargesByStudent[c.studentId] ||= []).push({ ...c, id: d.id }); });
 
         const cloudDues = [];
         studentSnap.forEach((d) => {
           const data = d.data();
-          const academicYear = data.academicYear || getAcademicYear();
-          const classSettings = normalizeClassFeeSettings(storedSettings[selectedSchool]?.[data.class] || {});
+          const studentObj = { id: d.id, ...data };
           
-          // RUN ENGINE
-          const baseCharges = generateChargeSchedule(data, classSettings, academicYear);
-          const arrears = calculateOpeningArrears(data, Number(data.dueAmount || 0), academicYear); // Legacy fallback mapping
-          const withArrears = [...arrears, ...baseCharges];
+          const sClass = studentObj.class;
+          const sSchool = studentObj.schoolId || selectedSchool;
+          const classSettings = normalizeClassFeeSettings(storedSettings[sSchool]?.[sClass] || {});
+          const dbCharges = chargesByStudent[d.id] || [];
           
-          const rules = [
-            { id: 'sept_late', label: 'Late Fee – September', deadline: '2026-09-10', graceDays: 5, amount: 100, waiveIfCleared: false },
-            { id: 'dec_late',  label: 'Late Fee – December',  deadline: '2026-12-10', graceDays: 5, amount: 500, waiveIfCleared: true  }
-          ];
-          const penalties = calculatePenalties(withArrears, new Date().toISOString(), rules);
-          const fullCharges = [...withArrears, ...penalties];
+          if (dbCharges.length === 0) {
+            cloudDues.push({
+              id: d.id, name: data.name || 'Student', class: data.class || '', section: data.section || '',
+              contact: data.contact || '', dueAmount: 0, status: 'Not Billed', unbilled: true
+            });
+            return;
+          }
 
-          const res = applyPaymentsAndAdjustments(fullCharges, paymentsByStudent[d.id] || [], adjustmentsByStudent[d.id] || []);
-          const summary = summarizeDues(data, res.ledger, res.advanceCredit);
+          const summary = calculateStudentDue({
+            student: studentObj,
+            charges: dbCharges,
+            classSettings,
+            payments: paymentsByStudent[d.id] || [],
+            adjustments: adjustmentsByStudent[d.id] || []
+          });
 
           if (summary.totalDue > 0) {
             cloudDues.push({
@@ -139,6 +143,7 @@ function ClasswiseDueFeesReport({ onCollectFee, onNavigate, dict, selectedSchool
             });
           }
         });
+
         setDueList(cloudDues);
       } catch (err) {
         console.error(err);
@@ -156,10 +161,88 @@ function ClasswiseDueFeesReport({ onCollectFee, onNavigate, dict, selectedSchool
   return (
     <div className="glass-card" style={{ padding: 24 }}>
       <h2>Classwise Due Fees Directory</h2>
-      <select value={selectedClass} onChange={e => setSelectedClass(e.target.value)} className="form-input" style={{ width: 300, marginBottom: 20 }}>
-        <option value="ALL">All Classes</option>
-        {[...new Set(dueList.map(s => s.class))].sort().map(c => <option key={c} value={c}>{c}</option>)}
-      </select>
+      <div style={{ display: 'flex', gap: 10, marginBottom: 20, flexWrap: 'wrap' }}>
+        <select value={selectedClass} onChange={e => setSelectedClass(e.target.value)} className="form-input" style={{ width: 300 }}>
+          <option value="ALL">All Classes</option>
+          {[...new Set([...(classes || []), ...dueList.map(s => s.class)])].filter(Boolean).sort().map(c => <option key={c} value={c}>{c}</option>)}
+        </select>
+        <button className="btn-secondary" onClick={async () => {
+          if (!window.confirm("Assess Late Fees for all students in the selected view?")) return;
+          // Implementation of late fee assessment
+          try {
+            const rules = [
+              { id: 'sept_late', label: 'Late Fee – September', deadline: '2026-09-10', graceDays: 5, amount: 100, waiveIfCleared: false },
+              { id: 'dec_late',  label: 'Late Fee – December',  deadline: '2026-12-10', graceDays: 5, amount: 500, waiveIfCleared: true  }
+            ];
+            
+            let studentQ = collection(db, "students");
+            if (selectedSchool && selectedSchool !== 'ALL') studentQ = query(studentQ, where("schoolId", "==", selectedSchool));
+            const studentSnap = await getDocs(studentQ);
+            const allStudents = studentSnap.docs.map(d => ({id: d.id, ...d.data()}));
+            
+            // Filter by class if needed
+            const targetStudents = selectedClass === 'ALL' ? allStudents : allStudents.filter(s => s.class === selectedClass);
+            
+            const batch = writeBatch(db);
+            let count = 0;
+            
+            for (const student of targetStudents) {
+               const cSnap = await getDocs(query(collection(db, 'fee_charges'), where('studentId', '==', student.id)));
+               if (cSnap.empty) continue; // Not billed yet
+               
+               const pSnap = await getDocs(query(collection(db, 'student_ledger'), where('studentId', '==', student.id), where('type', '==', 'credit')));
+               const aSnap = await getDocs(query(collection(db, 'fee_adjustments'), where('studentId', '==', student.id), where('status', '==', 'approved')));
+               
+               const charges = cSnap.docs.map(d => ({id: d.id, ...d.data()}));
+               const payments = pSnap.docs.map(d => ({id: d.id, ...d.data()}));
+               const adjustments = aSnap.docs.map(d => ({id: d.id, ...d.data()}));
+               
+               const res = applyPaymentsAndAdjustments(charges, payments, adjustments);
+               const penalties = calculatePenalties(res.ledger, new Date().toISOString(), rules);
+               
+               for (const p of penalties) {
+                  // Ensure we don't already have this penalty in fee_charges
+                  const exists = charges.some(c => c.type === 'penalty' && c.relatedRuleId === p.relatedRuleId);
+                  if (!exists) {
+                     const pid = `chg_${student.id}_${student.academicYear || 'AY_2025_26'}_penalty_${p.relatedRuleId}`;
+                     batch.set(doc(collection(db, 'fee_charges'), pid), {
+                        ...p,
+                        id: pid,
+                        studentId: student.id,
+                        schoolId: selectedSchool,
+                        academicYear: student.academicYear || 'AY_2025_26',
+                        createdAt: new Date().toISOString()
+                     }, { merge: true });
+                     count++;
+                  }
+               }
+            }
+            await batch.commit();
+            alert(`Successfully assessed ${count} new late fees.`);
+            window.location.reload();
+          } catch(e) {
+             console.error(e);
+             alert("Error assessing late fees.");
+          }
+        }}> Assess Late Fees </button>
+        <button className="btn-primary" onClick={() => {
+          const exportData = filtered.map(item => ({
+            'Student Name': item.name,
+            'Class': item.class,
+            'Section': item.section,
+            'Contact': item.contact,
+            'Pending Amount (₹)': item.dueAmount,
+            'Status': item.status
+          }));
+          const ws = XLSX.utils.json_to_sheet(exportData);
+          const wb = XLSX.utils.book_new();
+          XLSX.utils.book_append_sheet(wb, ws, "Due Fees List");
+          XLSX.writeFile(wb, `Due_Fees_List_${selectedClass}_${new Date().toISOString().split('T')[0]}.xlsx`);
+        }} style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <Download size={16} /> Export to Excel
+        </button>
+      </div>
+
 
       <table className="modern-table">
         <thead>
@@ -194,7 +277,8 @@ function RecordPayment({ subOnNavigate, dict, prefilledStudentId, selectedSchool
   const [allStudents, setAllStudents] = useState([]);
   const [selectedStudentId, setSelectedStudentId] = useState(prefilledStudentId || '');
   const [receiptNumber, setReceiptNumber] = useState('');
-  const [paymentAmount, setPaymentAmount] = useState('');
+  const [manualAllocations, setManualAllocations] = useState({});
+  const paymentAmount = Object.values(manualAllocations).reduce((sum, val) => sum + (Number(val) || 0), 0);
   const [isProcessing, setIsProcessing] = useState(false);
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   
@@ -222,32 +306,42 @@ function RecordPayment({ subOnNavigate, dict, prefilledStudentId, selectedSchool
     const fetchLedger = async () => {
       if (!selectedStudentObj) return;
       try {
-        const [paymentSnap, adjustmentSnap, settingsDoc] = await Promise.all([
-          getDocs(query(collection(db, 'student_ledger'), where('schoolId', '==', selectedSchool), where('type', '==', 'credit'), where('studentId', '==', selectedStudentId))),
-          getDocs(query(collection(db, 'fee_adjustments'), where('schoolId', '==', selectedSchool), where('status', '==', 'approved'), where('studentId', '==', selectedStudentId))),
-          getDoc(doc(db, 'school_settings', 'settings'))
+        const [paymentSnap, adjustmentSnap, settingsDoc, chargeSnap] = await Promise.all([
+          getDocs(query(collection(db, 'student_ledger'), where('type', '==', 'credit'), where('studentId', '==', selectedStudentId))),
+          getDocs(query(collection(db, 'fee_adjustments'), where('status', '==', 'approved'), where('studentId', '==', selectedStudentId))),
+          getDoc(doc(db, 'school_settings', 'settings')),
+          getDocs(query(collection(db, 'fee_charges'), where('studentId', '==', selectedStudentId)))
         ]);
         
         const payments = paymentSnap.docs.map(d => ({ ...d.data(), id: d.id }));
         const adjustments = adjustmentSnap.docs.map(d => ({ ...d.data(), id: d.id }));
         const storedSettings = settingsDoc.exists() ? (settingsDoc.data().schoolClassSettings || {}) : {};
         const classSettings = normalizeClassFeeSettings(storedSettings[selectedSchool]?.[selectedStudentObj.class] || {});
-        const academicYear = selectedStudentObj.academicYear || getAcademicYear();
+        const dbCharges = chargeSnap.docs.map(d => ({ ...d.data(), id: d.id }));
 
-        const baseCharges = generateChargeSchedule(selectedStudentObj, classSettings, academicYear);
-        const arrears = calculateOpeningArrears(selectedStudentObj, Number(selectedStudentObj.dueAmount || 0), academicYear);
-        const rules = [
-          { id: 'sept_late', label: 'Late Fee – September', deadline: '2026-09-10', graceDays: 5, amount: 100, waiveIfCleared: false },
-          { id: 'dec_late',  label: 'Late Fee – December',  deadline: '2026-12-10', graceDays: 5, amount: 500, waiveIfCleared: true  }
-        ];
-        
-        const withArrears = [...arrears, ...baseCharges];
-        const penalties = calculatePenalties(withArrears, new Date().toISOString(), rules);
-        const fullCharges = [...withArrears, ...penalties];
+        if (dbCharges.length === 0) {
+          setCurrentLedger([]);
+          setCurrentSummary({
+            totalDue: 0,
+            totalPaid: 0,
+            totalConcession: 0,
+            advanceCredit: 0,
+            ledger: [],
+            missingCharges: true
+          });
+          return;
+        }
 
-        const res = applyPaymentsAndAdjustments(fullCharges, payments, adjustments);
-        setCurrentLedger(res.ledger);
-        setCurrentSummary(summarizeDues(selectedStudentObj, res.ledger, res.advanceCredit));
+        const summary = calculateStudentDue({
+          student: selectedStudentObj,
+          charges: dbCharges,
+          classSettings,
+          payments,
+          adjustments
+        });
+
+        setCurrentLedger(summary.ledger);
+        setCurrentSummary(summary);
       } catch (e) {
         console.error("fetchLedger failed:", e);
       }
@@ -276,6 +370,30 @@ function RecordPayment({ subOnNavigate, dict, prefilledStudentId, selectedSchool
 
       const myAllocations = previewAllocation.allocations.filter(a => a.paymentId === 'preview');
       const allocatedChargeIds = myAllocations.map(a => a.chargeId);
+
+      const myAllocationsForInvoice = myAllocations.map(a => {
+        const charge = currentLedger.find(c => c.id === a.chargeId);
+        let label = charge ? charge.label : a.componentId;
+        if (label === 'September' || label.toLowerCase().includes('september')) {
+          label = label.toLowerCase().includes('late fee') ? 'Late Fee - October / अक्टूबर लेट फीस' : 'October Installment / अक्टूबर की किस्त';
+        }
+        return {
+          chargeId: a.chargeId,
+          componentId: a.componentId,
+          amount: a.amount,
+          label: label
+        };
+      });
+
+      const advanceAdded = previewAllocation.advanceCredit - (currentSummary?.advanceCredit || 0);
+      if (advanceAdded > 0) {
+        myAllocationsForInvoice.push({
+          chargeId: 'advance',
+          componentId: 'advance',
+          amount: advanceAdded,
+          label: 'Advance Payment / अग्रिम भुगतान'
+        });
+      }
 
       // Prevent duplicate receipt submission
       const existingInvoiceQ = query(collection(db, "invoices"), where("receiptId", "==", receiptNumber.trim()), where("schoolId", "==", selectedSchool));
@@ -312,18 +430,20 @@ function RecordPayment({ subOnNavigate, dict, prefilledStudentId, selectedSchool
 
         transaction.set(invoiceRef, {
           receiptId: receiptNumber.trim(),
+          receiptNo: receiptNumber.trim(),
           student: selectedStudentObj?.name || '',
           class: selectedStudentObj?.class || '',
           studentId: selectedStudentId,
           date: now,
           amount: val,
           status: 'Paid',
-          schoolId: selectedSchool
+          schoolId: selectedSchool,
+          allocations: myAllocationsForInvoice
         });
       });
       
       alert(`Payment of ₹${val} recorded successfully!`);
-      setPaymentAmount('');
+      setManualAllocations({});
       setReceiptNumber('');
       setRefreshTrigger(prev => prev + 1);
     } catch (e) {
@@ -337,7 +457,7 @@ function RecordPayment({ subOnNavigate, dict, prefilledStudentId, selectedSchool
   return (
     <div style={{ maxWidth: 800, margin: '0 auto' }}>
       <div className="glass-card" style={{ padding: 24 }}>
-        <h2>Record Payment (FIFO Allocation)</h2>
+        <h2>{dict.recordFeePayment}</h2>
         
         <select className="form-input" value={selectedStudentId} onChange={e => setSelectedStudentId(e.target.value)} style={{ marginBottom: 20 }}>
           {allStudents.map(s => <option key={s.id} value={s.id}>{s.name} - {s.class}</option>)}
@@ -347,40 +467,108 @@ function RecordPayment({ subOnNavigate, dict, prefilledStudentId, selectedSchool
         {currentSummary ? (
           <div style={{ padding: 16, background: 'var(--bg-secondary)', borderRadius: 8, marginBottom: 20 }}>
             <div data-testid="debug-summary" style={{ display: 'none' }}>{JSON.stringify(currentSummary)}</div>
-            <h3 style={{ marginTop: 0 }}>Transparent Student Statement</h3>
+            <h3 style={{ marginTop: 0 }}>{dict.financialSummary}</h3>
             <table className="modern-table" style={{ fontSize: 12 }}>
               <thead>
                 <tr>
-                  <th>Charge / Penalty</th>
-                  <th>Original</th>
-                  <th>Adjusted</th>
-                  <th>Paid</th>
-                  <th>Net Due</th>
+                  <th>{dict.feeCategory}</th>
+                  <th>Total Due</th>
+                  <th>Previously Paid</th>
+                  <th>Collecting Now</th>
+                  <th>Balance</th>
                   <th>Status</th>
                 </tr>
               </thead>
               <tbody>
-                {currentSummary.ledger.map(c => (
-                  <tr key={c.id}>
-                    <td>{c.label}</td>
-                    <td>{c.originalAmount}</td>
-                    <td style={{ color: 'var(--warning)' }}>{c.allocatedAdjusted}</td>
-                    <td style={{ color: 'var(--success)' }}>{c.allocatedPaid}</td>
-                    <td style={{ fontWeight: 'bold' }}>{c.netDue}</td>
-                    <td>
-                       <span className={`badge ${c.status === 'paid' ? 'success' : c.status === 'partial' ? 'warning' : 'danger'}`}>
-                         {c.status.toUpperCase()}
-                       </span>
-                    </td>
-                  </tr>
-                ))}
+                {currentSummary.ledger.map((c, index) => {
+                  let isPreviousFullyCovered = true;
+                  for (let i = 0; i < index; i++) {
+                    const prevCharge = currentSummary.ledger[i];
+                    const prevInput = Number(manualAllocations[prevCharge.id]) || 0;
+                    if (prevCharge.netDue > 0 && prevInput < prevCharge.netDue) {
+                      isPreviousFullyCovered = false;
+                      break;
+                    }
+                  }
+                  
+                  const isFullyPaid = c.netDue === 0;
+                  const isInputDisabled = isFullyPaid || !isPreviousFullyCovered;
+
+                  const collectingNowAmount = manualAllocations[c.id] !== undefined ? manualAllocations[c.id] : '';
+                  const balanceAfter = c.netDue - (Number(collectingNowAmount) || 0);
+                  
+                  let displayLabel = c.label;
+                  if (displayLabel === 'September' || displayLabel.toLowerCase().includes('september')) {
+                    displayLabel = displayLabel.toLowerCase().includes('late fee') ? 'Late Fee - October / अक्टूबर लेट फीस' : 'October Installment / अक्टूबर की किस्त';
+                  }
+
+                  return (
+                    <tr key={c.id}>
+                      <td>{displayLabel}</td>
+                      <td>₹{c.originalAmount - c.allocatedAdjusted}</td>
+                      <td style={{ color: 'var(--success)' }}>₹{c.allocatedPaid}</td>
+                      <td style={{ color: 'var(--brand-primary)', fontWeight: 'bold' }}>
+                        <input
+                          type="number"
+                          className="form-input"
+                          style={{ width: 120, padding: '4px 8px', borderColor: isInputDisabled ? 'transparent' : 'var(--brand-primary)' }}
+                          disabled={isInputDisabled}
+                          max={c.netDue}
+                          value={collectingNowAmount}
+                          onChange={e => {
+                            let val = e.target.value;
+                            if (val !== '' && Number(val) > c.netDue) val = c.netDue;
+                            setManualAllocations(prev => ({ ...prev, [c.id]: val }));
+                          }}
+                          placeholder={isFullyPaid ? "Paid" : "₹ 0"}
+                        />
+                      </td>
+                      <td style={{ fontWeight: 'bold' }}>₹{balanceAfter}</td>
+                      <td>
+                         <span className={`badge ${balanceAfter === 0 ? 'success' : balanceAfter < (c.originalAmount - c.allocatedAdjusted) ? 'warning' : 'danger'}`}>
+                           {balanceAfter === 0 ? 'PAID' : balanceAfter < (c.originalAmount - c.allocatedAdjusted) ? 'PARTIAL' : 'DUE'}
+                         </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+                {(() => {
+                  let allChargesFullyCovered = true;
+                  for (const c of currentSummary.ledger) {
+                    if (c.netDue > 0 && (Number(manualAllocations[c.id]) || 0) < c.netDue) {
+                      allChargesFullyCovered = false;
+                      break;
+                    }
+                  }
+                  const advanceVal = manualAllocations['advance'] !== undefined ? manualAllocations['advance'] : '';
+                  
+                  return (
+                    <tr>
+                      <td style={{ fontWeight: 'bold', color: 'var(--success)' }}>Advance Payment / अग्रिम भुगतान</td>
+                      <td>-</td>
+                      <td>-</td>
+                      <td>
+                        <input
+                           type="number"
+                           className="form-input"
+                           style={{ width: 120, padding: '4px 8px', borderColor: !allChargesFullyCovered ? 'transparent' : 'var(--brand-primary)' }}
+                           disabled={!allChargesFullyCovered}
+                           value={advanceVal}
+                           onChange={e => setManualAllocations(prev => ({ ...prev, 'advance': e.target.value }))}
+                           placeholder="₹ 0"
+                        />
+                      </td>
+                      <td colSpan="2">-</td>
+                    </tr>
+                  );
+                })()}
               </tbody>
             </table>
             <div style={{ marginTop: 10, fontSize: 16, fontWeight: 'bold', color: 'var(--danger)' }}>
-              Total Outstanding: ₹{currentSummary.totalDue}
+              {dict.outstandingDue}: ₹{currentSummary.totalDue}
             </div>
             {currentSummary.advanceCredit > 0 && (
-              <div style={{ color: 'var(--success)', fontWeight: 'bold' }}>Advance Credit: ₹{currentSummary.advanceCredit}</div>
+              <div style={{ color: 'var(--success)', fontWeight: 'bold' }}>{dict.walletBalance}: ₹{currentSummary.advanceCredit}</div>
             )}
           </div>
         ) : null}
@@ -388,34 +576,19 @@ function RecordPayment({ subOnNavigate, dict, prefilledStudentId, selectedSchool
         {/* PAYMENT INPUT */}
         <div style={{ display: 'flex', gap: 16, marginBottom: 20 }}>
           <div style={{ flex: 1 }}>
-            <label className="form-label">Total Payment Amount (₹)</label>
-            <input type="number" className="form-input" value={paymentAmount} onChange={e => setPaymentAmount(e.target.value)} placeholder="e.g. 2000" />
+            <label className="form-label">{dict.amountReceived} (Auto-Sum)</label>
+            <div style={{ fontSize: 24, fontWeight: '900', padding: '10px 0', color: 'var(--success)' }}>
+              ₹ {paymentAmount}
+            </div>
           </div>
           <div style={{ flex: 1 }}>
-            <label className="form-label">Receipt Number</label>
+            <label className="form-label">{dict.receiptVoucherNo}</label>
             <input type="text" className="form-input" value={receiptNumber} onChange={e => setReceiptNumber(e.target.value)} placeholder="Physical Book #" />
           </div>
         </div>
 
-        {/* FIFO PREVIEW */}
-        {previewAllocation && (
-          <div style={{ padding: 16, background: 'rgba(16, 185, 129, 0.1)', borderRadius: 8, marginBottom: 20 }}>
-            <h4 style={{ margin: '0 0 10px' }}>Allocation Preview (Auto-calculated)</h4>
-            <ul style={{ margin: 0, paddingLeft: 20 }}>
-              {previewAllocation.allocations.filter(a => a.paymentId === 'preview').map((alloc, i) => (
-                <li key={i}>Allocating <strong>₹{alloc.amount}</strong> to <em>{alloc.componentId} ({alloc.chargeId})</em></li>
-              ))}
-            </ul>
-            {previewAllocation.advanceCredit > (currentSummary?.advanceCredit || 0) && (
-              <div style={{ color: 'var(--success)', marginTop: 10, fontWeight: 'bold' }}>
-                + ₹{previewAllocation.advanceCredit - (currentSummary?.advanceCredit || 0)} will be stored as Advance Credit
-              </div>
-            )}
-          </div>
-        )}
-
         <button className="btn-primary" onClick={handleRecordPayment} disabled={isProcessing || !paymentAmount || !receiptNumber}>
-          {isProcessing ? 'Recording...' : 'Record Single Payment'}
+          {isProcessing ? 'Recording...' : dict.recordFeePayment}
         </button>
       </div>
     </div>
@@ -447,25 +620,33 @@ function FeeAdjustmentModule({ selectedSchool, userPermissions }) {
       if (!selectedStudentObj) { setCurrentLedger([]); return; }
       
       try {
-        const [paymentSnap, adjustmentSnap, settingsDoc] = await Promise.all([
-          getDocs(query(collection(db, 'student_ledger'), where('schoolId', '==', selectedSchool), where('type', '==', 'credit'), where('studentId', '==', studentId))),
-          getDocs(query(collection(db, 'fee_adjustments'), where('schoolId', '==', selectedSchool), where('status', '==', 'approved'), where('studentId', '==', studentId))),
-          getDoc(doc(db, 'school_settings', 'settings'))
+        const [paymentSnap, adjustmentSnap, settingsDoc, chargeSnap] = await Promise.all([
+          getDocs(query(collection(db, 'student_ledger'), where('type', '==', 'credit'), where('studentId', '==', studentId))),
+          getDocs(query(collection(db, 'fee_adjustments'), where('status', '==', 'approved'), where('studentId', '==', studentId))),
+          getDoc(doc(db, 'school_settings', 'settings')),
+          getDocs(query(collection(db, 'fee_charges'), where('studentId', '==', studentId)))
         ]);
         
         const payments = paymentSnap.docs.map(d => ({ ...d.data(), id: d.id }));
         const adjustments = adjustmentSnap.docs.map(d => ({ ...d.data(), id: d.id }));
         const storedSettings = settingsDoc.exists() ? (settingsDoc.data().schoolClassSettings || {}) : {};
         const classSettings = normalizeClassFeeSettings(storedSettings[selectedSchool]?.[selectedStudentObj.class] || {});
-        
-        const academicYear = selectedStudentObj.academicYear || getAcademicYear();
-        const baseCharges = generateChargeSchedule(selectedStudentObj, classSettings, academicYear);
-        const arrears = calculateOpeningArrears(selectedStudentObj, Number(selectedStudentObj.dueAmount || 0), academicYear);
-        const penalties = calculatePenalties([...arrears, ...baseCharges], new Date().toISOString(), []);
-        
-        const fullCharges = [...arrears, ...baseCharges, ...penalties];
-        const res = applyPaymentsAndAdjustments(fullCharges, payments, adjustments);
-        setCurrentLedger(res.ledger.filter(c => c.netDue > 0)); 
+        const dbCharges = chargeSnap.docs.map(d => ({ ...d.data(), id: d.id }));
+
+        if (dbCharges.length === 0) {
+          setCurrentLedger([]);
+          return;
+        }
+
+        const summary = calculateStudentDue({
+          student: selectedStudentObj,
+          charges: dbCharges,
+          classSettings,
+          payments,
+          adjustments
+        });
+
+        setCurrentLedger(summary.ledger.filter(c => c.netDue > 0));
       } catch (e) { console.error(e); }
     };
     fetchLedger();
@@ -517,7 +698,7 @@ function FeeAdjustmentModule({ selectedSchool, userPermissions }) {
 
   return (
     <div className="glass-card" style={{ padding: 24 }}>
-      <h2>Adjust / Waive Exact Charge</h2>
+      <h2>Reduce Fee / फीस कम करें</h2>
       <div className="form-group">
         <label className="form-label">Select Student</label>
         <select className="form-input" value={studentId} onChange={e => setStudentId(e.target.value)}>
@@ -547,7 +728,7 @@ function FeeAdjustmentModule({ selectedSchool, userPermissions }) {
       </div>
 
       <button className="btn-primary" onClick={handleAdjustment} disabled={isSaving || !selectedChargeId}>
-        {isSaving ? 'Saving...' : 'Apply Waiver'}
+        {isSaving ? 'Saving...' : 'Reduce Fee / फीस कम करें'}
       </button>
     </div>
   );
@@ -556,30 +737,124 @@ function FeeAdjustmentModule({ selectedSchool, userPermissions }) {
 // ────────────────────────────────────────────────────────────────────────────
 // INVOICES (Read-Only History)
 // ────────────────────────────────────────────────────────────────────────────
-function InvoicesModule({ selectedSchool }) {
+function InvoicesModule({ selectedSchool, dict }) {
   const [invoices, setInvoices] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState('');
+
   useEffect(() => {
-    let q = query(collection(db, "invoices"), orderBy("date", "desc"));
-    if (selectedSchool !== 'ALL') q = query(q, where("schoolId", "==", selectedSchool));
-    getDocs(q).then(qs => setInvoices(qs.docs.map(d => ({ id: d.id, ...d.data() }))));
+    const fetchInvoices = async () => {
+      setLoading(true);
+      try {
+        let q = collection(db, "invoices");
+        if (selectedSchool && selectedSchool !== 'ALL') {
+          q = query(q, where("schoolId", "==", selectedSchool));
+        }
+        const qs = await getDocs(q);
+        const list = qs.docs.map(d => ({ id: d.id, ...d.data() }));
+        list.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+        setInvoices(list);
+      } catch (err) {
+        console.error("Error fetching invoices:", err);
+      } finally {
+        setLoading(false);
+      }
+    };
+    fetchInvoices();
   }, [selectedSchool]);
+
+  const filteredInvoices = invoices.filter(inv => {
+    if (!search.trim()) return true;
+    const s = search.toLowerCase();
+    return (
+      (inv.student || '').toLowerCase().includes(s) ||
+      (inv.receiptId || '').toLowerCase().includes(s) ||
+      (inv.receiptNo || '').toLowerCase().includes(s) ||
+      (inv.class || '').toLowerCase().includes(s)
+    );
+  });
 
   return (
     <div className="glass-card" style={{ padding: 24 }}>
-      <h2>Receipt History</h2>
-      <table className="modern-table">
-        <thead><tr><th>Receipt No</th><th>Student</th><th>Amount</th><th>Date</th></tr></thead>
-        <tbody>
-          {invoices.map(inv => (
-            <tr key={inv.id}>
-              <td>{inv.receiptId}</td>
-              <td>{inv.student}</td>
-              <td>₹{inv.amount}</td>
-              <td>{new Date(inv.date).toLocaleDateString()}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20, flexWrap: 'wrap', gap: 12 }}>
+        <div>
+          <h2 style={{ margin: 0, fontSize: 20, fontWeight: 800 }}>{dict?.invoicesAndReceipts || 'Issued Receipts & History'}</h2>
+          <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>
+            {filteredInvoices.length} receipt(s) found
+          </span>
+        </div>
+        <div style={{ position: 'relative', minWidth: 260 }}>
+          <input
+            type="text"
+            className="form-input"
+            placeholder="Search by student, receipt no, class..."
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            style={{ paddingLeft: 36, width: '100%' }}
+          />
+          <Search size={16} style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-secondary)' }} />
+        </div>
+      </div>
+
+      {loading ? (
+        <div style={{ textAlign: 'center', padding: '40px 0', color: 'var(--text-secondary)' }}>
+          Loading receipts...
+        </div>
+      ) : filteredInvoices.length === 0 ? (
+        <div style={{ textAlign: 'center', padding: '40px 0', color: 'var(--text-secondary)' }}>
+          No issued receipts found.
+        </div>
+      ) : (
+        <div style={{ overflowX: 'auto' }}>
+          <table className="modern-table">
+            <thead>
+              <tr>
+                <th>{dict?.receiptNo || 'Receipt No'}</th>
+                <th>Student</th>
+                <th>Class</th>
+                <th>Fee Breakdown</th>
+                <th>Amount</th>
+                <th>Date</th>
+                <th style={{ textAlign: 'right' }}>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredInvoices.map(inv => (
+                <tr key={inv.id}>
+                  <td style={{ fontFamily: 'var(--font-mono)', fontWeight: 700 }}>
+                    {inv.receiptId || inv.receiptNo || inv.id?.slice(0, 10)}
+                  </td>
+                  <td style={{ fontWeight: 600 }}>{inv.student || 'N/A'}</td>
+                  <td>
+                    <span className="badge" style={{ backgroundColor: 'var(--bg-secondary)' }}>{inv.class || 'N/A'}</span>
+                  </td>
+                  <td style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                    {inv.allocations && inv.allocations.length > 0
+                      ? inv.allocations.map(a => `${a.label || a.componentId}: ₹${a.amount}`).join(', ')
+                      : 'Fee Payment'}
+                  </td>
+                  <td style={{ fontWeight: 800, fontFamily: 'var(--font-mono)', color: 'var(--success)' }}>
+                    ₹{Number(inv.amount || 0).toLocaleString()}
+                  </td>
+                  <td style={{ fontSize: 13 }}>
+                    {inv.date ? new Date(inv.date).toLocaleDateString() : 'N/A'}
+                  </td>
+                  <td style={{ textAlign: 'right' }}>
+                    <button
+                      className="btn-secondary"
+                      style={{ padding: '6px 12px', fontSize: 12, display: 'inline-flex', alignItems: 'center', gap: 6 }}
+                      onClick={() => generateFeeReceipt(inv, { name: inv.student, class: inv.class, id: inv.studentId })}
+                      title="Print / Download Receipt"
+                    >
+                      <Printer size={14} /> Print Receipt
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }

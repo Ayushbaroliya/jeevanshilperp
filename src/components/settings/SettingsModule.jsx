@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { X, Plus, Key, Shield, Trash2, Briefcase, Save } from 'lucide-react';
-import { collection, addDoc, getDocs, query, orderBy, updateDoc, doc, deleteDoc, serverTimestamp, setDoc, where } from 'firebase/firestore';
+import { collection, addDoc, getDocs, query, orderBy, updateDoc, doc, deleteDoc, serverTimestamp, setDoc, where , writeBatch} from 'firebase/firestore';
 import { httpsCallable } from 'firebase/functions';
 import { createStaffAuthAccount, db, functions } from '../../firebase';
 import { SCHOOLS } from '../../utils/translations';
@@ -8,7 +8,7 @@ import { DEFAULT_ROLE_PERMISSIONS, getUserPermissions } from '../../utils/permis
 import { auditLogGovernance } from '../../utils/audit';
 import ManagePermissionsModal from './ManagePermissionsModal';
 import SchoolFolderPicker from '../common/SchoolFolderPicker';
-import { FEE_FREQUENCIES, INSTALLMENTS, DEFAULT_FEE_COMPONENTS, getDefaultFeeComponents, normalizeClassFeeSettings } from '../../utils/feeEngine';
+import { FEE_FREQUENCIES, INSTALLMENTS, DEFAULT_FEE_COMPONENTS, getDefaultFeeComponents, getJSICFeeComponents, getJSPSFeeComponents, normalizeClassFeeSettings } from '../../utils/feeEngine';
 
 export default function SettingsModule({ lang, classes, setClasses, classSettings, setClassSettings, sections, setSections, onNavigate, setSelectedTeacher, selectedSchool, setSelectedSchool, currentUser, activeAcademicYearId }) {
   const [activeTab, setActiveTab] = useState('school'); // 'school' | 'staff' | 'assignments' | 'academic'
@@ -122,6 +122,11 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
     );
   }
 
+const normalizeSectionQuery = (sec) => {
+  if (!sec) return '';
+  return sec.replace(/^Section\s+/i, '').trim();
+};
+
   const handleAddAssignment = async (e) => {
     e.preventDefault();
     if (!newAssignment.class || !newAssignment.section || !newAssignment.teacherId) {
@@ -129,38 +134,74 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
       return;
     }
 
+    if (!activeAcademicYearId || !activeAcademicYearId.trim()) {
+      alert("Configuration Error: Active academic year is missing for this school. Please configure and set the active academic year in the Academic Years tab first.");
+      return;
+    }
+
+    const targetSchool = selectedSchool !== 'ALL' ? selectedSchool : 'SCH_01';
+    const teacher = staffList.find(s => s.id === newAssignment.teacherId);
+    if (!teacher) {
+      alert("Selected teacher not found.");
+      return;
+    }
+
+    if (teacher.schoolId && teacher.schoolId !== 'ALL' && teacher.schoolId !== targetSchool) {
+      alert(`Teacher ${teacher.name} belongs to ${teacher.schoolId}, not ${targetSchool}. Only teachers belonging to the selected school may be assigned.`);
+      return;
+    }
+
     const targetSections = newAssignment.section === 'ALL' 
       ? sections 
       : [newAssignment.section];
     
-    const teacher = staffList.find(s => s.id === newAssignment.teacherId);
     let successCount = 0;
 
     for (const sec of targetSections) {
-      const existing = assignmentsList.find(a => a.class === newAssignment.class && a.section === sec);
+      const normSec = normalizeSectionQuery(sec);
+      const existing = assignmentsList.find(a => 
+        a.class === newAssignment.class && 
+        (normalizeSectionQuery(a.section) === normSec || a.section === sec) &&
+        (a.schoolId === targetSchool) &&
+        (a.academicYearId === activeAcademicYearId)
+      );
+
       if (existing) {
-        if (!window.confirm(`Class ${newAssignment.class} (${sec}) already has a teacher assigned. Reassign?`)) {
+        if (existing.teacherId === teacher.id) {
+          // Already assigned to this exact teacher for this academic year
           continue;
         }
-        try {
-          await deleteDoc(doc(db, "class_assignments", existing.id));
-        } catch (err) {
-          console.error("Error removing old assignment", err);
+        const confirmReassign = window.confirm(
+          `Class ${newAssignment.class} (${sec}) in ${targetSchool} is currently assigned to "${existing.teacherName}".\n\nDo you want to explicitly reassign this section to "${teacher.name}"?`
+        );
+        if (!confirmReassign) {
+          continue;
         }
       }
       
       try {
-        const targetSchool = selectedSchool !== 'ALL' ? selectedSchool : 'SCH_01';
-        const assignmentId = `${targetSchool}_AY_2025_26_${newAssignment.class}_${sec}`;
-        await setDoc(doc(db, "class_assignments", assignmentId), {
+        const assignmentId = `${targetSchool}_${activeAcademicYearId}_${newAssignment.class}_${normSec || sec}`;
+        const assignmentData = {
           class: newAssignment.class,
           section: sec,
+          normalizedSection: normSec,
           teacherId: teacher.id,
           teacherName: teacher.name,
-          academicYearId: 'AY_2025_26',
-          createdAt: new Date().toISOString(),
-          schoolId: targetSchool
-        });
+          academicYearId: activeAcademicYearId,
+          schoolId: targetSchool,
+          updatedAt: new Date().toISOString(),
+          updatedBy: currentUser?.name || currentUser?.email || 'Administrator'
+        };
+
+        if (existing) {
+          assignmentData.createdAt = existing.createdAt || new Date().toISOString();
+          assignmentData.reassignedFrom = existing.teacherName;
+          assignmentData.previousTeacherId = existing.teacherId;
+        } else {
+          assignmentData.createdAt = new Date().toISOString();
+        }
+
+        await setDoc(doc(db, "class_assignments", assignmentId), assignmentData, { merge: true });
         successCount++;
       } catch (error) {
         console.error("Error adding assignment:", error);
@@ -172,7 +213,7 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
       setNewAssignment({ class: classes[0] || '', section: '', teacherId: '' });
       fetchAssignments();
     } else if (targetSections.length > 0) {
-      alert("Failed to assign class teacher.");
+      alert("No changes made or section is already assigned to this teacher.");
     }
   };
 
@@ -191,8 +232,12 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
   const persistStructureToFirestore = async (updatedClasses, updatedSections) => {
     try {
       await setDoc(doc(db, "school_settings", "settings"), {
-        [`schoolClasses.${selectedSchool}`]: updatedClasses,
-        [`schoolSections.${selectedSchool}`]: updatedSections
+        schoolClasses: {
+          [selectedSchool]: updatedClasses
+        },
+        schoolSections: {
+          [selectedSchool]: updatedSections
+        }
       }, { merge: true });
     } catch (e) {
       console.error('Auto-save classes/sections failed:', e);
@@ -204,9 +249,12 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
     if (classTrimmed && !classes.some(c => c.toLowerCase() === classTrimmed.toLowerCase())) {
       const updated = [...classes, classTrimmed];
       setClasses(updated);
+      const defaultComps = selectedSchool === 'SCH_01'
+        ? getJSPSFeeComponents(classTrimmed, activeAcademicYearId || '2026-2027')
+        : getJSICFeeComponents(classTrimmed, activeAcademicYearId || '2026-2027');
       setClassSettings(prev => ({
         ...prev,
-        [classTrimmed]: normalizeClassFeeSettings({ academicYear: activeAcademicYearId || '2026-2027', components: DEFAULT_FEE_COMPONENTS.map(c => ({ ...c })) })
+        [classTrimmed]: normalizeClassFeeSettings({ academicYear: activeAcademicYearId || '2026-2027', components: defaultComps }, activeAcademicYearId || '2026-2027')
       }));
       setNewClass('');
       await persistStructureToFirestore(updated, sections);
@@ -534,37 +582,63 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
           </div>
 
           <div className="glass-card">
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, marginBottom: 16 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, marginBottom: 20, flexWrap: 'wrap', background: 'var(--bg-secondary)', padding: '16px 20px', borderRadius: 16, border: '1px solid var(--border-light)' }}>
               <div>
                 <h2 style={{ fontSize: 18, fontWeight: 700, margin: 0 }}>Class-Specific Fee Structure</h2>
-                <p style={{ margin: '6px 0 0', color: 'var(--text-secondary)', fontSize: 13 }}>
-                  Configure exactly which fees apply to each class. Frequency controls when the charge is created; grace is the payment window after its due date.
+                <p style={{ margin: '4px 0 0', color: 'var(--text-secondary)', fontSize: 13 }}>
+                  Configure fee components, amounts, installment schedules, due days, and late fees for each class.
                 </p>
               </div>
-              <button 
-                className="btn-primary" 
-                onClick={async () => {
-                  try {
-                    await setDoc(doc(db, "school_settings", "settings"), {
-                      [`schoolClassSettings.${selectedSchool}`]: classSettings,
-                      [`schoolClasses.${selectedSchool}`]: classes,
-                      [`schoolSections.${selectedSchool}`]: sections
-                    }, { merge: true });
-                    alert("Settings saved to Cloud successfully!");
-                  } catch (e) {
-                    alert("Error saving settings.");
-                    console.error(e);
-                  }
-                }}
-                style={{ backgroundColor: '#10b981', borderColor: '#10b981' }}
-              >
-                <Save size={16} /> Save Configuration
-              </button>
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 8 }}>
+                  <span style={{ fontSize: 13, color: 'var(--danger)', fontWeight: 600 }}>
+                    ⚠️ Warning: Saving will instantly update student dues across the entire system based on the configuration below.
+                  </span>
+                  <button 
+                    className="btn-primary" 
+                    onClick={async () => {
+                      if (!window.confirm("Are you sure you want to save this configuration? This will instantly affect all due fees.")) return;
+                      try {
+                        const normalizedMap = {};
+                        for (const cls of classes) {
+                          let cfg = classSettings[cls] || {};
+                          let settings = normalizeClassFeeSettings(cfg, activeAcademicYearId);
+                          if (!settings.components || settings.components.length === 0 || !settings.components.some(c => c.id === 'tuition' && c.amount > 0)) {
+                             settings.components = selectedSchool === 'SCH_01'
+                               ? getJSPSFeeComponents(cls, activeAcademicYearId)
+                               : getJSICFeeComponents(cls, activeAcademicYearId);
+                          }
+                          normalizedMap[cls] = settings;
+                        }
+                        await setDoc(doc(db, "school_settings", "settings"), {
+                          schoolClassSettings: {
+                            [selectedSchool]: normalizedMap
+                          },
+                          schoolClasses: {
+                            [selectedSchool]: classes
+                          },
+                          schoolSections: {
+                            [selectedSchool]: sections
+                          }
+                        }, { merge: true });
+                        alert("Settings saved to Cloud successfully!");
+                      } catch (e) {
+                        alert("Error saving settings: " + e.message);
+                        console.error(e);
+                      }
+                    }}
+                    style={{ backgroundColor: 'var(--danger)', borderColor: 'var(--danger)', padding: '10px 20px', fontSize: 14, fontWeight: 700 }}
+                  >
+                    <Save size={18} /> Save Configuration
+                  </button>
+                </div>
             </div>
 
             {classes.map(cls => {
               const settings = normalizeClassFeeSettings(classSettings[cls] || {});
-              const components = settings.components?.length ? settings.components : getDefaultFeeComponents(activeAcademicYearId);
+              const defaultComps = selectedSchool === 'SCH_01'
+                ? getJSPSFeeComponents(cls, activeAcademicYearId)
+                : getJSICFeeComponents(cls, activeAcademicYearId);
+              const components = settings.components?.length ? settings.components : defaultComps;
               const updateComponent = (id, updates) => {
                 setClassSettings(prev => ({
                   ...prev,
@@ -581,22 +655,46 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
                 updateComponent(id, { installments: next });
               };
               return (
-                <div key={cls} style={{ marginBottom: 20, border: '1px solid var(--border-light)', borderRadius: 12, overflow: 'hidden' }}>
-                  <div style={{ padding: '12px 14px', background: 'var(--bg-secondary)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
-                    <strong>{cls}</strong>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-                      <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>Due day</span>
-                      <input type="number" min="1" max="28" className="form-input" style={{ width: 62, padding: '6px 8px' }} value={settings.duePolicy?.defaultDueDay ?? 10} onChange={e => setClassSettings(prev => ({ ...prev, [cls]: { ...settings, duePolicy: { ...(settings.duePolicy || {}), defaultDueDay: Number(e.target.value) || 10 } } }))} />
-                      <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>Sep penalty</span>
-                      <input type="number" min="0" className="form-input" style={{ width: 70, padding: '6px 8px' }} value={settings.duePolicy?.septemberPenalty ?? 100} onChange={e => setClassSettings(prev => ({ ...prev, [cls]: { ...settings, duePolicy: { ...(settings.duePolicy || {}), septemberPenalty: Number(e.target.value) || 0 } } }))} />
-                      <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>Dec penalty</span>
-                      <input type="number" min="0" className="form-input" style={{ width: 70, padding: '6px 8px' }} value={settings.duePolicy?.decemberPenalty ?? 500} onChange={e => setClassSettings(prev => ({ ...prev, [cls]: { ...settings, duePolicy: { ...(settings.duePolicy || {}), decemberPenalty: Number(e.target.value) || 0 } } }))} />
-                      <label style={{ fontSize: 11, display: 'flex', alignItems: 'center', gap: 4 }}><input type="checkbox" checked={settings.duePolicy?.decemberClearWaivesPenalty !== false} onChange={e => setClassSettings(prev => ({ ...prev, [cls]: { ...settings, duePolicy: { ...(settings.duePolicy || {}), decemberClearWaivesPenalty: e.target.checked } } }))} />Clear all in Dec waives penalty</label>
+                <div key={cls} style={{ marginBottom: 24, border: '1px solid var(--border-light)', borderRadius: 12, overflow: 'hidden', backgroundColor: 'var(--bg-card)' }}>
+                  <div style={{ padding: '14px 18px', background: 'var(--bg-secondary)', display: 'flex', flexDirection: 'column', gap: 12, borderBottom: '1px solid var(--border-light)' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+                      <strong style={{ fontSize: 16, color: 'var(--text-primary)' }}>{cls}</strong>
+                      <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>Class Policy & Late Fee Rules</span>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap', fontSize: 12, color: 'var(--text-secondary)' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <span>Due Day of Month:</span>
+                        <input type="number" min="1" max="28" className="form-input" style={{ width: 62, padding: '4px 8px' }} value={settings.duePolicy?.defaultDueDay ?? 10} onChange={e => setClassSettings(prev => ({ ...prev, [cls]: { ...settings, duePolicy: { ...(settings.duePolicy || {}), defaultDueDay: Number(e.target.value) || 10 } } }))} />
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <span>October Late Fee / अक्टूबर की लेट फीस:</span>
+                        <span style={{ fontSize: 11 }}>₹</span>
+                        <input type="number" min="0" className="form-input" style={{ width: 70, padding: '4px 8px' }} value={settings.duePolicy?.septemberPenalty ?? 100} onChange={e => setClassSettings(prev => ({ ...prev, [cls]: { ...settings, duePolicy: { ...(settings.duePolicy || {}), septemberPenalty: Number(e.target.value) || 0 } } }))} />
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <span>December Late Fee / दिसंबर की लेट फीस:</span>
+                        <span style={{ fontSize: 11 }}>₹</span>
+                        <input type="number" min="0" className="form-input" style={{ width: 70, padding: '4px 8px' }} value={settings.duePolicy?.decemberPenalty ?? 500} onChange={e => setClassSettings(prev => ({ ...prev, [cls]: { ...settings, duePolicy: { ...(settings.duePolicy || {}), decemberPenalty: Number(e.target.value) || 0 } } }))} />
+                      </div>
+                      <label style={{ fontSize: 11, display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+                        <input type="checkbox" checked={settings.duePolicy?.decemberClearWaivesPenalty !== false} onChange={e => setClassSettings(prev => ({ ...prev, [cls]: { ...settings, duePolicy: { ...(settings.duePolicy || {}), decemberClearWaivesPenalty: e.target.checked } } }))} />
+                        <span>Clear all in Dec removes late fee / दिसंबर में सब जमा होने पर लेट फीस हटेगी</span>
+                      </label>
                     </div>
                   </div>
-                  <div style={{ overflowX: 'auto' }}>
-                    <table className="modern-table">
-                      <thead><tr><th>Use</th><th>Fee</th><th>Amount</th><th>Frequency</th><th>Installment / Schedule</th><th>Penalty</th><th>Grace (days)</th></tr></thead>
+                  <div style={{ overflowX: 'auto', width: '100%', WebkitOverflowScrolling: 'touch' }}>
+                    <table className="modern-table" style={{ width: '100%', minWidth: 820 }}>
+                      <thead>
+                        <tr>
+                          <th style={{ width: 45, textAlign: 'center' }}>Use</th>
+                          <th style={{ minWidth: 140 }}>Fee Name</th>
+                          <th style={{ minWidth: 110 }}>Amount (₹)</th>
+                          <th style={{ minWidth: 160 }}>Frequency</th>
+                          <th style={{ minWidth: 320 }}>Installment / Schedule</th>
+                          <th style={{ minWidth: 100 }}>Late Fee (₹)</th>
+                          <th style={{ minWidth: 90 }}>Grace (Days)</th>
+                        </tr>
+                      </thead>
                       <tbody>
                         {components.map(c => (
                           <tr key={c.id}>
@@ -611,7 +709,24 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
                                 value={c.amount ?? 0} 
                                 onChange={e => {
                                   const val = Number(e.target.value) || 0;
-                                  updateComponent(c.id, { amount: val, ...(val > 0 && !c.enabled ? { enabled: true } : {}) });
+                                  if (c.id === 'tuition') {
+                                    const yr = (activeAcademicYearId || '2026').match(/\d{4}/)?.[0] || '2026';
+                                    let jA, oA, dA;
+                                    if (val === 7500) {
+                                      jA = 3000; oA = 2500; dA = 2000;
+                                    } else {
+                                      const third = Math.round(val / 3);
+                                      jA = third; oA = third; dA = val - (third * 2);
+                                    }
+                                    const updatedSched = [
+                                      { dueDate: `${yr}-07-10`, label: 'July Installment', amount: jA },
+                                      { dueDate: `${yr}-10-10`, label: 'October Installment / अक्टूबर की किस्त', amount: oA },
+                                      { dueDate: `${yr}-12-10`, label: 'December Installment', amount: dA }
+                                    ];
+                                    updateComponent(c.id, { amount: val, schedule: updatedSched, ...(val > 0 && !c.enabled ? { enabled: true } : {}) });
+                                  } else {
+                                    updateComponent(c.id, { amount: val, ...(val > 0 && !c.enabled ? { enabled: true } : {}) });
+                                  }
                                 }} 
                               />
                             </td>
@@ -620,8 +735,62 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
                                 {FEE_FREQUENCIES.map(f => <option key={f.value} value={f.value}>{f.label}</option>)}
                               </select>
                             </td>
-                            <td style={{ minWidth: 220 }}>
-                              {(c.frequency === 'specific_installments' || c.frequency === 'one_time' || c.frequency === 'every_installment') ? (
+                            <td style={{ minWidth: 260 }}>
+                              {c.id === 'tuition' ? (
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                                  {INSTALLMENTS.map(inst => {
+                                    const isChecked = (c.installments || []).includes(inst.id);
+                                    const schedItem = (c.schedule || []).find(s => 
+                                      (inst.id === 'july' && s.dueDate?.includes('-07-')) ||
+                                      (inst.id === 'september' && (s.dueDate?.includes('-09-') || s.dueDate?.includes('-10-'))) ||
+                                      (inst.id === 'december' && s.dueDate?.includes('-12-'))
+                                    );
+                                    const currentInstAmt = schedItem?.amount ?? (c.amount ? Math.round(c.amount / 3) : 0);
+                                    
+                                    return (
+                                      <div key={inst.id} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
+                                        <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', minWidth: 140 }}>
+                                          <input type="checkbox" checked={isChecked} onChange={() => toggleInstallment(c.id, inst.id)} />
+                                          <span>{inst.label}</span>
+                                        </label>
+                                        {isChecked && (
+                                          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                                            <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>₹</span>
+                                            <input
+                                              type="number"
+                                              min="0"
+                                              className="form-input"
+                                              style={{ width: 85, padding: '4px 6px', fontSize: 12 }}
+                                              value={currentInstAmt}
+                                              onChange={(e) => {
+                                                const newAmt = Number(e.target.value) || 0;
+                                                const yr = (activeAcademicYearId || '2026').match(/\d{4}/)?.[0] || '2026';
+                                                const targetDueDate = `${yr}-${inst.dueMonth}-${inst.dueDay}`;
+                                                
+                                                let updatedSched = [...(c.schedule || [])];
+                                                const existingIdx = updatedSched.findIndex(s => 
+                                                  (inst.id === 'july' && s.dueDate?.includes('-07-')) ||
+                                                  (inst.id === 'september' && (s.dueDate?.includes('-09-') || s.dueDate?.includes('-10-'))) ||
+                                                  (inst.id === 'december' && s.dueDate?.includes('-12-'))
+                                                );
+                                                
+                                                if (existingIdx >= 0) {
+                                                  updatedSched[existingIdx] = { ...updatedSched[existingIdx], dueDate: targetDueDate, label: inst.label, amount: newAmt };
+                                                } else {
+                                                  updatedSched.push({ dueDate: targetDueDate, label: inst.label, amount: newAmt });
+                                                }
+                                                
+                                                const totalAmt = updatedSched.reduce((sum, item) => sum + (item.amount || 0), 0);
+                                                updateComponent(c.id, { schedule: updatedSched, amount: totalAmt });
+                                              }}
+                                            />
+                                          </div>
+                                        )}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              ) : (c.frequency === 'specific_installments' || c.frequency === 'one_time' || c.frequency === 'every_installment') ? (
                                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                                   {INSTALLMENTS.map(i => <label key={i.id} style={{ fontSize: 11, display: 'flex', alignItems: 'center', gap: 4 }}>
                                     <input type="checkbox" checked={(c.installments || []).includes(i.id)} onChange={() => toggleInstallment(c.id, i.id)} />
@@ -839,9 +1008,11 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
                 <label className="form-label" style={{ fontWeight: 700 }}>Select Teacher</label>
                 <select className="form-input" value={newAssignment.teacherId} onChange={e => setNewAssignment({ ...newAssignment, teacherId: e.target.value })}>
                   <option value="">Select Teacher</option>
-                  {staffList.filter(s => s.role === 'Teacher' || s.role === 'Senior Teacher').map(t => (
-                    <option key={t.id} value={t.id}>{t.name}</option>
-                  ))}
+                  {staffList
+                    .filter(s => (s.role === 'Teacher' || s.role === 'Senior Teacher') && (!s.schoolId || s.schoolId === 'ALL' || s.schoolId === selectedSchool))
+                    .map(t => (
+                      <option key={t.id} value={t.id}>{t.name} ({t.schoolId === 'ALL' ? 'All Campuses' : t.schoolId})</option>
+                    ))}
                 </select>
               </div>
               <button type="submit" className="btn-primary">Assign Teacher</button>
@@ -863,6 +1034,7 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
                       <th>Class</th>
                       <th>Section</th>
                       <th>Assigned Teacher</th>
+                      <th>Academic Year</th>
                       <th style={{ textAlign: 'right' }}>Actions</th>
                     </tr>
                   </thead>
@@ -871,7 +1043,19 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
                       <tr key={assignment.id}>
                         <td style={{ fontWeight: 700 }}>{assignment.class}</td>
                         <td style={{ fontWeight: 700 }}>{assignment.section}</td>
-                        <td style={{ fontWeight: 600 }}>{assignment.teacherName}</td>
+                        <td style={{ fontWeight: 600 }}>
+                          <div>{assignment.teacherName}</div>
+                          {assignment.reassignedFrom && (
+                            <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+                              Reassigned from {assignment.reassignedFrom}
+                            </div>
+                          )}
+                        </td>
+                        <td>
+                          <span className="badge" style={{ backgroundColor: 'rgba(16, 185, 129, 0.1)', color: '#10b981', fontSize: 11, fontWeight: 700 }}>
+                            {assignment.academicYearId || activeAcademicYearId || 'AY_2026_27'}
+                          </span>
+                        </td>
                         <td style={{ textAlign: 'right' }}>
                           <button
                             className="icon-btn"
@@ -891,6 +1075,8 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
           </div>
         </div>
       )}
+
+
     </div>
   );
 }

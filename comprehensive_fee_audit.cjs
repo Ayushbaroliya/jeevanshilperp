@@ -25,7 +25,7 @@ function runTest(name, fn) {
 }
 
 // Mock base data
-const s1 = { id: 's1', name: 'John Doe', academicYear: '2026-2027', dueAmount: 0 };
+const s1 = { id: 's1', name: 'John Doe', academicYear: '2026-2027', dueAmount: 0, isNewAdmission: true };
 const feeTemplate = {
   components: [
     { id: 'admission', name: 'Admission', amount: 10000, schedule: [{ dueDate: '2026-04-10', label: 'One Time' }] },
@@ -64,7 +64,7 @@ runTest("2. Student with opening arrears", () => {
 
 // 3. One-time admission fee
 runTest("3. One-time admission fee", () => {
-  const charges = generateChargeSchedule(s1, { components: [{ id: 'admission', amount: 10000, schedule: [{ dueDate: '2026-04-10' }] }] }, '2026-2027');
+  const charges = generateChargeSchedule({ ...s1, isNewAdmission: true }, { components: [{ id: 'admission', amount: 10000, schedule: [{ dueDate: '2026-04-10' }] }] }, '2026-2027');
   if (charges.length !== 1 || charges[0].componentId !== 'admission') throw new Error("Admission charge incorrect");
 });
 

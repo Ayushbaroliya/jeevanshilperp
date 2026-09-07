@@ -19,17 +19,27 @@ export default function OperationsDashboard({ onNavigate, selectedSchool, classS
       setLoading(true);
       
       // 1. Fetch Students
-      let studentsQ = collection(db, 'students');
-      if (selectedSchool !== 'ALL') {
-        studentsQ = query(studentsQ, where('schoolId', '==', selectedSchool));
-      }
-      const studentsSnap = await getDocs(studentsQ);
-      let totalStudents = 0;
+      let totalStudents = null;
+      let hasError = false;
       const uniqueClasses = new Set();
-      studentsSnap.forEach(d => {
-        totalStudents++;
-        uniqueClasses.add(d.data().class);
-      });
+      try {
+        let studentsQ = collection(db, 'students');
+        if (selectedSchool !== 'ALL') {
+          studentsQ = query(studentsQ, where('schoolId', '==', selectedSchool));
+        }
+        const studentsSnap = await getDocs(studentsQ);
+        totalStudents = 0;
+        studentsSnap.forEach(d => {
+          const s = d.data();
+          if (s.status !== 'Deleted' && s.status !== 'archived') {
+            totalStudents++;
+            if (s.class) uniqueClasses.add(s.class);
+          }
+        });
+      } catch (err) {
+        console.error('Error fetching students count:', err);
+        hasError = true;
+      }
 
       // 2. Fetch Fee Summaries (Authoritative, No Payroll)
       const feeData = await fetchAuthoritativeFeeSummary(selectedSchool, activeAcademicYearId, classSettings);
@@ -61,7 +71,8 @@ export default function OperationsDashboard({ onNavigate, selectedSchool, classS
         totalStudents,
         classesCount: uniqueClasses.size,
         totalFeeCollection: feeData.totalFeeCollection,
-        todayAttendancePercent: attendancePercent
+        todayAttendancePercent: attendancePercent,
+        hasError
       });
       setLoading(false);
     };
@@ -91,7 +102,7 @@ export default function OperationsDashboard({ onNavigate, selectedSchool, classS
             </div>
           </div>
           <div style={{ fontSize: 24, fontWeight: 800 }}>
-            {loading ? '...' : stats.totalStudents.toLocaleString()}
+            {loading ? '...' : stats.hasError ? 'Unavailable' : (stats.totalStudents ?? 0).toLocaleString()}
           </div>
         </div>
 

@@ -1,0 +1,165 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Core auth helpers ─────────────────────────────────────────────────────
+    function signedIn()  { return request.auth != null; }
+    function profile()   { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function hasProfile(){ return signedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)); }
+
+    // Top authority = Owner or Director
+    function isOwner()      { return hasProfile() && (profile().role == 'Owner' || profile().role == 'Director'); }
+    function isAdmin()      { return hasProfile() && (profile().role == 'Administrator' || isOwner()); }
+    function isPrincipal()  { return hasProfile() && profile().role == 'Principal'; }
+    function isAccountant() { return hasProfile() && profile().role == 'Accountant'; }
+
+    // School-scoped access: Owner/Director can see all schools; others only their own
+    function sameSchool(schoolId) {
+      return signedIn() && (isOwner() || (hasProfile() && profile().schoolId == schoolId));
+    }
+
+    // Finance permission: Admin, Accountant, or custom permission flag
+    function canAdjustFees() {
+      return signedIn() && (
+        isAdmin() ||
+        isAccountant() ||
+        (hasProfile() && profile().customPermissions.adjustFees == true)
+      );
+    }
+
+    // Teacher assignment permission for Academics
+    function isAssignedTeacher(schoolId, academicYearId, classId, sectionId) {
+      let docPath = /databases/$(database)/documents/class_assignments/$(schoolId + '_' + academicYearId + '_' + classId + '_' + sectionId);
+      return signedIn() && exists(docPath) && get(docPath).data.teacherId == request.auth.uid;
+    }
+
+    // ── Users collection ──────────────────────────────────────────────────────
+    match /users/{uid} {
+      // Any signed-in user can read their own profile; Admin can read all
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      // Admin can create/update any staff profile
+      allow create: if isAdmin() && request.resource.data.role in [
+        'Teacher', 'Senior Teacher', 'Accountant', 'Principal',
+        'Administrator', 'Peon', 'Driver', 'Watchman'
+      ] && (request.resource.data.role != 'Administrator' || isOwner());
+      allow update: if isAdmin() && request.resource.data.role in [
+        'Teacher', 'Senior Teacher', 'Accountant', 'Principal',
+        'Administrator', 'Peon', 'Driver', 'Watchman'
+      ] && (request.resource.data.role != 'Administrator' || isOwner())
+        && (isOwner() || request.auth.uid != uid || (request.resource.data.role == resource.data.role && request.resource.data.customPermissions == resource.data.customPermissions));
+      // Nobody can delete a user profile via client SDK
+      allow delete: if false;
+    }
+
+    // ── Students & Yearly Enrollments ──────────────────────────────────────────
+    match /students/{id} {
+      allow read:           if signedIn() && sameSchool(resource.data.schoolId);
+      allow create:         if signedIn() && (isAdmin() || isPrincipal() || isAccountant()) && sameSchool(request.resource.data.schoolId);
+      allow update:         if signedIn() && (isAdmin() || isPrincipal() || isAccountant()) && sameSchool(resource.data.schoolId);
+      allow delete:         if false; // Physical deletion strictly forbidden
+    }
+
+    match /enrollments/{id} {
+      allow read:           if signedIn() && sameSchool(resource.data.schoolId);
+      allow create:         if signedIn() && (isAdmin() || isPrincipal() || isAccountant()) && sameSchool(request.resource.data.schoolId);
+      allow update:         if signedIn() && (isAdmin() || isPrincipal() || isAccountant()) && sameSchool(resource.data.schoolId);
+      allow delete:         if false; // Physical deletion strictly forbidden
+    }
+
+    // ── Staff records ─────────────────────────────────────────────────────────
+    match /staff/{id} {
+      allow read:          if signedIn() && sameSchool(resource.data.schoolId);
+      allow create:        if signedIn() && (isAdmin() || isPrincipal()) && sameSchool(request.resource.data.schoolId) && (request.resource.data.role != 'Administrator' || isOwner());
+      allow update:        if signedIn() && isAdmin() && sameSchool(resource.data.schoolId)
+                           && (request.resource.data.role != 'Administrator' || isOwner())
+                           && (isOwner() || resource.data.uid != request.auth.uid || (request.resource.data.role == resource.data.role && request.resource.data.customPermissions == resource.data.customPermissions));
+      allow delete:        if signedIn() && isAdmin() && sameSchool(resource.data.schoolId);
+    }
+
+    // ── Fee receipts / invoices ───────────────────────────────────────────────
+    match /invoices/{id} {
+      allow read:           if signedIn() && (isAdmin() || ((isAccountant() || isPrincipal()) && sameSchool(resource.data.schoolId)));
+      allow create:         if signedIn() && (isAdmin() || (isAccountant() && sameSchool(request.resource.data.schoolId)));
+      allow update:         if signedIn() && (isAdmin() || (isAccountant() && sameSchool(resource.data.schoolId)));
+      allow delete:         if signedIn() && isAdmin();
+    }
+
+    // ── Fee adjustments ───────────────────────────────────────────────────────
+    match /fee_adjustments/{id} {
+      allow read:           if signedIn() && (isAdmin() || ((debug(isAccountant()) || isPrincipal()) && debug(sameSchool(resource.data.schoolId))));
+      allow create:         if signedIn() && (isAdmin() || (canAdjustFees() && sameSchool(request.resource.data.schoolId)));
+      allow update, delete: if signedIn() && isAdmin();
+    }
+
+    // ── Student ledger (credits, debits, reversals) ───────────────────────────
+    match /student_ledger/{id} {
+      allow read:           if signedIn() && (isAdmin() || ((debug(isAccountant()) || isPrincipal()) && debug(sameSchool(resource.data.schoolId))));
+      allow create:         if signedIn() && (isAdmin() || (isAccountant() && sameSchool(request.resource.data.schoolId)));
+      allow update, delete: if signedIn() && (isAdmin() || (isAccountant() && sameSchool(resource.data.schoolId)));
+    }
+
+    // ── Attendance logs ───────────────────────────────────────────────────────
+    match /attendance_logs/{id} {
+      allow read:   if signedIn() && sameSchool(resource.data.schoolId);
+      allow create: if signedIn() && 
+                    sameSchool(request.resource.data.schoolId) && 
+                    (isAdmin() || isPrincipal() || isAssignedTeacher(request.resource.data.schoolId, request.resource.data.academicYearId, request.resource.data.class, request.resource.data.section));
+      allow update: if signedIn() && sameSchool(resource.data.schoolId) && (isAdmin() || isPrincipal() || isAssignedTeacher(resource.data.schoolId, resource.data.academicYearId, resource.data.class, resource.data.section));
+      allow delete: if false;
+    }
+
+    // ── Exam marks ────────────────────────────────────────────────────────────
+    match /exam_marks/{id} {
+      allow read:   if signedIn() && sameSchool(resource.data.schoolId);
+      allow create: if signedIn() && 
+                    sameSchool(request.resource.data.schoolId) && 
+                    (isAdmin() || isPrincipal() || isAssignedTeacher(request.resource.data.schoolId, request.resource.data.academicYearId, request.resource.data.class, request.resource.data.section));
+      allow update: if signedIn() && sameSchool(resource.data.schoolId) && (isAdmin() || isPrincipal() || isAssignedTeacher(resource.data.schoolId, resource.data.academicYearId, resource.data.class, resource.data.section));
+      allow delete: if signedIn() && isAdmin();
+    }
+
+    // ── Class assignments (teacher ↔ class mapping) ───────────────────────────
+    match /class_assignments/{id} {
+      allow read:           if signedIn() && sameSchool(resource.data.schoolId);
+      allow create:         if signedIn() && sameSchool(request.resource.data.schoolId);
+      allow update, delete: if signedIn() && (isAdmin() || isPrincipal()) && sameSchool(resource.data.schoolId);
+    }
+
+    // ── Staff attendance ──────────────────────────────────────────────────────
+    match /staff_attendance/{id} {
+      allow read:   if signedIn() && sameSchool(resource.data.schoolId);
+      allow create: if signedIn() && sameSchool(request.resource.data.schoolId);
+      allow update: if signedIn() && isAdmin() && sameSchool(resource.data.schoolId);
+      // Nobody can delete staff attendance records via client SDK
+      allow delete: if false;
+    }
+    // ── Staff salary ──────────────────────────────────────────────────────────
+    match /staff_salary/{id} {
+      allow read, write: if signedIn() && isOwner();
+    }
+
+    // ── Payroll ───────────────────────────────────────────────────────────────
+    match /payroll/{id} {
+      allow read, write: if signedIn() && isOwner();
+    }
+
+    // ── School settings (fee structure, classes, sections) ───────────────────
+    match /school_settings/{document=**} {
+      allow read:  if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // ── Governance & Audit ───────────────────────────────────────────────────
+    match /governance_audit/{id} {
+      allow read:   if isAdmin() || isOwner();
+      allow create: if signedIn() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // ── Academic Years ───────────────────────────────────────────────────────
+    match /academic_years/{id} {
+      allow read:   if signedIn();
+      allow write:  if isAdmin() || isOwner();
+    }
+  }
+}

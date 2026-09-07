@@ -9,8 +9,10 @@ import { DEFAULT_ROLE_PERMISSIONS } from '../../utils/permissions';
 export default function OwnerDashboard({ onNavigate, lang, selectedSchool, setSelectedSchool, userPermissions, currentUser, activeAcademicYearId, classSettings }) {
   const [activeTab, setActiveTab] = useState('Overview');
 
-  const [totalStudents, setTotalStudents] = useState(0);
+  const [consolidatedStudents, setConsolidatedStudents] = useState(null);
   const [schoolStudentCounts, setSchoolStudentCounts] = useState({});
+  const [studentsLoading, setStudentsLoading] = useState(true);
+  const [studentsError, setStudentsError] = useState(null);
   const [recentStudents, setRecentStudents] = useState([]);
 
   const [singleSchoolFinancialData, setSingleSchoolFinancialData] = useState([]);
@@ -23,20 +25,25 @@ export default function OwnerDashboard({ onNavigate, lang, selectedSchool, setSe
 
   useEffect(() => {
     const fetchDashboardData = async () => {
+      setStudentsLoading(true);
+      setStudentsError(null);
       try {
         let studentsQ = collection(db, 'students');
         const allStudentsSnap = await getDocs(studentsQ);
-        let total = 0;
-        let counts = {};
+        let counts = { SCH_01: 0, SCH_02: 0, SCH_03: 0 };
         allStudentsSnap.forEach(doc => {
           const s = doc.data();
-          counts[s.schoolId] = (counts[s.schoolId] || 0) + 1;
-          if (selectedSchool === 'ALL' || selectedSchool === s.schoolId) {
-             total++;
+          if (s.status !== 'Deleted' && s.status !== 'archived') {
+            const sid = s.schoolId || 'SCH_01';
+            counts[sid] = (counts[sid] || 0) + 1;
           }
         });
-        setTotalStudents(total);
+        
+        const totalConsolidated = (counts.SCH_01 || 0) + (counts.SCH_02 || 0) + (counts.SCH_03 || 0);
+
+        setConsolidatedStudents(totalConsolidated);
         setSchoolStudentCounts(counts);
+        setStudentsLoading(false);
 
         let recentQ = query(collection(db, 'students'), orderBy('createdAt', 'desc'), limit(4));
         if (selectedSchool !== 'ALL') {
@@ -96,6 +103,10 @@ export default function OwnerDashboard({ onNavigate, lang, selectedSchool, setSe
 
       } catch (e) {
         console.error("Error fetching dashboard data:", e);
+        setStudentsLoading(false);
+        setStudentsError("Live connection unavailable");
+        setConsolidatedStudents(null);
+        setSchoolStudentCounts({});
       }
     };
     fetchDashboardData();
@@ -172,7 +183,7 @@ export default function OwnerDashboard({ onNavigate, lang, selectedSchool, setSe
       <div className="page-header" style={{ marginBottom: 0, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
         <div>
           <h1 className="page-title">{activeSchoolName}</h1>
-          <p className="page-subtitle">Executive overview, financial metrics, and operational hub</p>
+          <p className="page-subtitle">Welcome back, {currentUser?.name || 'Administrator'}</p>
         </div>
       </div>
 
@@ -233,14 +244,20 @@ export default function OwnerDashboard({ onNavigate, lang, selectedSchool, setSe
           </div>
           <div style={{ fontWeight: 700, fontSize: 14 }}>All 3 Schools Combined</div>
           <div style={{ fontSize: 18, fontWeight: 800, color: 'var(--brand-orange)', marginTop: 8 }}>
-            {totalStudents > 0 ? totalStudents.toLocaleString() : '0'} Students
+            {studentsLoading 
+              ? 'Loading...' 
+              : studentsError 
+                ? 'Unavailable' 
+                : `${(consolidatedStudents ?? 0).toLocaleString()} Students`}
           </div>
-          <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>Real-time aggregated view</div>
+          <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+            {studentsError ? 'Live connection error' : 'Real-time aggregated view'}
+          </div>
         </div>
 
         {/* Cards 1, 2, 3: Individual Schools */}
         {SCHOOLS.map((school, i) => {
-          const studentCounts = schoolStudentCounts[school.id] || 0;
+          const studentCounts = schoolStudentCounts[school.id];
           const isSelected = selectedSchool === school.id;
 
           return (
@@ -264,7 +281,11 @@ export default function OwnerDashboard({ onNavigate, lang, selectedSchool, setSe
               </div>
               <div style={{ fontWeight: 700, fontSize: 14 }}>{school.name}</div>
               <div style={{ fontSize: 18, fontWeight: 800, color: 'var(--text-primary)', marginTop: 8 }}>
-                {studentCounts} Students
+                {studentsLoading 
+                  ? 'Loading...' 
+                  : studentsError 
+                    ? 'Unavailable' 
+                    : `${(studentCounts ?? 0).toLocaleString()} Students`}
               </div>
             </div>
           );

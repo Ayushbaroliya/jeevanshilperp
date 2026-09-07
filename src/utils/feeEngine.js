@@ -38,8 +38,15 @@ export function generateChargeSchedule(student, feeTemplate, academicYear) {
   const charges = [];
 
   for (const component of feeTemplate.components) {
+    if (component.enabled === false) continue;
+    
+    if (component.id === 'admission') {
+      const isNew = student?.isNewAdmission === true || student?.admissionType === 'new';
+      if (!isNew) continue;
+    }
     if (!component.schedule || component.schedule.length === 0) continue;
     for (const item of component.schedule) {
+      const amt = item.amount ?? component.amount;
       const chargeId = `chg_${student.id}_${academicYear}_${component.id}_${item.dueDate}`;
       charges.push({
         id: chargeId,
@@ -47,12 +54,12 @@ export function generateChargeSchedule(student, feeTemplate, academicYear) {
         academicYear,
         componentId: component.id,
         label: `${component.name} - ${item.label}`,
-        originalAmount: component.amount,
+        originalAmount: amt,
         dueDate: item.dueDate,
         status: 'unpaid',
         allocatedPaid: 0,
         allocatedAdjusted: 0,
-        netDue: component.amount,
+        netDue: amt,
         type: 'standard'
       });
     }
@@ -362,11 +369,22 @@ export function summarizeDues(student, ledger, advanceCredit = 0, filterAcademic
  * Penalty amounts and deadlines are sourced from classSettings.duePolicy
  * when available; the built-in defaults match the final business rules.
  */
-export function calculateStudentDue({ student, classSettings, payments, adjustments }) {
+export function calculateStudentDue({ student, charges, classSettings, payments, adjustments }) {
+  if (!charges) {
+    return {
+      totalDue: 0,
+      totalPaid: 0,
+      totalConcession: 0,
+      advanceCredit: 0,
+      ledger: [],
+      missingCharges: true
+    };
+  }
+
   const academicYear = student.academicYear || '2026-2027';
   const policy = classSettings?.duePolicy || {};
 
-  const baseCharges = generateChargeSchedule(student, classSettings, academicYear);
+  const baseCharges = charges;
   // NOTE: calculateOpeningArrears via legacy dueAmount is intentionally NOT
   // called here. The source of truth for arrears is the ledger carried forward
   // by closeAcademicYear. Legacy seeding must be done explicitly at enrolment.
@@ -376,8 +394,8 @@ export function calculateStudentDue({ student, classSettings, payments, adjustme
   const rules = [
     {
       id: 'sept_late',
-      label: 'Late Fee – September',
-      deadline: `${academicYear.split('-')[0]}-09-10`,
+      label: 'October Late Fee / अक्टूबर की लेट फीस',
+      deadline: `${academicYear.split('-')[0]}-10-10`,
       graceDays: policy.septemberGraceDays ?? 5,
       amount: policy.septemberPenalty ?? 100,
       waiveIfCleared: false
@@ -411,24 +429,96 @@ export function calculateStudentDue({ student, classSettings, payments, adjustme
 export function normalizeClassFeeSettings(settings, academicYear) {
   if (!settings) return { components: [] };
   if (Array.isArray(settings)) return { components: settings };
-  if (settings.components && Array.isArray(settings.components)) return settings;
 
-  // Minimal legacy-shim for very old flat objects — derive due dates from year
-  const yr = (academicYear || '2026-2027').split('-')[0];
+  const yr = (academicYear || '2026').match(/\d{4}/)?.[0] || '2026';
+
+  // ── Path A: canonical shape — has a components array ──────────────────────
+  if (settings.components && Array.isArray(settings.components)) {
+    const LEGACY_IDS = new Set(['july', 'september', 'december', 'october', 'october_inst', 'october_installment', 'july_inst', 'july_installment', 'december_inst', 'december_installment']);
+
+    // Step 1: remove legacy standalone installment components
+    let comps = settings.components.filter(c => !LEGACY_IDS.has(c.id));
+
+    // Step 2: if no tuition component exists at all, inject a blank one
+    if (!comps.find(c => c.id === 'tuition')) {
+      comps.push({
+        id: 'tuition', name: 'Tuition Fee', amount: 0,
+        enabled: false, frequency: 'every_installment',
+        installments: ['july', 'september', 'december'],
+        dueDay: 10, penalty: 100, graceDays: 5,
+        schedule: [
+          { dueDate: `${yr}-07-10`, label: 'July Installment' },
+          { dueDate: `${yr}-10-10`, label: 'October Installment / अक्टूबर की किस्त' },
+          { dueDate: `${yr}-12-10`, label: 'December Installment' }
+        ]
+      });
+    }
+
+    // Step 3: enforce correct canonical shape on every component
+    comps = comps.map(c => {
+      if (c.id === 'tuition') {
+        if (c.frequency === 'custom' && c.schedule && c.schedule.length > 0) {
+          return c; // Preserve custom schedules (e.g. JSPS config)
+        }
+
+        const existingSched = c.schedule || [];
+        const julyItem = existingSched.find(s => s.dueDate?.includes('-07-'));
+        const octItem  = existingSched.find(s => s.dueDate?.includes('-09-') || s.dueDate?.includes('-10-'));
+        const decItem  = existingSched.find(s => s.dueDate?.includes('-12-'));
+
+        let julyAmt = julyItem?.amount;
+        let octAmt  = octItem?.amount;
+        let decAmt  = decItem?.amount;
+
+        // If schedule items have no explicit amounts set yet, calculate fallbacks based on c.amount
+        if (julyAmt === undefined && octAmt === undefined && decAmt === undefined && c.amount > 0) {
+          if (c.amount === 7500) {
+            julyAmt = 3000; octAmt = 2500; decAmt = 2000;
+          } else {
+            const third = Math.round(c.amount / 3);
+            julyAmt = third; octAmt = third; decAmt = c.amount - (third * 2);
+          }
+        }
+
+        const totalSched = (julyAmt || 0) + (octAmt || 0) + (decAmt || 0);
+
+        return {
+          ...c,
+          amount: totalSched > 0 ? totalSched : (c.amount || 0),
+          frequency: 'every_installment',
+          installments: ['july', 'september', 'december'],
+          schedule: [
+            { dueDate: `${yr}-07-10`, label: 'July Installment', ...(julyAmt !== undefined ? { amount: julyAmt } : {}) },
+            { dueDate: `${yr}-10-10`, label: 'October Installment / अक्टूबर की किस्त', ...(octAmt !== undefined ? { amount: octAmt } : {}) },
+            { dueDate: `${yr}-12-10`, label: 'December Installment', ...(decAmt !== undefined ? { amount: decAmt } : {}) }
+          ]
+        };
+      }
+      if (c.id === 'admission') {
+        return { ...c, frequency: 'one_time', installments: [] };
+      }
+      return c;
+    });
+
+    return { ...settings, components: comps };
+  }
+
+  // ── Path B: very old flat object (e.g. { tuition: 1500, admission: 500 }) ──
   const components = [];
   if (settings.admission > 0) {
     components.push({
-      id: 'admission',
-      name: 'Admission Fee',
-      amount: settings.admission,
+      id: 'admission', name: 'Admission Fee', amount: settings.admission,
+      enabled: true, frequency: 'one_time', installments: [],
+      dueDay: 10, penalty: 0, graceDays: 5,
       schedule: [{ dueDate: `${yr}-07-10`, label: 'One Time' }]
     });
   }
   if (settings.tuition > 0) {
     components.push({
-      id: 'tuition',
-      name: 'Tuition Fee',
-      amount: settings.tuition,
+      id: 'tuition', name: 'Tuition Fee', amount: settings.tuition,
+      enabled: true, frequency: 'every_installment',
+      installments: ['july', 'september', 'december'],
+      dueDay: 10, penalty: 100, graceDays: 5,
       schedule: [
         { dueDate: `${yr}-07-10`, label: 'July Installment' },
         { dueDate: `${yr}-09-10`, label: 'September Installment' },
@@ -439,6 +529,7 @@ export function normalizeClassFeeSettings(settings, academicYear) {
   return { components };
 }
 
+
 // ─── 8. Constants ─────────────────────────────────────────────────────────────
 
 /**
@@ -448,14 +539,14 @@ export function normalizeClassFeeSettings(settings, academicYear) {
  * Admission Fee is SEPARATE and must NOT appear here.
  */
 export const INSTALLMENTS = [
-  { id: 'july',      label: 'July Installment',      dueMonth: '07', dueDay: '10' },
-  { id: 'september', label: 'September Installment',  dueMonth: '09', dueDay: '10' },
-  { id: 'december',  label: 'December Installment',   dueMonth: '12', dueDay: '10' }
+  { id: 'july',      label: 'July Installment',                         dueMonth: '07', dueDay: '10' },
+  { id: 'september', label: 'October Installment / अक्टूबर की किस्त', dueMonth: '10', dueDay: '10' },
+  { id: 'december',  label: 'December Installment',                      dueMonth: '12', dueDay: '10' }
 ];
 
 /**
  * Returns the canonical due date string for a given installment ID and academic year.
- * e.g. installmentDueDate('september', '2026-2027') → '2026-09-10'
+ * e.g. installmentDueDate('september', '2026-2027') → '2026-10-10'
  */
 export function installmentDueDate(installmentId, academicYear) {
   const startYear = (academicYear || '2026-2027').split('-')[0];
@@ -468,7 +559,7 @@ export function installmentDueDate(installmentId, academicYear) {
  * Frequency options for fee components (used in Settings UI).
  */
 export const FEE_FREQUENCIES = [
-  { value: 'every_installment',    label: 'All 3 Installments (Jul / Sep / Dec)' },
+  { value: 'every_installment',    label: 'All 3 Installments (Jul / Oct / Dec)' },
   { value: 'specific_installments', label: 'Specific Installments' },
   { value: 'one_time',             label: 'One Time' },
   { value: 'monthly',              label: 'Monthly' }
@@ -509,7 +600,7 @@ export function getDefaultFeeComponents(academicYear) {
       graceDays: 5,
       schedule: [
         { dueDate: `${yr}-07-10`, label: 'July Installment' },
-        { dueDate: `${yr}-09-10`, label: 'September Installment' },
+        { dueDate: `${yr}-10-10`, label: 'October Installment / अक्टूबर की किस्त' },
         { dueDate: `${yr}-12-10`, label: 'December Installment' }
       ]
     },
@@ -540,14 +631,38 @@ export function getDefaultFeeComponents(academicYear) {
     {
       id: 'practical',
       name: 'Practical Fee',
-      amount: 0,
-      enabled: false,
+      amount: 200,
+      enabled: false,             // NOT PAYABLE / do not enable as payable charge by default
       frequency: 'one_time',
       installments: ['december'],
       dueDay: 10,
       penalty: 0,
       graceDays: 5,
       schedule: [{ dueDate: `${yr}-12-10`, label: 'December Installment' }]
+    },
+    {
+      id: 'registration',
+      name: 'Registration Fee',
+      amount: 100,
+      enabled: false,
+      frequency: 'one_time',
+      installments: ['july'],
+      dueDay: 10,
+      penalty: 0,
+      graceDays: 5,
+      schedule: [{ dueDate: `${yr}-07-10`, label: 'July Installment' }]
+    },
+    {
+      id: 'test',
+      name: 'Test Fee',
+      amount: 200,
+      enabled: false,
+      frequency: 'one_time',
+      installments: ['july'],
+      dueDay: 10,
+      penalty: 0,
+      graceDays: 5,
+      schedule: [{ dueDate: `${yr}-07-10`, label: 'July Installment' }]
     },
     {
       id: 'transport',
@@ -564,8 +679,121 @@ export function getDefaultFeeComponents(academicYear) {
   ];
 }
 
+export function getJSICFeeComponents(className, academicYear) {
+  const defaults = getDefaultFeeComponents(academicYear);
+  const yr = (academicYear || '2026-2027').split('-')[0];
+
+  let admission = 0;
+  let hasAdmission = true;
+  let tuition = 0;
+  let exam = 0;
+  let tuitionSchedule = [
+    { dueDate: `${yr}-07-10`, label: 'July Installment', amount: 2000 },
+    { dueDate: `${yr}-10-10`, label: 'October Installment / अक्टूबर की किस्त', amount: 2000 },
+    { dueDate: `${yr}-12-10`, label: 'December Installment', amount: 2000 }
+  ];
+
+  if (['Class 6', 'Class 7', 'Class 8'].includes(className)) {
+    admission = className === 'Class 6' ? 1200 : 1000;
+    tuition = 6000;
+    exam = 500;
+  } else if (['Class 9', 'Class 10'].includes(className)) {
+    admission = className === 'Class 9' ? 1500 : 0;
+    hasAdmission = className === 'Class 9'; // Class 10 has 0 default but is configurable
+    tuition = 6000;
+    exam = 500;
+  } else if (['Class 11 Art', 'Class 11 Arts', 'Class 12 Art', 'Class 12 Arts'].includes(className)) {
+    const is11 = className.includes('11');
+    admission = is11 ? 1500 : 0;
+    hasAdmission = is11;
+    tuition = 6000;
+    exam = 500;
+  } else if (['Class 11 Science', 'Class 12 Science'].includes(className)) {
+    const is11 = className.includes('11');
+    admission = is11 ? 2000 : 0;
+    hasAdmission = is11;
+    tuition = 7500;
+    exam = 1000;
+    tuitionSchedule = [
+      { dueDate: `${yr}-07-10`, label: 'July Installment', amount: 3000 },
+      { dueDate: `${yr}-10-10`, label: 'October Installment / अक्टूबर की किस्त', amount: 2500 },
+      { dueDate: `${yr}-12-10`, label: 'December Installment', amount: 2000 }
+    ];
+  } else {
+    // Fallback for primary classes if any
+    admission = 1000;
+    tuition = 6000;
+    exam = 500;
+  }
+
+  return defaults.map(comp => {
+    if (comp.id === 'admission') {
+      return { ...comp, amount: admission, enabled: true }; // Always enabled/configurable, even if 0
+    }
+    if (comp.id === 'tuition') {
+      return { ...comp, amount: tuition, schedule: tuitionSchedule, enabled: true };
+    }
+    if (comp.id === 'exam') {
+      return { ...comp, amount: exam, enabled: true };
+    }
+    // Other fees remain as their template defaults (disabled)
+    return comp;
+  });
+}
+
 /**
  * @deprecated Use getDefaultFeeComponents(academicYear) instead.
  * Kept for backward-compat with any remaining static references.
  */
 export const DEFAULT_FEE_COMPONENTS = getDefaultFeeComponents('2026-2027');
+
+export function getJSPSFeeComponents(className, academicYear) {
+  const defaults = getDefaultFeeComponents(academicYear);
+  const yr = (academicYear || '2026-2027').split('-')[0];
+  const yrNext = parseInt(yr) + 1;
+
+  let admission = 0;
+  let tuition = 0;
+  let exam = 0;
+  let inst1_total = 0, inst2_total = 0, inst3_total = 0;
+
+  switch(className) {
+    case 'Nursery': case 'LKG': admission=1700; tuition=6400; exam=600; inst1_total=3000; inst2_total=2000; inst3_total=2000; break;
+    case 'UKG': admission=1800; tuition=6400; exam=600; inst1_total=3000; inst2_total=2000; inst3_total=2000; break;
+    case 'Class 1': admission=2000; tuition=7400; exam=750; inst1_total=4150; inst2_total=2000; inst3_total=2000; break;
+    case 'Class 2': admission=2000; tuition=7500; exam=750; inst1_total=4250; inst2_total=2000; inst3_total=2000; break;
+    case 'Class 3': admission=2000; tuition=7600; exam=750; inst1_total=4350; inst2_total=2000; inst3_total=2000; break;
+    case 'Class 4': admission=2000; tuition=7700; exam=750; inst1_total=4450; inst2_total=2000; inst3_total=2000; break;
+    case 'Class 5': admission=2000; tuition=7800; exam=750; inst1_total=4550; inst2_total=2000; inst3_total=2000; break;
+    case 'Class 6': admission=2000; tuition=8000; exam=750; inst1_total=3750; inst2_total=2500; inst3_total=2500; break;
+    case 'Class 7': admission=2000; tuition=8200; exam=750; inst1_total=3950; inst2_total=2500; inst3_total=2500; break;
+    case 'Class 8': admission=2000; tuition=8400; exam=750; inst1_total=4150; inst2_total=2500; inst3_total=2500; break;
+    default: admission=2000; tuition=6400; exam=600; inst1_total=3000; inst2_total=2000; inst3_total=2000; break;
+  }
+
+  // The fee sheet combines Exam Fee into the 1st Installment payment amount.
+  // We separate it for accounting but ensure the due dates align so the parent pays the expected total.
+  const t1 = inst1_total - exam;
+  const t2 = inst2_total;
+  const t3 = inst3_total;
+
+  const tuitionSchedule = [
+    { dueDate: `${yr}-07-10`, label: '1st Installment (April/July)', amount: t1 },
+    { dueDate: `${yr}-10-10`, label: '2nd Installment (September/October)', amount: t2 },
+    { dueDate: `${yrNext}-01-10`, label: '3rd Installment (December/January)', amount: t3 }
+  ];
+
+  return defaults.map(comp => {
+    if (comp.id === 'admission') {
+      return { ...comp, amount: admission, enabled: true, isOneTime: true, condition: 'isNewAdmission' };
+    }
+    if (comp.id === 'tuition') {
+      return { ...comp, amount: tuition, enabled: true, frequency: 'custom', schedule: tuitionSchedule, penalty: 100, graceDays: 10 };
+    }
+    if (comp.id === 'exam') {
+      return { ...comp, amount: exam, enabled: true, frequency: 'custom', schedule: [{ dueDate: `${yr}-07-10`, label: 'Examination Fee', amount: exam }] };
+    }
+    return { ...comp, amount: 0, enabled: false };
+  });
+}
+

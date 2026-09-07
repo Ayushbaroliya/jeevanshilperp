@@ -5,7 +5,7 @@ import { VitePWA } from 'vite-plugin-pwa'
 // https://vite.dev/config/
 export default defineConfig({
   define: {
-    'import.meta.env.VITE_E2E_TESTING': JSON.stringify(process.env.VITE_E2E_TESTING || 'true')
+    'import.meta.env.VITE_E2E_TESTING': JSON.stringify(process.env.VITE_E2E_TESTING || 'false')
   },
   plugins: [
     react(),
@@ -13,6 +13,8 @@ export default defineConfig({
       registerType: 'autoUpdate',
       includeAssets: ['logo.jpg'],
       manifest: {
+        id: '/',
+        start_url: '/',
         name: 'Jeevanshilp Group System',
         short_name: 'Jeevanshilp Group',
         description: 'Jeevanshilp Group with offline accounting',
@@ -39,7 +41,10 @@ export default defineConfig({
         ]
       },
       workbox: {
-        maximumFileSizeToCacheInBytes: 5000000
+        maximumFileSizeToCacheInBytes: 5000000,
+        skipWaiting: true,
+        clientsClaim: true,
+        cleanupOutdatedCaches: true
       }
     })
   ],

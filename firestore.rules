@@ -98,6 +98,14 @@ service cloud.firestore {
       allow update, delete: if signedIn() && (isAdmin() || (isAccountant() && sameSchool(resource.data.schoolId)));
     }
 
+    // ── Fee charges ───────────────────────────────────────────────────────────
+    match /fee_charges/{id} {
+      allow read:   if signedIn() && (isAdmin() || isAccountant() || isPrincipal());
+      allow create: if signedIn() && (isAdmin() || (isAccountant() && sameSchool(request.resource.data.schoolId)));
+      allow update: if false;
+      allow delete: if signedIn() && isAdmin();
+    }
+
     // ── Attendance logs ───────────────────────────────────────────────────────
     match /attendance_logs/{id} {
       allow read:   if signedIn() && sameSchool(resource.data.schoolId);

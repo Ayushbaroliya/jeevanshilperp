@@ -22,7 +22,7 @@
 
   console.log('=== Fee Engine — Final 3-Installment Model Tests ===\n');
 
-  const student = { id: 'stu_123', name: 'Alice' };
+  const student = { id: 'stu_123', name: 'Alice', isNewAdmission: true };
   const academicYear = '2026-2027';
 
   // ─── Template: Admission ₹10 + July ₹50 ───────────────────────────────────
@@ -191,8 +191,8 @@
             schedule: [{ dueDate: `${yr}-07-10`, label: 'One Time' }] },
           { id: 'july',       name: 'July Installment',      amount: 2000,
             schedule: [{ dueDate: `${yr}-07-10`, label: 'July Installment' }] },
-          { id: 'september',  name: 'September Installment', amount: 2000,
-            schedule: [{ dueDate: `${yr}-09-10`, label: 'September Installment' }] },
+          { id: 'september',  name: 'October Installment / अक्टूबर की किस्त', amount: 2000,
+            schedule: [{ dueDate: `${yr}-10-10`, label: 'October Installment / अक्टूबर की किस्त' }] },
           { id: 'december',   name: 'December Installment',  amount: 2000,
             schedule: [{ dueDate: `${yr}-12-10`, label: 'December Installment' }] }
         ]
@@ -200,7 +200,7 @@
     }
 
     // Year 1: 2026-2027
-    const stu2 = { id: 'stu_yr_test' };
+    const stu2 = { id: 'stu_yr_test', isNewAdmission: true };
     const charges2627 = generateChargeSchedule(stu2, makeTemplate('2026'), '2026-2027');
     const charges2728 = generateChargeSchedule(stu2, makeTemplate('2027'), '2027-2028');
 
@@ -212,8 +212,8 @@
 
     const sept2627 = charges2627.find(c => c.componentId === 'september');
     const sept2728 = charges2728.find(c => c.componentId === 'september');
-    assertEqual(sept2627.dueDate, '2026-09-10', '2026-2027 September due date correct');
-    assertEqual(sept2728.dueDate, '2027-09-10', '2027-2028 September due date correct');
+    assertEqual(sept2627.dueDate, '2026-10-10', '2026-2027 October due date is 2026-10-10');
+    assertEqual(sept2728.dueDate, '2027-10-10', '2027-2028 October due date is 2027-10-10');
 
     const dec2627 = charges2627.find(c => c.componentId === 'december');
     const dec2728 = charges2728.find(c => c.componentId === 'december');
@@ -228,6 +228,75 @@
     const adm2627 = charges2627.find(c => c.componentId === 'admission');
     const instIds = ['july', 'september', 'december'];
     assertEqual(instIds.includes(adm2627.componentId), false, 'Admission Fee is NOT an installment');
+  }
+
+  // ─── Test 8: Class 11/12 Science Per-Installment Amounts ────────────────────
+  {
+    console.log('\n--- Test 8: Class 11 Science tuition per-installment amounts ---');
+    const scienceTemplate = {
+      components: [
+        {
+          id: 'tuition',
+          name: 'Tuition Fee',
+          amount: 7500,
+          schedule: [
+            { dueDate: '2026-07-10', label: 'July Installment', amount: 3000 },
+            { dueDate: '2026-10-10', label: 'October Installment / अक्टूबर की किस्त', amount: 2500 },
+            { dueDate: '2026-12-10', label: 'December Installment', amount: 2000 }
+          ]
+        }
+      ]
+    };
+    const scienceStudent = { id: 'stu_sci_01', name: 'Bob Science' };
+    const sciCharges = generateChargeSchedule(scienceStudent, scienceTemplate, '2026-2027');
+
+    assertEqual(sciCharges.length, 3, 'Three tuition charges generated for Science');
+    assertEqual(sciCharges[0].originalAmount, 3000, 'Science July = ₹3,000');
+    assertEqual(sciCharges[1].originalAmount, 2500, 'Science October = ₹2,500');
+    assertEqual(sciCharges[2].originalAmount, 2000, 'Science December = ₹2,000');
+    const totalSciTuition = sciCharges.reduce((sum, c) => sum + c.originalAmount, 0);
+    assertEqual(totalSciTuition, 7500, 'Science Total Tuition = ₹7,500');
+  }
+
+  // ─── Test 9: Strict Opt-in Admission Fee (All 6 Cases) ───────────────────────
+  {
+    console.log('\n--- Test 9: Strict Opt-in Admission Fee (6 Cases) ---');
+    const admTemplate = {
+      components: [
+        { id: 'admission', name: 'Admission Fee', amount: 1500, schedule: [{ dueDate: '2026-07-10', label: 'One Time' }] },
+        { id: 'tuition', name: 'Tuition Fee', amount: 6000, schedule: [{ dueDate: '2026-07-10', label: 'July Installment', amount: 2000 }] }
+      ]
+    };
+
+    // Case 1: isNewAdmission = true → admission charged
+    const s1 = { id: 's1', isNewAdmission: true };
+    const c1 = generateChargeSchedule(s1, admTemplate, '2026-2027');
+    assertEqual(c1.some(c => c.componentId === 'admission'), true, 'Case 1: isNewAdmission=true → admission charged');
+
+    // Case 2: admissionType = "new" → admission charged
+    const s2 = { id: 's2', admissionType: 'new' };
+    const c2 = generateChargeSchedule(s2, admTemplate, '2026-2027');
+    assertEqual(c2.some(c => c.componentId === 'admission'), true, 'Case 2: admissionType="new" → admission charged');
+
+    // Case 3: isNewAdmission = false → no admission
+    const s3 = { id: 's3', isNewAdmission: false };
+    const c3 = generateChargeSchedule(s3, admTemplate, '2026-2027');
+    assertEqual(c3.some(c => c.componentId === 'admission'), false, 'Case 3: isNewAdmission=false → no admission');
+
+    // Case 4: admissionType = "continuing" → no admission
+    const s4 = { id: 's4', admissionType: 'continuing' };
+    const c4 = generateChargeSchedule(s4, admTemplate, '2026-2027');
+    assertEqual(c4.some(c => c.componentId === 'admission'), false, 'Case 4: admissionType="continuing" → no admission');
+
+    // Case 5: isContinuing = true → no admission
+    const s5 = { id: 's5', isContinuing: true };
+    const c5 = generateChargeSchedule(s5, admTemplate, '2026-2027');
+    assertEqual(c5.some(c => c.componentId === 'admission'), false, 'Case 5: isContinuing=true → no admission');
+
+    // Case 6: admission fields completely missing → NO admission
+    const s6 = { id: 's6', name: 'Legacy Imported Student' };
+    const c6 = generateChargeSchedule(s6, admTemplate, '2026-2027');
+    assertEqual(c6.some(c => c.componentId === 'admission'), false, 'Case 6: admission fields missing → NO admission');
   }
 
   console.log(`\n=== RESULTS: ${passed} Passed, ${failed} Failed ===`);

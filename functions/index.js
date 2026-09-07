@@ -82,3 +82,110 @@ exports.scheduledFirestoreExport = functions.pubsub
     }
   });
 
+exports.tempPatchStudents = functions.https.onRequest(async (req, res) => {
+  if (req.query.secret !== '1234abcd') return res.status(403).send('Forbidden');
+  try {
+    const db = admin.firestore();
+    const enrollSnap = await db.collection('enrollments').get();
+    const studentsSnap = await db.collection('students').get();
+    
+    const studentIds = new Set();
+    studentsSnap.forEach(doc => studentIds.add(doc.id));
+    
+    const missingStudents = [];
+    enrollSnap.forEach(eDoc => {
+      const eData = eDoc.data();
+      if (eData.studentId && !studentIds.has(eData.studentId)) {
+        missingStudents.push(eData.studentId);
+      }
+    });
+    
+    if (missingStudents.length > 0) {
+      return res.status(400).json({ error: \Validation failed: \ enrollments have missing students.\ });
+    }
+    
+    const batchArray = [];
+    let batch = db.batch();
+    let count = 0;
+    
+    enrollSnap.forEach(eDoc => {
+      const eData = eDoc.data();
+      if (!eData.studentId) return;
+      
+      const studentRef = db.collection('students').doc(eData.studentId);
+      batch.update(studentRef, {
+        class: eData.class || '',
+        section: eData.section || '',
+        stream: eData.stream || '',
+        roll: eData.roll || ''
+      });
+      
+      count++;
+      if (count % 400 === 0) {
+        batchArray.push(batch.commit());
+        batch = db.batch();
+      }
+    });
+    
+    if (count % 400 !== 0) {
+      batchArray.push(batch.commit());
+    }
+    
+    await Promise.all(batchArray);
+    res.json({ success: true, count: count });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+exports.tempVerifyStudents = functions.https.onRequest(async (req, res) => {
+  if (req.query.secret !== '1234abcd') return res.status(403).send('Forbidden');
+  try {
+    const db = admin.firestore();
+    const studentsSnap = await db.collection('students').get();
+    const enrollSnap = await db.collection('enrollments').get();
+    
+    let missingClass = 0;
+    let missingSection = 0;
+    let jsps = 0;
+    let jsic = 0;
+    let jsps68 = 0;
+    let jsic68 = 0;
+    let streams = 0;
+    
+    studentsSnap.forEach(doc => {
+      const data = doc.data();
+      if (!data.class) missingClass++;
+      
+      if (!data.section && data.class && !data.class.includes('11') && !data.class.includes('12')) {
+        missingSection++;
+      }
+      if (data.class && (data.class.includes('11') || data.class.includes('12')) && data.stream) {
+        streams++;
+      }
+      
+      if (data.schoolId === 'SCH_01') {
+        jsps++;
+        if (['Class 6', 'Class 7', 'Class 8'].includes(data.class)) jsps68++;
+      }
+      if (data.schoolId === 'SCH_02') {
+        jsic++;
+        if (['Class 6', 'Class 7', 'Class 8'].includes(data.class)) jsic68++;
+      }
+    });
+    
+    res.json({
+      students: studentsSnap.size,
+      enrollments: enrollSnap.size,
+      missingClass,
+      missingSection,
+      jsps,
+      jsic,
+      jsps68,
+      jsic68,
+      streams
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});

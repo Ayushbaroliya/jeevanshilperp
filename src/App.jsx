@@ -15,6 +15,7 @@ import { getUserPermissions } from './utils/permissions';
 import { auth, db, signOut } from './firebase';
 import { onAuthStateChanged } from 'firebase/auth';
 import { collection, getDocs, query, where, doc, getDoc, onSnapshot, setDoc } from 'firebase/firestore';
+import { normalizeClassFeeSettings } from './utils/feeEngine';
 import './App.css';
 import './mobile.css';
 
@@ -120,25 +121,36 @@ export default function App() {
     const fallback = {};
     defaultClasses.forEach(c => {
       let admissionFee = 0;
-      let julyFee = 0;
-      let septFee = 0;
-      let decFee = 0;
+      let tuitionFee = 0;
       let examFee = 0;
       let isEnabled = false;
 
       if (['Class 6', 'Class 7', 'Class 8'].includes(c)) {
         admissionFee = c === 'Class 6' ? 1200 : 1000;
-        julyFee = 2000; septFee = 2000; decFee = 2000; examFee = 500; isEnabled = true;
+        tuitionFee = 6000; examFee = 500; isEnabled = true;
       } else if (['Class 9', 'Class 10'].includes(c)) {
         admissionFee = 1500;
-        julyFee = 2000; septFee = 2000; decFee = 2000; examFee = 500; isEnabled = true;
+        tuitionFee = 6000; examFee = 500; isEnabled = true;
       } else if (['Class 11 Art', 'Class 12 Art'].includes(c)) {
         admissionFee = 1500;
-        julyFee = 2000; septFee = 2000; decFee = 2000; examFee = 500; isEnabled = true;
+        tuitionFee = 6000; examFee = 500; isEnabled = true;
       } else if (['Class 11 Science', 'Class 12 Science'].includes(c)) {
         admissionFee = 2000;
-        julyFee = 3000; septFee = 2500; decFee = 2000; examFee = 1000; isEnabled = true;
+        tuitionFee = 7500; examFee = 1000; isEnabled = true;
       }
+
+      const isScience = ['Class 11 Science', 'Class 12 Science'].includes(c);
+      const tuitionSchedule = isScience
+        ? [
+            { dueDate: '2026-07-10', label: 'July Installment', amount: 3000 },
+            { dueDate: '2026-10-10', label: 'October Installment / अक्टूबर की किस्त', amount: 2500 },
+            { dueDate: '2026-12-10', label: 'December Installment', amount: 2000 }
+          ]
+        : [
+            { dueDate: '2026-07-10', label: 'July Installment', amount: 2000 },
+            { dueDate: '2026-10-10', label: 'October Installment / अक्टूबर की किस्त', amount: 2000 },
+            { dueDate: '2026-12-10', label: 'December Installment', amount: 2000 }
+          ];
 
       fallback[c] = {
         academicYear: '2026-2027',
@@ -154,21 +166,21 @@ export default function App() {
           // Admission Fee — separate one-time component, NOT an installment
           { id: 'admission', name: 'Admission Fee', amount: admissionFee, enabled: admissionFee > 0, frequency: 'one_time', installments: [], dueDay: 10, penalty: 0, graceDays: 5,
             schedule: [{ dueDate: '2026-07-10', label: 'One Time' }] },
-          // Tuition installments — July / September / December
-          { id: 'july',      name: 'July Installment',      amount: julyFee, enabled: julyFee > 0, frequency: 'one_time', installments: ['july'],      dueDay: 10, penalty: 0, graceDays: 5,
-            schedule: [{ dueDate: '2026-07-10', label: 'July Installment' }] },
-          { id: 'september', name: 'September Installment',  amount: septFee, enabled: septFee > 0, frequency: 'one_time', installments: ['september'], dueDay: 10, penalty: 100, graceDays: 5,
-            schedule: [{ dueDate: '2026-09-10', label: 'September Installment' }] },
-          { id: 'december',  name: 'December Installment',   amount: decFee,  enabled: decFee  > 0, frequency: 'one_time', installments: ['december'],  dueDay: 10, penalty: 500, graceDays: 5,
-            schedule: [{ dueDate: '2026-12-10', label: 'December Installment' }] },
+          // Tuition Fee — single component spanning all 3 installments
+          { id: 'tuition', name: 'Tuition Fee', amount: tuitionFee, enabled: tuitionFee > 0, frequency: 'every_installment', installments: ['july', 'september', 'december'], dueDay: 10, penalty: 100, graceDays: 5,
+            schedule: tuitionSchedule },
           // Optional fee components
-          { id: 'exam',      name: 'Examination Fee', amount: examFee, enabled: examFee > 0, frequency: 'one_time', installments: ['december'], dueDay: 10, penalty: 0, graceDays: 5,
+          { id: 'exam',         name: 'Examination Fee', amount: examFee, enabled: examFee > 0, frequency: 'one_time', installments: ['december'], dueDay: 10, penalty: 0, graceDays: 5,
             schedule: [{ dueDate: '2026-12-10', label: 'December Installment' }] },
-          { id: 'computer',  name: 'Computer Fee',    amount: 0,       enabled: false,        frequency: 'one_time', installments: ['july'],      dueDay: 10, penalty: 0, graceDays: 5,
+          { id: 'computer',     name: 'Computer Fee',    amount: 0,       enabled: false,        frequency: 'one_time', installments: ['july'],      dueDay: 10, penalty: 0, graceDays: 5,
             schedule: [{ dueDate: '2026-07-10', label: 'July Installment' }] },
-          { id: 'practical', name: 'Practical Fee',   amount: 0,       enabled: false,        frequency: 'one_time', installments: ['december'],  dueDay: 10, penalty: 0, graceDays: 5,
+          { id: 'practical',    name: 'Practical Fee',   amount: 200,     enabled: false,        frequency: 'one_time', installments: ['december'],  dueDay: 10, penalty: 0, graceDays: 5,
             schedule: [{ dueDate: '2026-12-10', label: 'December Installment' }] },
-          { id: 'transport', name: 'Transport Fee',   amount: 0,       enabled: false,        frequency: 'monthly',  installments: [],            dueDay: 10, penalty: 0, graceDays: 5,
+          { id: 'registration', name: 'Registration Fee',amount: 100,     enabled: false,        frequency: 'one_time', installments: ['july'],      dueDay: 10, penalty: 0, graceDays: 5,
+            schedule: [{ dueDate: '2026-07-10', label: 'July Installment' }] },
+          { id: 'test',         name: 'Test Fee',        amount: 200,     enabled: false,        frequency: 'one_time', installments: ['july'],      dueDay: 10, penalty: 0, graceDays: 5,
+            schedule: [{ dueDate: '2026-07-10', label: 'July Installment' }] },
+          { id: 'transport',    name: 'Transport Fee',   amount: 0,       enabled: false,        frequency: 'monthly',  installments: [],            dueDay: 10, penalty: 0, graceDays: 5,
             schedule: [] }
         ]
       };
@@ -188,9 +200,9 @@ export default function App() {
     try {
       const saved = localStorage.getItem('jeevan_active_academic_year');
       if (saved) return JSON.parse(saved);
-      return { SCH_01: 'AY_2025_26', SCH_02: 'AY_2025_26', SCH_03: 'AY_2025_26' };
+      return { SCH_01: 'AY_2026_27', SCH_02: 'AY_2026_27', SCH_03: 'AY_2026_27' };
     } catch {
-      return { SCH_01: 'AY_2025_26', SCH_02: 'AY_2025_26', SCH_03: 'AY_2025_26' };
+      return { SCH_01: 'AY_2026_27', SCH_02: 'AY_2026_27', SCH_03: 'AY_2026_27' };
     }
   });
 
@@ -198,7 +210,19 @@ export default function App() {
     const unsub = onSnapshot(doc(db, "school_settings", "settings"), (docSnap) => {
       if (docSnap.exists()) {
         const data = docSnap.data();
-        if (data.schoolClassSettings) setSchoolClassSettings(data.schoolClassSettings);
+        if (data.schoolClassSettings) {
+          // Migrate legacy component structures (e.g. separate july/sept/dec rows,
+          // wrong tuition installments) as they enter React state, so the UI and
+          // any downstream saves always see the canonical shape.
+          const migrated = {};
+          for (const [schoolId, perClassMap] of Object.entries(data.schoolClassSettings)) {
+            migrated[schoolId] = {};
+            for (const [cls, classSetting] of Object.entries(perClassMap || {})) {
+              migrated[schoolId][cls] = normalizeClassFeeSettings(classSetting);
+            }
+          }
+          setSchoolClassSettings(migrated);
+        }
         if (data.schoolClasses) setSchoolClasses(data.schoolClasses);
         if (data.schoolSections) setSchoolSections(data.schoolSections);
         if (data.activeAcademicYearId) setActiveAcademicYearId(data.activeAcademicYearId);
@@ -307,6 +331,11 @@ export default function App() {
         onLogout={handleLogout}
         searchQuery={searchQuery}
         setSearchQuery={setSearchQuery}
+        onNavigate={setCurrentView}
+        onSelectStudent={(st) => {
+          setActiveStudent(st);
+          setCurrentView('ledger');
+        }}
       />
 
       {/* Main Layout Body */}
@@ -353,7 +382,8 @@ export default function App() {
               selectedSchool={selectedSchool}
               classSettings={schoolClassSettings[selectedSchool] || {}}
               setSelectedSchool={setSelectedSchool}
-              activeAcademicYearId={activeAcademicYearId[selectedSchool] || 'AY_2025_26'}
+              activeAcademicYearId={activeAcademicYearId[selectedSchool] || 'AY_2026_27'}
+              searchQuery={searchQuery}
               onSelectStudent={(st) => {
                 setActiveStudent(st);
                 setCurrentView('ledger');
@@ -367,7 +397,7 @@ export default function App() {
               activeStudent={activeStudent}
               userPermissions={userPermissions}
               selectedSchool={selectedSchool}
-              activeAcademicYearId={activeAcademicYearId[selectedSchool] || 'AY_2025_26'}
+              activeAcademicYearId={activeAcademicYearId[selectedSchool] || 'AY_2026_27'}
             />
           )}
           {currentView === 'finance' && (
@@ -378,7 +408,7 @@ export default function App() {
               selectedSchool={selectedSchool}
               setSelectedSchool={setSelectedSchool}
               classes={schoolClasses[selectedSchool] || []}
-              activeAcademicYearId={activeAcademicYearId[selectedSchool] || 'AY_2025_26'}
+              activeAcademicYearId={activeAcademicYearId[selectedSchool] || 'AY_2026_27'}
             />
           )}
           {currentView === 'academics' && (
@@ -389,7 +419,7 @@ export default function App() {
               setSelectedSchool={setSelectedSchool}
               currentUser={currentUser}
               userPermissions={userPermissions}
-              activeAcademicYearId={activeAcademicYearId[selectedSchool] || 'AY_2025_26'}
+              activeAcademicYearId={activeAcademicYearId[selectedSchool] || 'AY_2026_27'}
             />
           )}
           {currentView === 'settings' && (
@@ -406,7 +436,7 @@ export default function App() {
               selectedSchool={selectedSchool}
               setSelectedSchool={setSelectedSchool}
               currentUser={currentUser}
-              activeAcademicYearId={activeAcademicYearId[selectedSchool] || 'AY_2025_26'}
+              activeAcademicYearId={activeAcademicYearId[selectedSchool] || 'AY_2026_27'}
             />
             ) : <RestrictedAccessView userRole={currentUser?.role} viewName="Settings & Governance" />
           )}
@@ -417,6 +447,7 @@ export default function App() {
               userPermissions={userPermissions}
               currentUser={currentUser}
               activeAcademicYearId={activeAcademicYearId[selectedSchool] || 'AY_2025_26'}
+              onNavigate={setCurrentView}
             />
           )}
         </main>

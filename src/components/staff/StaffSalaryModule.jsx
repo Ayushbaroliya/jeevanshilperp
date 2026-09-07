@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { DollarSign, Search, Filter, Download, UserCheck, Calendar, FileText, Plus, Calculator, AlertCircle, Save, X, Printer } from 'lucide-react';
-import { collection, getDocs, addDoc, query, where, serverTimestamp } from 'firebase/firestore';
+import { collection, getDocs, addDoc, setDoc, doc, query, where, serverTimestamp } from 'firebase/firestore';
 import { db } from '../../firebase';
 import { t } from '../../utils/translations';
 import * as XLSX from 'xlsx';
@@ -18,7 +18,7 @@ const getLastSixMonths = () => {
   return months;
 };
 
-export default function StaffSalaryModule({ lang = 'en', selectedSchool, currentUser }) {
+export default function StaffSalaryModule({ lang = 'en', selectedSchool, currentUser, onNavigate }) {
   const dict = t[lang] || t.en;
   
   // Only Owners/Directors can view/manage salary and payroll. Admins can only mark attendance.
@@ -249,7 +249,10 @@ export default function StaffSalaryModule({ lang = 'en', selectedSchool, current
   // ─────────────────────────────────────────────────────────────────
 
   const confirmPayroll = async () => {
-    if (!selectedSchool || selectedSchool === 'ALL') return;
+    if (!selectedSchool || selectedSchool === 'ALL') {
+      alert("Please select a specific school campus to process and save payroll.");
+      return;
+    }
     setIsSavingPayroll(true);
     setMessage('');
     try {
@@ -257,7 +260,30 @@ export default function StaffSalaryModule({ lang = 'en', selectedSchool, current
       const [yearStr, monthStr] = payrollMonth.split('-');
       const payableDays = new Date(Number(yearStr), Number(monthStr), 0).getDate();
 
+      // Check existing payroll records for this month and school to prevent duplicates
+      const existingQ = query(
+        collection(db, 'payroll'),
+        where('month', '==', month),
+        where('schoolId', '==', selectedSchool)
+      );
+      const existingSnap = await getDocs(existingQ);
+      const existingStaffIds = new Set();
+      existingSnap.forEach(d => {
+        const p = d.data();
+        if (p.staffId) existingStaffIds.add(p.staffId);
+      });
+
+      let createdCount = 0;
+      let skippedCount = 0;
+
       for (const staff of visibleStaff) {
+        // Prevent duplicate payroll records: If a record already exists, NEVER overwrite it silently.
+        // Treat it as an existing historical payroll record.
+        if (existingStaffIds.has(staff.id)) {
+          skippedCount++;
+          continue;
+        }
+
         const data = payrollData[staff.id] || {};
         const baseSalary = Number(data.salary ?? staff.baseSalary ?? 0);
         
@@ -267,7 +293,10 @@ export default function StaffSalaryModule({ lang = 'en', selectedSchool, current
         const deductions = Number(data.deductions ?? defaultDeductions);
         const bonus = Number(data.bonus ?? 0);
         const netPay = Math.max(0, baseSalary + bonus - deductions);
-        await addDoc(collection(db, 'payroll'), {
+
+        const payrollDocId = `pay_${selectedSchool}_${month}_${staff.id}`;
+        await setDoc(doc(db, 'payroll', payrollDocId), {
+          id: payrollDocId,
           staffId: staff.id,
           staffName: staff.name || '',
           schoolId: selectedSchool,
@@ -280,11 +309,24 @@ export default function StaffSalaryModule({ lang = 'en', selectedSchool, current
           status: 'Processed',
           createdAt: serverTimestamp()
         });
+        createdCount++;
       }
-      setMessage('Payroll records saved successfully.');
+
+      let msg = '';
+      if (createdCount > 0 && skippedCount > 0) {
+        msg = `Saved ${createdCount} payroll record(s). Skipped ${skippedCount} staff who already have processed payroll for ${month}.`;
+      } else if (createdCount > 0) {
+        msg = `Successfully saved ${createdCount} payroll records for ${month}.`;
+      } else if (skippedCount > 0) {
+        msg = `Payroll for all ${skippedCount} staff members in this branch has already been processed for ${month}. Existing historical records were preserved.`;
+      } else {
+        msg = 'No staff found to process payroll.';
+      }
+      setMessage(msg);
+      alert(msg);
     } catch (error) {
       console.error('Error saving payroll:', error);
-      setMessage('Failed to save payroll records.');
+      setMessage('Failed to save payroll records: ' + error.message);
     } finally {
       setIsSavingPayroll(false);
     }
@@ -305,6 +347,16 @@ export default function StaffSalaryModule({ lang = 'en', selectedSchool, current
           <button className="btn-secondary" style={{ padding: '8px 16px' }} onClick={exportReport} disabled={!visibleStaff.length}>
             <Download size={18} /> Export Report
           </button>
+          {isOwner && onNavigate && (
+            <button
+              className="btn-secondary"
+              style={{ padding: '8px 16px', borderColor: 'var(--brand-orange)', color: 'var(--brand-orange)', fontWeight: 700 }}
+              onClick={() => onNavigate('settings')}
+              title="Go to Settings to add or manage staff members"
+            >
+              <Plus size={18} /> Add / Manage Staff
+            </button>
+          )}
           <button className="btn-primary" style={{ padding: '8px 16px', opacity: selectedSchool === 'ALL' ? 0.5 : 1, cursor: selectedSchool === 'ALL' ? 'not-allowed' : 'pointer' }} onClick={() => setActiveTab('process')} disabled={selectedSchool === 'ALL'}>
             <Plus size={18} /> Process Payroll
           </button>
@@ -456,7 +508,7 @@ export default function StaffSalaryModule({ lang = 'en', selectedSchool, current
         <div className="glass-card" style={{ padding: 24, borderRadius: 20 }}>
           <div className="flex-responsive" style={{ marginBottom: 20 }}>
             <h3 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
-              <Calendar size={20} color="var(--brand-orange)" /> Today's Staff Roster ({new Date().toLocaleDateString()})
+              <Calendar size={20} color="var(--brand-orange)" /> Today's Staff List / शिक्षक व कर्मचारी सूची ({new Date().toLocaleDateString()})
             </h3>
             <button className="btn-primary" style={{ padding: '8px 16px', opacity: selectedSchool === 'ALL' ? 0.5 : 1, cursor: selectedSchool === 'ALL' ? 'not-allowed' : 'pointer' }} onClick={saveAttendance} disabled={selectedSchool === 'ALL' || isSavingAttendance || !visibleStaff.length}>
               <Save size={16} /> {isSavingAttendance ? 'Saving...' : 'Save All Attendance'}

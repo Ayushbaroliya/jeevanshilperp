@@ -308,20 +308,20 @@ export default function LoginScreen({ onLoginSuccess }) {
       }}>
         {/* Branding Header */}
         <div style={{ textAlign: 'center', marginBottom: 28 }}>
-          <div style={{
-            width: 64,
-            height: 64,
-            borderRadius: 18,
-            backgroundColor: 'var(--brand-orange)',
-            color: '#fff',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            margin: '0 auto 16px',
-            boxShadow: '0 10px 20px rgba(191, 87, 0, 0.3)'
-          }}>
-            <GraduationCap size={36} />
-          </div>
+          <img
+            src="/logo.jpg"
+            alt="Jeevan Shilp Inter College"
+            style={{
+              width: 96,
+              height: 96,
+              borderRadius: '50%',
+              objectFit: 'cover',
+              margin: '0 auto 16px',
+              display: 'block',
+              border: '3px solid #fff',
+              boxShadow: '0 10px 30px rgba(0,0,0,0.18)'
+            }}
+          />
           <h1 style={{ fontSize: 24, fontWeight: 900, color: 'var(--text-primary)', marginBottom: 6, letterSpacing: '-0.5px' }}>
             {dict.loginTitle}
           </h1>

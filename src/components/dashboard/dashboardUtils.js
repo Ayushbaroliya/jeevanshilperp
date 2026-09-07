@@ -8,16 +8,20 @@ export async function fetchAuthoritativeFeeSummary(selectedSchool, activeAcademi
     let invoicesQ = collection(db, 'invoices');
     let adjustmentsQ = collection(db, 'fee_adjustments');
 
+    let chargesQ = collection(db, 'fee_charges');
+
     if (selectedSchool !== 'ALL') {
       studentsQ = query(studentsQ, where('schoolId', '==', selectedSchool));
       invoicesQ = query(invoicesQ, where('schoolId', '==', selectedSchool));
       adjustmentsQ = query(adjustmentsQ, where('schoolId', '==', selectedSchool));
+      chargesQ = query(chargesQ, where('schoolId', '==', selectedSchool), where('academicYearId', '==', activeAcademicYearId));
     }
 
-    const [studentsSnap, invoicesSnap, adjustmentsSnap] = await Promise.all([
+    const [studentsSnap, invoicesSnap, adjustmentsSnap, chargesSnap] = await Promise.all([
       getDocs(studentsQ),
       getDocs(invoicesQ),
-      getDocs(adjustmentsQ)
+      getDocs(adjustmentsQ),
+      getDocs(chargesQ)
     ]);
 
     const paymentsByStudent = {};
@@ -43,6 +47,13 @@ export async function fetchAuthoritativeFeeSummary(selectedSchool, activeAcademi
       adjustmentsByStudent[a.studentId].push(a);
     });
 
+    const chargesByStudent = {};
+    chargesSnap.forEach(d => {
+      const c = { id: d.id, ...d.data() };
+      if (!chargesByStudent[c.studentId]) chargesByStudent[c.studentId] = [];
+      chargesByStudent[c.studentId].push(c);
+    });
+
     let totalOutstanding = 0;
     
     studentsSnap.forEach(d => {
@@ -57,6 +68,7 @@ export async function fetchAuthoritativeFeeSummary(selectedSchool, activeAcademi
 
       const summary = calculateStudentDue({
         student,
+        charges: chargesByStudent[student.id],
         classSettings: sSettings,
         payments: paymentsByStudent[student.id] || [],
         adjustments: adjustmentsByStudent[student.id] || []

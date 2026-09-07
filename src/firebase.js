@@ -21,13 +21,11 @@ export const functions = getFunctions(app);
 
 import { collection, doc, getDocs, query, where, runTransaction } from "firebase/firestore";
 
-if (import.meta.env.VITE_E2E_TESTING === 'true') {
+if (import.meta.env.VITE_E2E_TESTING === 'true' && typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')) {
   connectAuthEmulator(auth, "http://127.0.0.1:9099", { disableWarnings: true });
   connectFirestoreEmulator(db, '127.0.0.1', 8080);
   connectFunctionsEmulator(functions, "127.0.0.1", 5001);
-  if (typeof window !== 'undefined') {
-    window.e2eFirestore = { db, collection, doc, getDocs, query, where, runTransaction };
-  }
+  window.e2eFirestore = { db, collection, doc, getDocs, query, where, runTransaction };
 }
 
 export const staffAuthEmail = (contact) => `${String(contact).trim().toLowerCase().replace(/[^a-z0-9._-]/g, '')}@jeevanshilpgroup.local`;

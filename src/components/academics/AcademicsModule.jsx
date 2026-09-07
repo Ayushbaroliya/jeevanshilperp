@@ -4,7 +4,12 @@ import { collection, addDoc, getDocs, query, where, doc, setDoc } from 'firebase
 import { db } from '../../firebase';
 import SchoolFolderPicker from '../common/SchoolFolderPicker';
 
-export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2', 'Class 3', 'Class 4', 'Class 5', 'Class 6', 'Class 7', 'Class 8', 'Class 9', 'Class 10'], globalSections = ['Section A', 'Section B', 'Section C'], currentUser, userPermissions, selectedSchool, setSelectedSchool }) {
+const normalizeSectionQuery = (sec) => {
+  if (!sec) return '';
+  return sec.replace(/^Section\s+/i, '').trim();
+};
+
+export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2', 'Class 3', 'Class 4', 'Class 5', 'Class 6', 'Class 7', 'Class 8', 'Class 9', 'Class 10'], globalSections = ['Section A', 'Section B', 'Section C'], currentUser, userPermissions, selectedSchool, setSelectedSchool, activeAcademicYearId = 'AY_2026_27' }) {
   const [activeTab, setActiveTab] = useState('attendance'); // 'attendance' | 'marks'
   const [selectedClass, setSelectedClass] = useState(globalClasses[0] || 'Class 1');
   const [selectedSection, setSelectedSection] = useState(globalSections[0] || 'Section A');
@@ -22,6 +27,16 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
 
   const subjects = ['Mathematics', 'Science', 'English', 'Social Science', 'Hindi', 'Computer'];
   const exams = ['Quarterly', 'Half Yearly', 'Final Exam'];
+
+  // Reset class and section selections cleanly on school switch
+  useEffect(() => {
+    if (globalClasses && globalClasses.length > 0) {
+      setSelectedClass(globalClasses[0]);
+    }
+    if (globalSections && globalSections.length > 0) {
+      setSelectedSection(globalSections[0]);
+    }
+  }, [selectedSchool]);
 
   useEffect(() => {
     const fetchAssignments = async () => {
@@ -42,7 +57,7 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
       }
     };
     fetchAssignments();
-  }, []);
+  }, [selectedSchool, currentUser]);
 
 
   useEffect(() => {
@@ -53,13 +68,13 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
         let q = query(
           collection(db, "students"),
           where("class", "==", selectedClass),
-          where("section", "==", selectedSection)
+          where("section", "==", normalizeSectionQuery(selectedSection))
         );
         if (targetSchool) {
           q = query(
             collection(db, "students"),
             where("class", "==", selectedClass),
-            where("section", "==", selectedSection),
+            where("section", "==", normalizeSectionQuery(selectedSection)),
             where("schoolId", "==", targetSchool)
           );
         }
@@ -103,17 +118,21 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
 
   const isAttendanceAllowed = () => {
     if (!currentUser) return false;
-    // Admins and Principals can bypass
-    if (currentUser.role === 'Administrator' || currentUser.role === 'Principal') return true;
+    // Admins, Principals, Owners, Directors can bypass
+    if (currentUser.role === 'Administrator' || currentUser.role === 'Principal' || currentUser.role === 'Owner' || currentUser.role === 'Director') return true;
     
     // Check if the current user is assigned to this class and section
+    const currentYear = activeAcademicYearId || 'AY_2026_27';
+    const normSelectedSec = normalizeSectionQuery(selectedSection);
+    const targetSchool = selectedSchool || currentUser?.schoolId || 'SCH_01';
+
     const assigned = assignments.find(a => 
       a.class === selectedClass && 
-      a.section === selectedSection &&
-      a.schoolId === (selectedSchool || 'SCH_01') &&
-      a.academicYearId === 'AY_2025_26'
+      (!a.section || a.section === 'All' || normalizeSectionQuery(a.section) === normSelectedSec) &&
+      (!a.schoolId || a.schoolId === targetSchool) &&
+      (!a.academicYearId || a.academicYearId === currentYear || a.academicYearId === 'AY_2025_26')
     );
-    return assigned && assigned.teacherId === (currentUser.id || currentUser.uid);
+    return assigned && (assigned.teacherId === currentUser.id || assigned.teacherId === currentUser.uid);
   };
   
   const canMark = isAttendanceAllowed();
@@ -134,16 +153,18 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
     setIsSavingAttendance(true);
     try {
       const targetSchool = selectedSchool || 'SCH_01';
-      const academicYearId = 'AY_2025_26';
+      const academicYearId = activeAcademicYearId || 'AY_2026_27';
+      const normSec = normalizeSectionQuery(selectedSection);
       
       const savePromises = classStudents.map(student => {
         const status = attendanceMap[student.id] || 'P';
-        const attendanceId = `${targetSchool}_${academicYearId}_${selectedClass}_${selectedSection}_${student.id}_${attendanceDate}`;
+        const attendanceId = `${targetSchool}_${academicYearId}_${selectedClass}_${normSec || selectedSection}_${student.id}_${attendanceDate}`;
         return setDoc(doc(db, "attendance_logs", attendanceId), {
           academicYearId,
           schoolId: targetSchool,
           class: selectedClass,
           section: selectedSection,
+          normalizedSection: normSec,
           studentId: student.id,
           date: attendanceDate,
           status: status,
