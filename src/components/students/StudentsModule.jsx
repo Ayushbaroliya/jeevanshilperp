@@ -1,15 +1,22 @@
 import React, { useState, useEffect } from 'react';
-import { ArrowLeft, Plus, FolderOpen, ChevronRight, Mic, Trash2, Edit2, X, AlertCircle, Sparkles, MessageCircle, Download, CreditCard, Calendar, BookOpen, Award, FileText, Receipt } from 'lucide-react';
-import { collection, addDoc, getDocs, query, where, doc, deleteDoc, updateDoc, orderBy, writeBatch } from 'firebase/firestore';
+import { ArrowLeft, Plus, FolderOpen, ChevronRight, Mic, Trash2, Edit2, X, AlertCircle, Sparkles, MessageCircle, Download, CreditCard, Calendar, BookOpen, Award, FileText, Receipt, RotateCcw, RefreshCw, ShieldAlert, Archive } from 'lucide-react';
+import { collection, addDoc, setDoc, getDocs, query, where, doc, deleteDoc, updateDoc, orderBy, writeBatch } from 'firebase/firestore';
 import { db } from '../../firebase';
-import { t } from '../../utils/translations';
+import { t, SCHOOLS } from '../../utils/translations';
 import SchoolFolderPicker from '../common/SchoolFolderPicker';
-import { calculateStudentDue, normalizeClassFeeSettings, generateChargeSchedule, getJSPSFeeComponents, getJSICFeeComponents, applyPaymentsAndAdjustments, summarizeDues } from '../../utils/feeEngine';
+import { calculateStudentDue, normalizeClassFeeSettings, generateChargeSchedule, getJSPSFeeComponents, getJSICFeeComponents, getSchoolDefaultFeeComponents, applyPaymentsAndAdjustments, summarizeDues } from '../../utils/feeEngine';
 import { generateStudentProfilePDF, generateFeeReceipt } from '../../utils/pdfGenerator';
 
 const normalizeSectionQuery = (sec) => {
   if (!sec) return '';
   return sec.replace(/^Section\s+/i, '').trim();
+};
+
+export const isUserAdminOrOwner = (user) => {
+  if (!user) return false;
+  if (user.email === 'jeevanshilporg@gmail.com') return true;
+  const r = (user.role || '').toLowerCase();
+  return r === 'owner' || r === 'director' || r === 'administrator' || r === 'admin' || r === 'principal';
 };
 
 export function StudentsDirectory({ onNavigate, lang, classes, sections, userPermissions, currentUser, onSelectStudent, selectedSchool, setSelectedSchool, classSettings = {}, searchQuery = '', activeAcademicYearId = '2026-2027' }) {
@@ -25,6 +32,13 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
   const [isListening, setIsListening] = useState(false);
   const [students, setStudents] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
+
+  // Deleted Students / Recycle Bin state
+  const [viewMode, setViewMode] = useState('active'); // 'active' | 'recycleBin'
+  const [deletedStudents, setDeletedStudents] = useState([]);
+  const [isDeletedLoading, setIsDeletedLoading] = useState(false);
+  const [deletedSearchQuery, setDeletedSearchQuery] = useState('');
+  const [deletedClassFilter, setDeletedClassFilter] = useState('All');
 
 
 
@@ -63,6 +77,7 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
   }, [currentUser]);
 
   const hasStudentEditPermission = (studentClass, studentSection) => {
+    if (isUserAdminOrOwner(currentUser)) return true;
     if (userPermissions?.manageStudents === false) return false;
     if (selectedSchool === 'ALL') return false;
     if (currentUser?.role !== 'Teacher' && currentUser?.role !== 'Senior Teacher') return true;
@@ -83,7 +98,40 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
     setSelectedClass(null);
     setSelectedSection('All');
     setStudents([]);
+    if (viewMode === 'recycleBin') {
+      fetchDeletedStudents();
+    }
   }, [selectedSchool]);
+
+  const fetchDeletedStudents = async () => {
+    setIsDeletedLoading(true);
+    try {
+      let q = collection(db, "students");
+      if (selectedSchool && selectedSchool !== 'ALL') {
+        q = query(q, where("schoolId", "==", selectedSchool));
+      }
+      const snap = await getDocs(q);
+      const list = [];
+      snap.forEach(docSnap => {
+        const data = docSnap.data();
+        if (data.status === 'Deleted' || data.isDeleted === true) {
+          list.push({ id: docSnap.id, ...data });
+        }
+      });
+      list.sort((a, b) => new Date(b.deletedAt || 0) - new Date(a.deletedAt || 0));
+      setDeletedStudents(list);
+    } catch (err) {
+      console.error("Error fetching deleted students:", err);
+    } finally {
+      setIsDeletedLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (viewMode === 'recycleBin') {
+      fetchDeletedStudents();
+    }
+  }, [viewMode, selectedSchool]);
 
   // Support Escape key to close modal windows
   useEffect(() => {
@@ -159,8 +207,16 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
           const loadedStudents = [];
           querySnapshot.forEach((docSnap) => {
             const data = docSnap.data();
-            if (data.status !== 'Deleted' && data.status !== 'archived') {
-              const sSettings = normalizeClassFeeSettings(classSettings[data.class] || {});
+            if (data.status !== 'Deleted' && data.status !== 'archived' && !data.isDeleted) {
+              const studentClass = data.class;
+              const studentSchool = data.schoolId || selectedSchool;
+              let rawSettings = classSettings[studentClass];
+              if (!rawSettings || !rawSettings.components || rawSettings.components.length === 0) {
+                rawSettings = {
+                  components: getSchoolDefaultFeeComponents(studentSchool, studentClass, canonicalYearId)
+                };
+              }
+              const sSettings = normalizeClassFeeSettings(rawSettings);
               const result = calculateStudentDue({
                 student: { id: docSnap.id, ...data },
                 charges: chargesByStudent[docSnap.id],
@@ -201,6 +257,20 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
         );
       })
     : students;
+
+  // Filter soft-deleted students for Recycle Bin view
+  const filteredDeletedStudents = deletedStudents.filter(s => {
+    if (deletedClassFilter !== 'All' && s.class !== deletedClassFilter) return false;
+    if (deletedSearchQuery.trim()) {
+      const q = deletedSearchQuery.trim().toLowerCase();
+      const matchName = (s.name || '').toLowerCase().includes(q);
+      const matchRoll = String(s.roll || '').toLowerCase().includes(q);
+      const matchId = (s.id || '').toLowerCase().includes(q);
+      const matchFather = (s.fatherName || s.parentName || '').toLowerCase().includes(q);
+      return matchName || matchRoll || matchId || matchFather;
+    }
+    return true;
+  });
 
   // If ALL schools are selected, force user to pick a school first
   if (selectedSchool === 'ALL') {
@@ -286,9 +356,7 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
       // 3. Generate permanent fee_charges snapshot from class settings
       let classFeeConfig = classSettings?.[selectedClass];
       if (!classFeeConfig || !classFeeConfig.components || classFeeConfig.components.length === 0) {
-        const defaultComps = targetSchool === 'SCH_01'
-          ? getJSPSFeeComponents(selectedClass, targetAcademicYearLabel)
-          : getJSICFeeComponents(selectedClass, targetAcademicYearLabel);
+        const defaultComps = getSchoolDefaultFeeComponents(targetSchool, selectedClass, targetAcademicYearLabel);
         classFeeConfig = { components: defaultComps };
       }
       const feeTemplate = normalizeClassFeeSettings(classFeeConfig, targetAcademicYearLabel);
@@ -378,7 +446,7 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
         const loadedStudents = [];
         querySnapshot.forEach((doc) => {
           const data = doc.data();
-          if (data.status !== 'Deleted' && data.status !== 'archived') {
+          if (data.status !== 'Deleted' && data.status !== 'archived' && !data.isDeleted) {
             const sSettings = normalizeClassFeeSettings(classSettings[data.class] || {});
             const result = calculateStudentDue({
               student: { id: doc.id, ...data },
@@ -404,6 +472,8 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
   const handleBack = () => {
     if (isAddingStudent) {
       setIsAddingStudent(false);
+    } else if (viewMode === 'recycleBin') {
+      setViewMode('active');
     } else if (selectedClass) {
       setSelectedClass(null);
       setSelectedSection('All');
@@ -437,20 +507,22 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
     recognition.start();
   };
 
-  const handleDeleteStudent = async (studentId, name) => {
-    if (window.confirm(`Mark student "${name}" as Left/Withdrawn? Historical financial records will be preserved.`)) {
+  const handleSoftDeleteStudent = async (studentId, name, studentSchool) => {
+    if (window.confirm(`Move student "${name}" to Deleted Students (Recycle Bin)?\n\nThis will safely remove them from active student lists, searches, dropdowns, and class rosters while keeping all historical financial and attendance records intact.`)) {
       try {
         await updateDoc(doc(db, "students", studentId), {
-          status: 'Left',
-          leftAt: new Date().toISOString()
+          status: 'Deleted',
+          isDeleted: true,
+          deletedAt: new Date().toISOString(),
+          deletedBy: currentUser?.name || currentUser?.email || currentUser?.role || 'Admin'
         });
 
         try {
           const { logAuditAction } = await import('../../utils/auditLogger');
           await logAuditAction({
-            action: 'STUDENT_MARKED_LEFT',
-            performedBy: currentUser?.name || currentUser?.uid || 'Unknown',
-            schoolId: selectedSchool,
+            action: 'STUDENT_SOFT_DELETED',
+            performedBy: currentUser?.name || currentUser?.email || currentUser?.uid || 'Admin',
+            schoolId: studentSchool || selectedSchool,
             details: { studentId, studentName: name }
           });
         } catch (e) {
@@ -458,10 +530,80 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
         }
 
         setStudents(prev => prev.filter(s => s.id !== studentId));
-        alert(`Student "${name}" marked as Left. Historical records preserved.`);
+        alert(`Student "${name}" moved to Deleted Students (Recycle Bin).`);
       } catch (err) {
-        console.error("Error updating student status:", err);
+        console.error("Error soft-deleting student:", err);
+        alert("Failed to delete student: " + err.message);
       }
+    }
+  };
+
+  const handleRestoreStudent = async (student) => {
+    if (window.confirm(`Restore student "${student.name}" back to active records in ${student.class || 'their class'}?`)) {
+      try {
+        await updateDoc(doc(db, "students", student.id), {
+          status: 'Active',
+          isDeleted: false,
+          restoredAt: new Date().toISOString(),
+          restoredBy: currentUser?.name || currentUser?.email || currentUser?.role || 'Admin'
+        });
+
+        try {
+          const { logAuditAction } = await import('../../utils/auditLogger');
+          await logAuditAction({
+            action: 'STUDENT_RESTORED',
+            performedBy: currentUser?.name || currentUser?.email || currentUser?.uid || 'Admin',
+            schoolId: student.schoolId || selectedSchool,
+            details: { studentId: student.id, studentName: student.name, class: student.class }
+          });
+        } catch (e) {
+          console.error("Audit log failed:", e);
+        }
+
+        setDeletedStudents(prev => prev.filter(s => s.id !== student.id));
+        alert(`Student "${student.name}" successfully restored to active records.`);
+      } catch (err) {
+        console.error("Error restoring student:", err);
+        alert("Failed to restore student: " + err.message);
+      }
+    }
+  };
+
+  const handlePermanentDelete = async (student) => {
+    const isAuthorized = isUserAdminOrOwner(currentUser);
+    if (!isAuthorized) {
+      alert("Unauthorized: Only Owner and Administrator roles can permanently delete student records.");
+      return;
+    }
+
+    const confirmed = window.confirm("This permanently deletes the student record and cannot be undone. Continue?");
+    if (!confirmed) return;
+
+    try {
+      await deleteDoc(doc(db, "students", student.id));
+
+      try {
+        const { logAuditAction } = await import('../../utils/auditLogger');
+        await logAuditAction({
+          action: 'STUDENT_PERMANENTLY_DELETED',
+          performedBy: currentUser?.name || currentUser?.email || currentUser?.uid || 'Admin',
+          schoolId: student.schoolId || selectedSchool,
+          details: {
+            studentId: student.id,
+            studentName: student.name,
+            class: student.class,
+            roll: student.roll
+          }
+        });
+      } catch (e) {
+        console.error("Audit log failed:", e);
+      }
+
+      setDeletedStudents(prev => prev.filter(s => s.id !== student.id));
+      alert(`Student record for "${student.name}" permanently deleted.`);
+    } catch (err) {
+      console.error("Error permanently deleting student:", err);
+      alert("Failed to permanently delete student: " + err.message);
     }
   };
 
@@ -492,7 +634,7 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
         );
         const dupSnap = await getDocs(q);
         const hasDup = dupSnap.docs.some(
-          d => d.id !== editingStudent.id && d.data().status !== 'archived' && d.data().status !== 'Deleted'
+          d => d.id !== editingStudent.id && d.data().status !== 'archived' && d.data().status !== 'Deleted' && !d.data().isDeleted
         );
         if (hasDup) {
           alert(`Roll number "${editRoll}" is already assigned to another student in ${editClass} (${editSection}). Please use a different roll number.`);
@@ -506,6 +648,11 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
 
     try {
       if (editingStudent) {
+        const targetSchool = editingStudent.schoolId || selectedSchool || 'SCH_01';
+        const targetAcademicYear = activeAcademicYearId === '2026-2027' ? 'AY_2026_27' : (activeAcademicYearId || 'AY_2026_27');
+        const targetAcademicYearLabel = targetAcademicYear === 'AY_2026_27' ? '2026-2027' : targetAcademicYear;
+
+        // 1. Update the student document
         await updateDoc(doc(db, "students", editingStudent.id), {
           name: editName,
           fatherName: editFatherName,
@@ -515,21 +662,106 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
           contact: editContact,
           isNewAdmission: editIsNewAdmission
         });
+
+        // 2. Synchronize Admission Fee in fee_charges
+        let admissionFeeDelta = 0;
+        try {
+          const chargeQ = query(collection(db, "fee_charges"), where("studentId", "==", editingStudent.id));
+          const chargeSnap = await getDocs(chargeQ);
+          const existingAdmissionDoc = chargeSnap.docs.find(d => d.data().componentId === 'admission');
+
+          // Sync class / section updates on existing charges if changed
+          const normSec = normalizeSectionQuery(editSection);
+          chargeSnap.docs.forEach(d => {
+            const cData = d.data();
+            if (cData.class !== editClass || cData.section !== normSec) {
+              updateDoc(doc(db, "fee_charges", d.id), {
+                class: editClass,
+                section: normSec
+              }).catch(e => console.warn("Charge class/section sync error:", e));
+            }
+          });
+
+          if (editIsNewAdmission) {
+            // Marked as New Admission -> Ensure admission charge exists in fee_charges
+            if (!existingAdmissionDoc) {
+              let classFeeConfig = classSettings?.[editClass];
+              if (!classFeeConfig || !classFeeConfig.components || classFeeConfig.components.length === 0) {
+                const defaultComps = getSchoolDefaultFeeComponents(targetSchool, editClass, targetAcademicYearLabel);
+                classFeeConfig = { components: defaultComps };
+              }
+              const feeTemplate = normalizeClassFeeSettings(classFeeConfig, targetAcademicYearLabel);
+              const admissionComp = feeTemplate.components?.find(c => c.id === 'admission');
+              const admissionAmt = Number(admissionComp?.amount ?? admissionComp?.schedule?.[0]?.amount ?? 500);
+
+              if (admissionAmt > 0) {
+                const startYear = targetAcademicYearLabel.split('-')[0] || '2026';
+                const dueDate = admissionComp?.schedule?.[0]?.dueDate || `${startYear}-07-10`;
+                const chargeId = `chg_${editingStudent.id}_${targetAcademicYearLabel}_admission_${dueDate}`;
+
+                await addDoc(collection(db, "fee_charges"), {
+                  id: chargeId,
+                  studentId: editingStudent.id,
+                  academicYear: targetAcademicYearLabel,
+                  academicYearId: targetAcademicYear,
+                  schoolId: targetSchool,
+                  class: editClass,
+                  section: normSec,
+                  componentId: 'admission',
+                  label: admissionComp?.name || 'Admission Fee - One Time',
+                  originalAmount: admissionAmt,
+                  dueDate: dueDate,
+                  status: 'unpaid',
+                  allocatedPaid: 0,
+                  allocatedAdjusted: 0,
+                  netDue: admissionAmt,
+                  type: 'standard',
+                  createdAt: new Date().toISOString()
+                });
+                admissionFeeDelta = admissionAmt;
+              }
+            }
+          } else {
+            // Unmarked New Admission -> Remove unpaid admission fee if it exists
+            if (existingAdmissionDoc) {
+              const admData = existingAdmissionDoc.data();
+              if ((Number(admData.allocatedPaid) || 0) === 0) {
+                await deleteDoc(doc(db, "fee_charges", existingAdmissionDoc.id));
+                admissionFeeDelta = -(Number(admData.netDue) || Number(admData.originalAmount) || 0);
+              }
+            }
+          }
+        } catch (feeSyncErr) {
+          console.error("Failed to sync admission charge in fee_charges:", feeSyncErr);
+        }
+
+        // 3. Update local state with new details and adjusted liveDue
+        setStudents(prev => prev.map(s => {
+          if (s.id === editingStudent.id) {
+            const currentLiveDue = Number(s.liveDue) || 0;
+            return {
+              ...s,
+              name: editName,
+              fatherName: editFatherName,
+              roll: editRoll,
+              class: editClass,
+              section: normalizeSectionQuery(editSection),
+              contact: editContact,
+              isNewAdmission: editIsNewAdmission,
+              liveDue: Math.max(0, currentLiveDue + admissionFeeDelta)
+            };
+          }
+          return s;
+        }));
+
+        alert(editIsNewAdmission
+          ? `Student updated successfully!\nAdmission Fee has been added to ${editName}'s account.`
+          : "Student information updated successfully!");
+        setEditingStudent(null);
       }
-      setStudents(prev => prev.map(s => s.id === editingStudent.id ? {
-        ...s,
-        name: editName,
-        fatherName: editFatherName,
-        roll: editRoll,
-        class: editClass,
-        section: normalizeSectionQuery(editSection),
-        contact: editContact,
-        isNewAdmission: editIsNewAdmission
-      } : s));
-      alert("Student information updated successfully!");
-      setEditingStudent(null);
     } catch (err) {
       console.error("Error updating student:", err);
+      alert("Failed to update student: " + err.message);
     }
   };
 
@@ -537,7 +769,7 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
     <>
       <div className="page-header" style={{ marginBottom: 24 }}>
         <div>
-          {selectedClass || isAddingStudent ? (
+          {selectedClass || isAddingStudent || viewMode === 'recycleBin' ? (
             <button className="btn-secondary" onClick={handleBack} style={{ marginBottom: 16 }}>
               <ArrowLeft size={16} /> Back
             </button>
@@ -545,21 +777,67 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
           <h1 className="page-title">
             {isAddingStudent
               ? 'Add New Student'
-              : !selectedClass
-                ? 'Classes Directory'
-                : `${selectedClass} - Students`}
+              : viewMode === 'recycleBin'
+                ? 'Deleted Students / Recycle Bin'
+                : !selectedClass
+                  ? 'Classes Directory'
+                  : `${selectedClass} - Students`}
           </h1>
           <p className="page-subtitle">
             {isAddingStudent
               ? `Register a new student for ${selectedClass}`
-              : !selectedClass
-                ? 'Select a class to view its students'
-                : 'Filter by section, click a student to view details, or delete'}
+              : viewMode === 'recycleBin'
+                ? 'Review soft-deleted students, restore to active rosters, or permanently delete (Admin/Owner only)'
+                : !selectedClass
+                  ? 'Select a class to view its students'
+                  : 'Filter by section, click a student to view details, or delete'}
           </p>
         </div>
 
-        <div className="header-actions-responsive">
-          {selectedClass && !isAddingStudent && hasStudentEditPermission(selectedClass, selectedSection) && (
+        <div className="header-actions-responsive" style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+          {!isAddingStudent && (
+            <div style={{ display: 'inline-flex', backgroundColor: 'var(--bg-secondary)', borderRadius: 10, padding: 4, border: '1px solid var(--border-light)' }}>
+              <button
+                onClick={() => { setViewMode('active'); setSelectedClass(null); }}
+                style={{
+                  padding: '6px 14px',
+                  borderRadius: 8,
+                  border: 'none',
+                  fontWeight: 700,
+                  fontSize: 13,
+                  cursor: 'pointer',
+                  transition: 'all 0.2s ease',
+                  backgroundColor: viewMode === 'active' ? 'var(--bg-card)' : 'transparent',
+                  color: viewMode === 'active' ? 'var(--text-primary)' : 'var(--text-secondary)',
+                  boxShadow: viewMode === 'active' ? '0 2px 6px rgba(0,0,0,0.08)' : 'none'
+                }}
+              >
+                Active Students
+              </button>
+              <button
+                onClick={() => { setViewMode('recycleBin'); setSelectedClass(null); }}
+                style={{
+                  padding: '6px 14px',
+                  borderRadius: 8,
+                  border: 'none',
+                  fontWeight: 700,
+                  fontSize: 13,
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  transition: 'all 0.2s ease',
+                  backgroundColor: viewMode === 'recycleBin' ? 'var(--bg-card)' : 'transparent',
+                  color: viewMode === 'recycleBin' ? 'var(--danger)' : 'var(--text-secondary)',
+                  boxShadow: viewMode === 'recycleBin' ? '0 2px 6px rgba(0,0,0,0.08)' : 'none'
+                }}
+              >
+                <Trash2 size={14} /> Recycle Bin / Deleted
+              </button>
+            </div>
+          )}
+
+          {viewMode === 'active' && selectedClass && !isAddingStudent && hasStudentEditPermission(selectedClass, selectedSection) && (
             <button className="btn-info" onClick={() => setIsAddingStudent(true)}>
               <Plus size={18} /> Add Student
             </button>
@@ -567,7 +845,7 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
         </div>
       </div>
 
-      {selectedSchool === 'ALL' && !isAddingStudent && !selectedClass && (
+      {selectedSchool === 'ALL' && !isAddingStudent && viewMode === 'active' && !selectedClass && (
         <div style={{ padding: '16px 20px', backgroundColor: 'rgba(245, 158, 11, 0.1)', color: 'var(--warning)', borderRadius: 12, marginBottom: 24, border: '1px solid rgba(245, 158, 11, 0.3)', display: 'flex', alignItems: 'center', gap: 12 }}>
           <AlertCircle size={24} />
           <div>
@@ -638,7 +916,7 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
         </div>
       )}
 
-      {!isAddingStudent && !selectedClass && (
+      {!isAddingStudent && viewMode === 'active' && !selectedClass && (
         <div className="grid-responsive">
           {classes && classes.map(cls => (
             <div
@@ -662,7 +940,7 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
         </div>
       )}
 
-      {!isAddingStudent && selectedClass && (
+      {!isAddingStudent && viewMode === 'active' && selectedClass && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
           <div style={{ display: 'flex', gap: 12, alignItems: 'center', marginBottom: 8 }}>
             <span style={{ fontWeight: 600, color: 'var(--text-secondary)' }}>Filter by Section:</span>
@@ -715,36 +993,250 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
                       </div>
                     </div>
                   </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }} onClick={(e) => e.stopPropagation()}>
                     {hasStudentEditPermission(student.class, student.section) && (
                       <>
                         <button
-                          className="icon-btn"
-                          title="Edit Student Info"
-                          style={{ color: 'var(--brand-orange)', padding: 6 }}
-                          onClick={(e) => handleOpenEdit(student, e)}
+                          type="button"
+                          className="btn-secondary"
+                          title="Edit Student Information / विवरण संपादित करें"
+                          style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: 6,
+                            padding: '8px 14px',
+                            fontSize: 13,
+                            fontWeight: 700,
+                            color: 'var(--brand-orange)',
+                            borderColor: 'rgba(249, 115, 22, 0.4)',
+                            backgroundColor: 'rgba(249, 115, 22, 0.08)',
+                            borderRadius: 8,
+                            cursor: 'pointer',
+                            transition: 'all 0.15s ease'
+                          }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleOpenEdit(student, e);
+                          }}
                         >
-                          <Edit2 size={18} />
+                          <Edit2 size={15} />
+                          <span>Edit</span>
                         </button>
-                        {(currentUser?.role === 'Administrator' || currentUser?.role === 'Principal') && (
+
+                        {isUserAdminOrOwner(currentUser) && (
                           <button
-                            className="icon-btn"
-                            title="Delete Student"
-                            style={{ color: 'var(--danger)', padding: 6 }}
+                            type="button"
+                            className="btn-secondary"
+                            title="Delete Student (Move to Recycle Bin) / छात्र हटाएं"
+                            style={{
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: 6,
+                              padding: '8px 14px',
+                              fontSize: 13,
+                              fontWeight: 700,
+                              color: 'var(--danger)',
+                              borderColor: 'rgba(239, 68, 68, 0.4)',
+                              backgroundColor: 'rgba(239, 68, 68, 0.08)',
+                              borderRadius: 8,
+                              cursor: 'pointer',
+                              transition: 'all 0.15s ease'
+                            }}
                             onClick={(e) => {
                               e.stopPropagation();
-                              handleDeleteStudent(student.id, student.name);
+                              handleSoftDeleteStudent(student.id, student.name, student.schoolId);
                             }}
                           >
-                            <Trash2 size={18} />
+                            <Trash2 size={15} />
+                            <span>Delete</span>
                           </button>
                         )}
                       </>
                     )}
-                    <ChevronRight size={20} color="var(--text-secondary)" />
+                    <div style={{ padding: 4, display: 'flex', alignItems: 'center', color: 'var(--text-secondary)' }}>
+                      <ChevronRight size={20} />
+                    </div>
                   </div>
                 </div>
               ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Recycle Bin / Deleted Students View */}
+      {!isAddingStudent && viewMode === 'recycleBin' && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+          {/* Informational / Safety banner */}
+          <div style={{
+            padding: '16px 20px',
+            backgroundColor: 'rgba(239, 68, 68, 0.08)',
+            border: '1px solid rgba(239, 68, 68, 0.25)',
+            borderRadius: 14,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: 16,
+            flexWrap: 'wrap'
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <ShieldAlert size={24} color="var(--danger)" />
+              <div>
+                <div style={{ fontWeight: 800, fontSize: 14, color: 'var(--text-primary)' }}>
+                  Recycle Bin / Archived Students
+                </div>
+                <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 2 }}>
+                  Soft-deleted students are hidden from active rosters, fee schedules, and attendance. All historical invoices, payment vouchers, and marks remain safely preserved.
+                </div>
+              </div>
+            </div>
+            <button
+              className="btn-secondary"
+              onClick={fetchDeletedStudents}
+              disabled={isDeletedLoading}
+              style={{ fontSize: 13, padding: '6px 12px', display: 'flex', alignItems: 'center', gap: 6 }}
+            >
+              <RefreshCw size={14} className={isDeletedLoading ? 'spin' : ''} /> Refresh
+            </button>
+          </div>
+
+          {/* Search & Filter Bar */}
+          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
+            <div style={{ flex: '1 1 240px', minWidth: 200 }}>
+              <input
+                type="text"
+                className="form-input"
+                placeholder="Search deleted students by name, roll, or ID..."
+                value={deletedSearchQuery}
+                onChange={(e) => setDeletedSearchQuery(e.target.value)}
+                style={{ width: '100%' }}
+              />
+            </div>
+            <div style={{ width: 180 }}>
+              <select
+                className="form-input"
+                value={deletedClassFilter}
+                onChange={(e) => setDeletedClassFilter(e.target.value)}
+                style={{ width: '100%' }}
+              >
+                <option value="All">All Classes</option>
+                {classes && classes.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+          </div>
+
+          {/* Table / List */}
+          {isDeletedLoading ? (
+            <div style={{ padding: 60, textAlign: 'center', color: 'var(--text-secondary)' }}>
+              Loading deleted students...
+            </div>
+          ) : filteredDeletedStudents.length === 0 ? (
+            <div className="glass-card" style={{ padding: 60, textAlign: 'center', color: 'var(--text-secondary)' }}>
+              <Archive size={40} style={{ margin: '0 auto 12px', opacity: 0.5 }} />
+              <div style={{ fontWeight: 700, fontSize: 16 }}>No Deleted Students Found</div>
+              <div style={{ fontSize: 13, marginTop: 4 }}>
+                {deletedSearchQuery ? `No deleted students match "${deletedSearchQuery}".` : 'The recycle bin is currently empty.'}
+              </div>
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {filteredDeletedStudents.map((st) => {
+                const schoolObj = SCHOOLS.find(s => s.id === st.schoolId);
+                const schoolLabel = schoolObj ? `${schoolObj.code} (${schoolObj.name})` : (st.schoolId || 'Unknown');
+                const canPermanentDelete = isUserAdminOrOwner(currentUser);
+                return (
+                  <div
+                    key={st.id}
+                    className="glass-card flex-responsive"
+                    style={{
+                      padding: 18,
+                      borderRadius: 14,
+                      border: '1px solid var(--border-light)',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: 16
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+                      <div style={{
+                        width: 46,
+                        height: 46,
+                        borderRadius: '50%',
+                        backgroundColor: 'rgba(239, 68, 68, 0.1)',
+                        color: 'var(--danger)',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        fontSize: 18,
+                        fontWeight: 'bold'
+                      }}>
+                        {st.name?.charAt(0) || '?'}
+                      </div>
+                      <div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                          <span style={{ fontWeight: 800, fontSize: 16, color: 'var(--text-primary)' }}>{st.name}</span>
+                          <span className="badge" style={{ backgroundColor: 'rgba(239, 68, 68, 0.1)', color: 'var(--danger)', fontSize: 11, fontWeight: 700 }}>
+                            DELETED
+                          </span>
+                          <span className="badge" style={{ backgroundColor: 'var(--bg-secondary)', color: 'var(--text-secondary)', fontSize: 11 }}>
+                            {schoolLabel}
+                          </span>
+                        </div>
+                        <div style={{ color: 'var(--text-secondary)', fontSize: 13, marginTop: 4, display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+                          <span>ID: <code style={{ fontWeight: 700 }}>{st.id}</code></span>
+                          <span>Class: <strong>{st.class || 'N/A'}</strong> {st.section ? `(${st.section})` : ''}</span>
+                          {st.roll && <span>Roll: {st.roll}</span>}
+                          {(st.fatherName || st.parentName) && <span>Father: {st.fatherName || st.parentName}</span>}
+                          <span>Deleted: {st.deletedAt ? new Date(st.deletedAt).toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'Unknown date'}</span>
+                          {st.deletedBy && <span>By: <strong>{st.deletedBy}</strong></span>}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                      <button
+                        className="btn-secondary"
+                        onClick={() => handleRestoreStudent(st)}
+                        title="Restore student to active class roster"
+                        style={{
+                          borderColor: '#10b981',
+                          color: '#10b981',
+                          fontWeight: 700,
+                          fontSize: 13,
+                          padding: '8px 14px',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 6
+                        }}
+                      >
+                        <RotateCcw size={15} /> Restore
+                      </button>
+
+                      <button
+                        className="btn-secondary"
+                        onClick={() => handlePermanentDelete(st)}
+                        disabled={!canPermanentDelete}
+                        title={canPermanentDelete ? "Permanently delete this student from database" : "Only Administrator or Owner can permanently delete"}
+                        style={{
+                          borderColor: canPermanentDelete ? 'rgba(239, 68, 68, 0.5)' : 'var(--border-light)',
+                          color: canPermanentDelete ? 'var(--danger)' : 'var(--text-secondary)',
+                          opacity: canPermanentDelete ? 1 : 0.5,
+                          cursor: canPermanentDelete ? 'pointer' : 'not-allowed',
+                          fontWeight: 700,
+                          fontSize: 13,
+                          padding: '8px 14px',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 6
+                        }}
+                      >
+                        <Trash2 size={15} /> Permanent Delete
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
@@ -754,96 +1246,169 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
       {editingStudent && (
         <div 
           onClick={(e) => { if (e.target === e.currentTarget) setEditingStudent(null); }}
-          style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.6)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(0,0,0,0.65)',
+            backdropFilter: 'blur(4px)',
+            zIndex: 1000,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: 16,
+            overflowY: 'auto'
+          }}
         >
-          <div className="glass-card" style={{ width: '100%', maxWidth: 520, padding: 28, position: 'relative' }}>
-            <button onClick={() => setEditingStudent(null)} style={{ position: 'absolute', top: 16, right: 16, background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)' }}>
-              <X size={20} />
-            </button>
+          <div
+            className="glass-card"
+            style={{
+              width: '100%',
+              maxWidth: 540,
+              maxHeight: 'min(90vh, 740px)',
+              display: 'flex',
+              flexDirection: 'column',
+              padding: 0,
+              position: 'relative',
+              borderRadius: 16,
+              boxShadow: '0 20px 50px rgba(0,0,0,0.3)',
+              overflow: 'hidden',
+              backgroundColor: 'var(--bg-card)'
+            }}
+          >
+            {/* Header - Sticky */}
+            <div style={{
+              padding: '18px 24px',
+              borderBottom: '1px solid var(--border-light)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              background: 'var(--bg-secondary)',
+              flexShrink: 0
+            }}>
+              <h3 style={{ fontSize: 18, fontWeight: 800, margin: 0, display: 'flex', alignItems: 'center', gap: 10 }}>
+                <Edit2 size={20} color="var(--brand-orange)" /> Edit Student Record
+              </h3>
+              <button
+                type="button"
+                onClick={() => setEditingStudent(null)}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  cursor: 'pointer',
+                  color: 'var(--text-secondary)',
+                  padding: 6,
+                  borderRadius: 6,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center'
+                }}
+              >
+                <X size={20} />
+              </button>
+            </div>
 
-            <h3 style={{ fontSize: 20, fontWeight: 800, marginBottom: 20, display: 'flex', alignItems: 'center', gap: 10 }}>
-              <Edit2 size={22} color="var(--brand-orange)" /> Edit Student Record
-            </h3>
-
-            <form onSubmit={handleSaveStudentEdit}>
-              <div className="grid-responsive">
-                <div className="form-group">
-                  <label className="form-label" style={{ fontWeight: 700 }}>Full Name</label>
-                  <input
-                    type="text"
-                    className="form-input"
-                    value={editName}
-                    onChange={(e) => setEditName(e.target.value)}
-                    required
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label" style={{ fontWeight: 700 }}>Father's Name</label>
-                  <input
-                    type="text"
-                    className="form-input"
-                    value={editFatherName}
-                    onChange={(e) => setEditFatherName(e.target.value)}
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label" style={{ fontWeight: 700 }}>Roll Number</label>
-                  <input
-                    type="text"
-                    className="form-input"
-                    value={editRoll}
-                    onChange={(e) => setEditRoll(e.target.value)}
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label" style={{ fontWeight: 700 }}>Class</label>
-                  <select
-                    className="form-input"
-                    value={editClass}
-                    onChange={(e) => setEditClass(e.target.value)}
-                  >
-                    {classes.map(c => <option key={c} value={c}>{c}</option>)}
-                  </select>
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label" style={{ fontWeight: 700 }}>Section</label>
-                  <select
-                    className="form-input"
-                    value={editSection}
-                    onChange={(e) => setEditSection(e.target.value)}
-                  >
-                    {sections.map(s => <option key={s} value={s}>{s}</option>)}
-                  </select>
-                </div>
-
-                <div className="form-group" style={{ gridColumn: '1 / -1' }}>
-                  <label className="form-label" style={{ fontWeight: 700 }}>Parent Mobile Contact</label>
-                  <input
-                    type="text"
-                    className="form-input"
-                    value={editContact}
-                    onChange={(e) => setEditContact(e.target.value)}
-                  />
-                </div>
-
-                <div className="form-group" style={{ gridColumn: '1 / -1', marginTop: 4 }}>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontWeight: 600, fontSize: 14 }}>
+            {/* Scrollable Form Body */}
+            <form onSubmit={handleSaveStudentEdit} style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+              <div style={{ padding: '24px', overflowY: 'auto', flex: 1, WebkitOverflowScrolling: 'touch' }}>
+                <div className="grid-responsive">
+                  <div className="form-group">
+                    <label className="form-label" style={{ fontWeight: 700 }}>Full Name</label>
                     <input
-                      type="checkbox"
-                      checked={editIsNewAdmission}
-                      onChange={(e) => setEditIsNewAdmission(e.target.checked)}
-                      style={{ width: 18, height: 18, cursor: 'pointer' }}
+                      type="text"
+                      className="form-input"
+                      value={editName}
+                      onChange={(e) => setEditName(e.target.value)}
+                      required
                     />
-                    <span>☐ New Admission / नया प्रवेश</span>
-                  </label>
+                  </div>
+
+                  <div className="form-group">
+                    <label className="form-label" style={{ fontWeight: 700 }}>Father's Name</label>
+                    <input
+                      type="text"
+                      className="form-input"
+                      value={editFatherName}
+                      onChange={(e) => setEditFatherName(e.target.value)}
+                    />
+                  </div>
+
+                  <div className="form-group">
+                    <label className="form-label" style={{ fontWeight: 700 }}>Roll Number</label>
+                    <input
+                      type="text"
+                      className="form-input"
+                      value={editRoll}
+                      onChange={(e) => setEditRoll(e.target.value)}
+                    />
+                  </div>
+
+                  <div className="form-group">
+                    <label className="form-label" style={{ fontWeight: 700 }}>Class</label>
+                    <select
+                      className="form-input"
+                      value={editClass}
+                      onChange={(e) => setEditClass(e.target.value)}
+                    >
+                      {classes.map(c => <option key={c} value={c}>{c}</option>)}
+                    </select>
+                  </div>
+
+                  <div className="form-group">
+                    <label className="form-label" style={{ fontWeight: 700 }}>Section</label>
+                    <select
+                      className="form-input"
+                      value={editSection}
+                      onChange={(e) => setEditSection(e.target.value)}
+                    >
+                      {sections.map(s => <option key={s} value={s}>{s}</option>)}
+                    </select>
+                  </div>
+
+                  <div className="form-group" style={{ gridColumn: '1 / -1' }}>
+                    <label className="form-label" style={{ fontWeight: 700 }}>Parent Mobile Contact</label>
+                    <input
+                      type="text"
+                      className="form-input"
+                      value={editContact}
+                      onChange={(e) => setEditContact(e.target.value)}
+                    />
+                  </div>
+
+                  <div className="form-group" style={{ gridColumn: '1 / -1', marginTop: 8 }}>
+                    <label style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 10,
+                      cursor: 'pointer',
+                      fontWeight: 600,
+                      fontSize: 14,
+                      padding: '12px 16px',
+                      borderRadius: 10,
+                      backgroundColor: 'var(--bg-secondary)',
+                      border: '1px solid var(--border-light)'
+                    }}>
+                      <input
+                        type="checkbox"
+                        checked={editIsNewAdmission}
+                        onChange={(e) => setEditIsNewAdmission(e.target.checked)}
+                        style={{ width: 18, height: 18, cursor: 'pointer' }}
+                      />
+                      <span>New Admission / नया प्रवेश (Applies Admission Fee)</span>
+                    </label>
+                  </div>
                 </div>
               </div>
 
-              <div style={{ display: 'flex', gap: 12, justifyContent: 'flex-end', marginTop: 24 }}>
+              {/* Sticky Footer with Action Buttons */}
+              <div style={{
+                padding: '16px 24px',
+                borderTop: '1px solid var(--border-light)',
+                display: 'flex',
+                gap: 12,
+                justifyContent: 'flex-end',
+                background: 'var(--bg-secondary)',
+                flexShrink: 0
+              }}>
                 <button className="btn-secondary" type="button" onClick={() => setEditingStudent(null)}>Cancel</button>
                 <button className="btn-primary" type="submit">Save Changes</button>
               </div>
@@ -856,7 +1421,7 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
 }
 
 // Senior Product Designer SaaS Redesign of Student Dashboard Profile
-export function StudentLedger({ onNavigate, lang = 'en', activeStudent, userPermissions, selectedSchool, activeAcademicYearId }) {
+export function StudentLedger({ onNavigate, lang = 'en', activeStudent, userPermissions, currentUser, selectedSchool, activeAcademicYearId }) {
   const dict = t[lang] || t.en;
   const [isEditingName, setIsEditingName] = useState(false);
   const [studentName, setStudentName] = useState(activeStudent?.name || 'Anjali Sharma');
@@ -880,6 +1445,38 @@ export function StudentLedger({ onNavigate, lang = 'en', activeStudent, userPerm
   const [calendarDays, setCalendarDays] = useState([]);
   const [selectedExamView, setSelectedExamView] = useState('Quarterly');
   const examOptions = ['Quarterly', 'Half Yearly', 'Final Exam'];
+
+  const handleProfileDelete = async () => {
+    if (!activeStudent?.id) return;
+    if (window.confirm(`Move student "${studentName}" to Deleted Students (Recycle Bin)?\n\nThis will safely remove them from active student lists and fee rosters while preserving all historical payment receipts and attendance records.`)) {
+      try {
+        await updateDoc(doc(db, "students", activeStudent.id), {
+          status: 'Deleted',
+          isDeleted: true,
+          deletedAt: new Date().toISOString(),
+          deletedBy: currentUser?.name || currentUser?.email || currentUser?.role || 'Admin'
+        });
+
+        try {
+          const { logAuditAction } = await import('../../utils/auditLogger');
+          await logAuditAction({
+            action: 'STUDENT_SOFT_DELETED',
+            performedBy: currentUser?.name || currentUser?.email || currentUser?.uid || 'Admin',
+            schoolId: activeStudent.schoolId || selectedSchool,
+            details: { studentId: activeStudent.id, studentName, class: activeStudent.class, fromProfile: true }
+          });
+        } catch (e) {
+          console.error("Audit log failed:", e);
+        }
+
+        alert(`Student "${studentName}" moved to Deleted Students (Recycle Bin).`);
+        onNavigate('students');
+      } catch (err) {
+        console.error("Error deleting student from profile:", err);
+        alert("Failed to delete student: " + err.message);
+      }
+    }
+  };
 
   useEffect(() => {
     if (activeStudent?.name) {
@@ -1046,14 +1643,31 @@ export function StudentLedger({ onNavigate, lang = 'en', activeStudent, userPerm
           setAnnualFee(totalChargesAmount);
           setAnnualTuitionFee(totalTuitionAmount);
         } else {
-          // Fallback if no permanent charges exist
-          const studentDue = activeStudent?.liveDue ?? activeStudent?.openingArrears ?? activeStudent?.dueAmount ?? 0;
-          setLiveDue(Number(studentDue));
-          const annual = paid + Number(studentDue);
-          setAnnualFee(annual);
-          setAnnualTuitionFee(annual);
-          const wallet = paid > annual ? paid - annual : 0;
-          setWalletBalance(wallet);
+          // Fallback if no permanent charges exist (e.g. JSIC students before permanent charges generation)
+          const studentClass = activeStudent?.class;
+          const studentSchool = activeStudent?.schoolId || selectedSchool;
+          let rawClassSettings = classSettings[studentClass];
+          if (!rawClassSettings || !rawClassSettings.components || rawClassSettings.components.length === 0) {
+            rawClassSettings = {
+              components: getSchoolDefaultFeeComponents(studentSchool, studentClass, activeAcademicYearId || '2026-2027')
+            };
+          }
+          const sSettings = normalizeClassFeeSettings(rawClassSettings, activeAcademicYearId || '2026-2027');
+          const summary = calculateStudentDue({
+            student: activeStudent,
+            charges: null,
+            classSettings: sSettings,
+            payments: invoices,
+            adjustments: rawAdjustments
+          });
+          setLiveDue(summary.totalDue);
+          setTotalPaid(summary.totalPaid);
+          setWalletBalance(summary.advanceCredit);
+
+          const totalChargesAmount = summary.ledger.reduce((sum, c) => sum + (Number(c.originalAmount) || 0), 0);
+          const totalTuitionAmount = summary.ledger.filter(c => c.componentId === 'tuition').reduce((sum, c) => sum + (Number(c.originalAmount) || 0), 0);
+          setAnnualFee(totalChargesAmount);
+          setAnnualTuitionFee(totalTuitionAmount);
         }
       } catch (err) {
         console.error('Error fetching financials:', err);
@@ -1203,6 +1817,27 @@ export function StudentLedger({ onNavigate, lang = 'en', activeStudent, userPerm
             >
               <Download size={18} />
             </button>
+
+            {/* Delete Student Action Button */}
+            {isUserAdminOrOwner(currentUser) && (
+              <button
+                className="btn-secondary"
+                title="Delete Student (Move to Recycle Bin)"
+                onClick={handleProfileDelete}
+                style={{
+                  borderColor: 'rgba(239, 68, 68, 0.4)',
+                  color: 'var(--danger)',
+                  fontWeight: 700,
+                  padding: '10px 14px',
+                  fontSize: 13,
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6
+                }}
+              >
+                <Trash2 size={16} /> {lang === 'hi' ? 'छात्र हटाएं' : 'Delete Student'}
+              </button>
+            )}
           </div>
         </div>
       </div>

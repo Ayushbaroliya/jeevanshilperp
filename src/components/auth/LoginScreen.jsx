@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { GraduationCap, Shield, User, Briefcase, Lock, ArrowRight, CheckCircle2, Key, Sliders, LogIn, Phone, Globe, Building2 } from 'lucide-react';
 import { collection, query, where, getDocs, doc, getDoc } from 'firebase/firestore';
-import { auth, db, staffAuthEmail, signInWithEmailAndPassword, signOut, createUserWithEmailAndPassword } from '../../firebase';
+import { auth, db, staffAuthEmail, normalizeLoginId, signInWithEmailAndPassword, signOut, createUserWithEmailAndPassword } from '../../firebase';
 import { DEFAULT_ROLE_PERMISSIONS } from '../../utils/permissions';
 import { t, SCHOOLS } from '../../utils/translations';
 
@@ -19,31 +19,106 @@ export default function LoginScreen({ onLoginSuccess }) {
 
   const handleStaffLogin = async (e) => {
     e.preventDefault();
-    if (!mobile.trim() || !password.trim()) {
-      setErrorMsg(lang === 'hi' ? 'कृपया पंजीकृत लॉगिन आईडी और पासवर्ड दोनों दर्ज करें।' : 'Please enter both Login ID and password.');
+    const cleanInput = normalizeLoginId(mobile.trim());
+    if (!cleanInput || !password.trim()) {
+      setErrorMsg(lang === 'hi' ? 'कृपया पंजीकृत 10 अंकों का मोबाइल नंबर और पासवर्ड दर्ज करें।' : 'Please enter your Mobile Number and password.');
       return;
     }
     setErrorMsg('');
     setIsLoggingIn(true);
 
-
-
     try {
-      const credential = await signInWithEmailAndPassword(auth, staffAuthEmail(mobile.trim()), password.trim());
-      const q = query(collection(db, 'staff'), where('uid', '==', credential.user.uid), where('schoolId', '==', activePortal));
-      const snapshot = await getDocs(q);
-      if (snapshot.empty) {
+      const email = staffAuthEmail(cleanInput);
+      const credential = await signInWithEmailAndPassword(auth, email, password.trim());
+      const userUid = credential.user.uid;
+
+      // Resilient Staff Profile Lookup:
+      // 1. Query staff collection by uid
+      let staffDoc = null;
+      let staffData = null;
+
+      const qUid = query(collection(db, 'staff'), where('uid', '==', userUid));
+      const uidSnap = await getDocs(qUid);
+      if (!uidSnap.empty) {
+        staffDoc = uidSnap.docs[0];
+        staffData = staffDoc.data();
+      } else {
+        // Fallback A: document ID == userUid
+        try {
+          const directSnap = await getDoc(doc(db, 'staff', userUid));
+          if (directSnap.exists()) {
+            staffDoc = directSnap;
+            staffData = directSnap.data();
+          }
+        } catch (_) {}
+
+        // Fallback B: query by contact or loginId
+        if (!staffDoc) {
+          try {
+            const qContact = query(collection(db, 'staff'), where('contact', '==', cleanInput));
+            const contactSnap = await getDocs(qContact);
+            if (!contactSnap.empty) {
+              staffDoc = contactSnap.docs[0];
+              staffData = contactSnap.data();
+              // Auto-link UID for future instant lookups
+              try {
+                const { setDoc, doc: fDoc } = await import('firebase/firestore');
+                await setDoc(fDoc(db, 'staff', staffDoc.id), { uid: userUid }, { merge: true });
+              } catch (_) {}
+            }
+          } catch (_) {}
+        }
+      }
+
+      if (!staffDoc || !staffData) {
+        // Fallback C: check users collection
+        try {
+          const userDocSnap = await getDoc(doc(db, 'users', userUid));
+          if (userDocSnap.exists()) {
+            staffData = userDocSnap.data();
+            staffDoc = { id: userUid, data: () => staffData };
+          }
+        } catch (_) {}
+      }
+
+      if (!staffDoc || !staffData) {
         await signOut(auth);
         throw new Error('STAFF_PROFILE_NOT_FOUND');
       }
-      const staffDoc = snapshot.docs[0];
-      const staff = { id: staffDoc.id, ...staffDoc.data(), uid: credential.user.uid, schoolId: activePortal };
+
+      // Smart Multi-Campus Routing:
+      // If staff belongs to another campus, route them seamlessly to their registered school!
+      const targetSchool = staffData.schoolId || activePortal;
+      const staff = { 
+        id: staffDoc.id, 
+        ...staffData, 
+        uid: userUid, 
+        schoolId: targetSchool 
+      };
+
       onLoginSuccess(staff);
     } catch (err) {
       console.error('Staff login error:', err);
-      const message = err?.message === 'STAFF_PROFILE_NOT_FOUND'
-        ? 'Your account is authenticated but no staff profile is linked to this campus.'
-        : (lang === 'hi' ? 'लॉगिन विफल। लॉगिन आईडी और पासवर्ड जांचें।' : 'Login failed. Check your Login ID and password.');
+      let message;
+      if (err?.code === 'auth/invalid-credential' || err?.code === 'auth/wrong-password' || err?.code === 'auth/user-not-found') {
+        message = lang === 'hi' 
+          ? 'गलत मोबाइल नंबर या पासवर्ड। कृपया पुनः जांचें।' 
+          : 'Invalid Mobile Number or password. Please check your credentials.';
+      } else if (err?.code === 'auth/too-many-requests') {
+        message = lang === 'hi' 
+          ? 'बहुत अधिक असफल प्रयास। कृपया कुछ मिनट बाद पुनः प्रयास करें।' 
+          : 'Too many failed login attempts. Please try again later.';
+      } else if (err?.code === 'auth/user-disabled') {
+        message = lang === 'hi' 
+          ? 'यह खाता व्यवस्थापक द्वारा निष्क्रिय कर दिया गया है।' 
+          : 'This staff account has been deactivated. Please contact administration.';
+      } else if (err?.message === 'STAFF_PROFILE_NOT_FOUND') {
+        message = lang === 'hi'
+          ? 'प्रमाणीकरण सफल हुआ, लेकिन इस खाते के लिए कोई स्टाफ प्रोफ़ाइल नहीं मिली।'
+          : 'Authenticated successfully, but no staff profile is linked to this account.';
+      } else {
+        message = lang === 'hi' ? 'लॉगिन विफल। कृपया मोबाइल नंबर और पासवर्ड जांचें।' : 'Login failed. Check your Mobile Number and password.';
+      }
       setErrorMsg(message);
     } finally {
       setIsLoggingIn(false);
@@ -226,12 +301,12 @@ export default function LoginScreen({ onLoginSuccess }) {
 
         <form onSubmit={isOwner ? handleOwnerLogin : handleStaffLogin}>
           <div style={{ marginBottom: 16 }}>
-            <label className="form-label" style={{ fontWeight: 700 }}>{isOwner ? 'Username' : (lang === 'hi' ? 'लॉगिन आईडी / मोबाइल नंबर' : 'Login ID / Mobile No')}</label>
+            <label className="form-label" style={{ fontWeight: 700 }}>{isOwner ? 'Username' : (lang === 'hi' ? '10 अंकों का मोबाइल नंबर' : '10-Digit Mobile Number')}</label>
             <div style={{ position: 'relative' }}>
               <input
                 type="text"
                 className="form-input"
-                placeholder={isOwner ? "admin" : "e.g. 9876543210 or username"}
+                placeholder={isOwner ? "admin" : "e.g. 9876543210"}
                 value={mobile}
                 onChange={(e) => setMobile(e.target.value)}
                 style={{ paddingLeft: 38 }}

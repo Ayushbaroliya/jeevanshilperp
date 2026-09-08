@@ -1,17 +1,46 @@
 import React, { useState, useEffect } from 'react';
-import { X, Plus, Key, Shield, Trash2, Briefcase, Save } from 'lucide-react';
+import { X, Plus, Key, Shield, Trash2, Briefcase, Save, Sparkles, Edit, BookOpen, Check } from 'lucide-react';
 import { collection, addDoc, getDocs, query, orderBy, updateDoc, doc, deleteDoc, serverTimestamp, setDoc, where , writeBatch} from 'firebase/firestore';
 import { httpsCallable } from 'firebase/functions';
-import { createStaffAuthAccount, db, functions } from '../../firebase';
+import { createStaffAuthAccount, normalizeLoginId, db, functions } from '../../firebase';
 import { SCHOOLS } from '../../utils/translations';
 import { DEFAULT_ROLE_PERMISSIONS, getUserPermissions } from '../../utils/permissions';
 import { auditLogGovernance } from '../../utils/audit';
 import ManagePermissionsModal from './ManagePermissionsModal';
+import PromotionWizardModal, { isOwnerUser } from './PromotionWizardModal';
 import SchoolFolderPicker from '../common/SchoolFolderPicker';
-import { FEE_FREQUENCIES, INSTALLMENTS, DEFAULT_FEE_COMPONENTS, getDefaultFeeComponents, getJSICFeeComponents, getJSPSFeeComponents, normalizeClassFeeSettings } from '../../utils/feeEngine';
+import { FEE_FREQUENCIES, INSTALLMENTS, DEFAULT_FEE_COMPONENTS, getDefaultFeeComponents, getJSICFeeComponents, getJSPSFeeComponents, getSchoolDefaultFeeComponents, normalizeClassFeeSettings } from '../../utils/feeEngine';
 
 export default function SettingsModule({ lang, classes, setClasses, classSettings, setClassSettings, sections, setSections, onNavigate, setSelectedTeacher, selectedSchool, setSelectedSchool, currentUser, activeAcademicYearId }) {
-  const [activeTab, setActiveTab] = useState('school'); // 'school' | 'staff' | 'assignments' | 'academic'
+  const defaultJSPSClasses = ['Nursery', 'LKG', 'UKG', 'Class 1', 'Class 2', 'Class 3', 'Class 4', 'Class 5', 'Class 6', 'Class 7', 'Class 8'];
+  const defaultJSICClasses = ['Class 6', 'Class 7', 'Class 8', 'Class 9', 'Class 10', 'Class 11', 'Class 12', 'Class 11 Art', 'Class 11 Science', 'Class 12 Art', 'Class 12 Science'];
+  const defaultJSB2Classes = ['Nursery', 'LKG', 'UKG', 'Class 1', 'Class 2', 'Class 3', 'Class 4', 'Class 5', 'Class 6', 'Class 7', 'Class 8', 'Class 9', 'Class 10'];
+  const defaultSectionsList = ['Section A', 'Section B', 'Section C'];
+
+  const getDefaultClassesForSchool = (sch) => {
+    if (sch === 'SCH_01') return defaultJSPSClasses;
+    if (sch === 'SCH_03') return defaultJSB2Classes;
+    return defaultJSICClasses;
+  };
+
+  const effectiveClasses = classes && classes.length > 0
+    ? classes
+    : getDefaultClassesForSchool(selectedSchool);
+
+  const effectiveSections = sections && sections.length > 0
+    ? sections
+    : defaultSectionsList;
+
+  useEffect(() => {
+    if ((!classes || classes.length === 0) && selectedSchool && selectedSchool !== 'ALL') {
+      setClasses(getDefaultClassesForSchool(selectedSchool));
+    }
+    if ((!sections || sections.length === 0) && selectedSchool && selectedSchool !== 'ALL') {
+      setSections(defaultSectionsList);
+    }
+  }, [selectedSchool]);
+
+  const [activeTab, setActiveTab] = useState('school'); // 'school' | 'staff' | 'assignments' | 'academic' | 'subjects'
   const [newClass, setNewClass] = useState('');
   const [newSection, setNewSection] = useState('');
   const [saveStatus, setSaveStatus] = useState('');
@@ -20,17 +49,45 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
   const [academicYearsList, setAcademicYearsList] = useState([]);
   const [newAcademicYear, setNewAcademicYear] = useState({ id: '', name: '' });
   const [isLoadingAcademicYears, setIsLoadingAcademicYears] = useState(false);
+  const [isPromotionWizardOpen, setIsPromotionWizardOpen] = useState(false);
 
   // Assignments state
   const [assignmentsList, setAssignmentsList] = useState([]);
   const [isLoadingAssignments, setIsLoadingAssignments] = useState(false);
-  const [newAssignment, setNewAssignment] = useState({ class: classes[0] || '', section: '', teacherId: '' });
+  const [newAssignment, setNewAssignment] = useState({ 
+    class: effectiveClasses[0] || '', 
+    section: '', 
+    teacherId: '', 
+    assignmentType: 'class_teacher', 
+    subject: '' 
+  });
+
+  // Subjects state
+  const [subjectsList, setSubjectsList] = useState([]);
+  const [isLoadingSubjects, setIsLoadingSubjects] = useState(false);
+  const [newSubject, setNewSubject] = useState({
+    name: '',
+    code: '',
+    class: 'ALL',
+    category: 'Core',
+    schoolId: selectedSchool === 'ALL' ? 'SCH_01' : selectedSchool,
+    academicYearId: activeAcademicYearId || 'AY_2026_27'
+  });
 
   // Staff Management state
   const [staffList, setStaffList] = useState([]);
   const [isLoadingStaff, setIsLoadingStaff] = useState(false);
   const [isAddingStaff, setIsAddingStaff] = useState(false);
-  const [newStaff, setNewStaff] = useState({ name: '', role: 'Teacher', baseSalary: '', contact: '', password: '', schoolId: selectedSchool === 'ALL' ? 'SCH_01' : selectedSchool });
+  const [editingStaff, setEditingStaff] = useState(null);
+  const [newStaff, setNewStaff] = useState({ 
+    name: '', 
+    role: 'Teacher', 
+    designation: 'Teacher',
+    baseSalary: '', 
+    contact: '', 
+    password: '', 
+    schoolId: selectedSchool === 'ALL' ? 'SCH_01' : selectedSchool 
+  });
   const [resetModalStaff, setResetModalStaff] = useState(null);
   const [newResetPassword, setNewResetPassword] = useState('');
   const [permissionModalStaff, setPermissionModalStaff] = useState(null);
@@ -38,18 +95,49 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
   const fetchStaff = async () => {
     setIsLoadingStaff(true);
     try {
-      let q = query(collection(db, "staff"), orderBy("createdAt", "desc"));
-      if (selectedSchool && selectedSchool !== 'ALL') {
-        q = query(collection(db, "staff"), where("schoolId", "==", selectedSchool), orderBy("createdAt", "desc"));
-      }
+      // Query without composite server-side orderBy to prevent missing-index errors
+      const q = (selectedSchool && selectedSchool !== 'ALL')
+        ? query(collection(db, "staff"), where("schoolId", "==", selectedSchool))
+        : collection(db, "staff");
       const querySnapshot = await getDocs(q);
+
+      // Fetch staff_salary collection as fallback/supplement for salaries
+      let salaries = {};
+      try {
+        const salSnap = await getDocs(collection(db, 'staff_salary'));
+        salSnap.forEach(sDoc => {
+          const d = sDoc.data();
+          if (d.baseSalary !== undefined) {
+            salaries[sDoc.id] = Number(d.baseSalary);
+            if (d.staffId) salaries[d.staffId] = Number(d.baseSalary);
+            if (d.uid) salaries[d.uid] = Number(d.baseSalary);
+          }
+        });
+      } catch (salErr) {
+        console.warn("Could not fetch staff_salary collection:", salErr);
+      }
+
       const staff = [];
       querySnapshot.forEach((doc) => {
         const data = doc.data();
         if (data.status !== 'archived' && data.isActive !== false) {
-          staff.push({ id: doc.id, ...data });
+          const resolvedSalary = data.baseSalary ?? salaries[doc.id] ?? (data.uid ? salaries[data.uid] : 0) ?? data.salary ?? 0;
+          staff.push({ 
+            id: doc.id, 
+            ...data,
+            baseSalary: Number(resolvedSalary)
+          });
         }
       });
+
+      // Sort client-side by createdAt descending, then by name
+      staff.sort((a, b) => {
+        const tA = a.createdAt?.toMillis ? a.createdAt.toMillis() : (new Date(a.createdAt || 0).getTime() || 0);
+        const tB = b.createdAt?.toMillis ? b.createdAt.toMillis() : (new Date(b.createdAt || 0).getTime() || 0);
+        if (tB !== tA) return tB - tA;
+        return (a.name || '').localeCompare(b.name || '');
+      });
+
       setStaffList(staff);
     } catch (error) {
       console.error("Error fetching staff:", error);
@@ -61,15 +149,21 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
   const fetchAssignments = async () => {
     setIsLoadingAssignments(true);
     try {
-      let q = query(collection(db, "class_assignments"));
-      if (selectedSchool && selectedSchool !== 'ALL') {
-        q = query(collection(db, "class_assignments"), where("schoolId", "==", selectedSchool));
-      }
+      const q = (selectedSchool && selectedSchool !== 'ALL')
+        ? query(collection(db, "class_assignments"), where("schoolId", "==", selectedSchool))
+        : collection(db, "class_assignments");
       const querySnapshot = await getDocs(q);
       const assigns = [];
       querySnapshot.forEach((doc) => {
         assigns.push({ id: doc.id, ...doc.data() });
       });
+
+      assigns.sort((a, b) => {
+        const clsComp = (a.class || '').localeCompare(b.class || '');
+        if (clsComp !== 0) return clsComp;
+        return (a.section || '').localeCompare(b.section || '');
+      });
+
       setAssignmentsList(assigns);
     } catch (error) {
       console.error("Error fetching assignments:", error);
@@ -95,16 +189,164 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
     }
   };
 
+  const fetchSubjects = async () => {
+    setIsLoadingSubjects(true);
+    try {
+      const targetSchool = (selectedSchool && selectedSchool !== 'ALL') ? selectedSchool : null;
+      let q = targetSchool 
+        ? query(collection(db, "subjects"), where("schoolId", "==", targetSchool))
+        : collection(db, "subjects");
+      const snap = await getDocs(q);
+      const list = [];
+      snap.forEach(d => list.push({ id: d.id, ...d.data() }));
+      list.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+      setSubjectsList(list);
+    } catch (err) {
+      console.error("Error fetching subjects:", err);
+    } finally {
+      setIsLoadingSubjects(false);
+    }
+  };
+
+  const handleAddSubject = async (e) => {
+    e.preventDefault();
+    if (!newSubject.name.trim()) {
+      alert("Please enter a Subject Name.");
+      return;
+    }
+    const targetSchool = (selectedSchool && selectedSchool !== 'ALL') ? selectedSchool : 'SCH_01';
+    const effectiveYear = (activeAcademicYearId && activeAcademicYearId.trim()) ? activeAcademicYearId.trim() : 'AY_2026_27';
+    const subName = newSubject.name.trim();
+    const subCode = (newSubject.code?.trim() || subName.slice(0, 4).toUpperCase()).replace(/\s+/g, '_');
+    const subClass = newSubject.class || 'ALL';
+    const subId = `${targetSchool}_${effectiveYear}_${subClass.replace(/\s+/g, '_')}_${subCode}`;
+
+    try {
+      const subDoc = {
+        name: subName,
+        code: subCode,
+        class: subClass,
+        category: newSubject.category || 'Core',
+        schoolId: targetSchool,
+        academicYearId: effectiveYear,
+        status: 'active',
+        isActive: true,
+        createdAt: new Date().toISOString(),
+        createdBy: currentUser?.name || currentUser?.email || 'Administrator'
+      };
+      await setDoc(doc(db, "subjects", subId), subDoc, { merge: true });
+      setSubjectsList(prev => [{ id: subId, ...subDoc }, ...prev.filter(s => s.id !== subId)]);
+      setNewSubject({
+        name: '',
+        code: '',
+        class: 'ALL',
+        category: 'Core',
+        schoolId: targetSchool,
+        academicYearId: effectiveYear
+      });
+      alert(`Subject "${subName}" (${subCode}) added successfully!`);
+      fetchSubjects();
+    } catch (err) {
+      console.error("Error adding subject:", err);
+      alert("Failed to add subject: " + err.message);
+    }
+  };
+
+  const handleDeleteSubject = async (subId, subName) => {
+    if (!window.confirm(`Are you sure you want to remove subject "${subName}"?`)) return;
+    try {
+      await deleteDoc(doc(db, "subjects", subId));
+      setSubjectsList(prev => prev.filter(s => s.id !== subId));
+      alert(`Subject "${subName}" removed.`);
+    } catch (err) {
+      console.error("Error deleting subject:", err);
+      alert("Failed to remove subject: " + err.message);
+    }
+  };
+
+  const handleSaveEditStaff = async (e) => {
+    e.preventDefault();
+    if (!editingStaff) return;
+    const salaryNum = Number(editingStaff.baseSalary) || 0;
+    try {
+      const updateData = {
+        name: editingStaff.name.trim(),
+        role: editingStaff.role,
+        designation: editingStaff.designation || editingStaff.role,
+        baseSalary: salaryNum,
+        schoolId: editingStaff.schoolId,
+        status: editingStaff.status || 'active',
+        isActive: editingStaff.status !== 'inactive' && editingStaff.status !== 'archived',
+        updatedAt: serverTimestamp()
+      };
+      await updateDoc(doc(db, 'staff', editingStaff.id), updateData);
+      
+      // If Owner, also update staff_salary
+      if (currentUser?.role === 'Owner' || currentUser?.role === 'Director') {
+        try {
+          await setDoc(doc(db, 'staff_salary', editingStaff.id), {
+            baseSalary: salaryNum,
+            schoolId: editingStaff.schoolId,
+            staffId: editingStaff.id,
+            uid: editingStaff.uid || null,
+            updatedAt: serverTimestamp()
+          }, { merge: true });
+        } catch (_) {}
+      }
+
+      if (editingStaff.uid) {
+        try {
+          await updateDoc(doc(db, 'users', editingStaff.uid), {
+            name: editingStaff.name.trim(),
+            role: editingStaff.role,
+            schoolId: editingStaff.schoolId
+          });
+        } catch (_) {}
+      }
+
+      setStaffList(prev => prev.map(s => s.id === editingStaff.id ? { ...s, ...updateData, baseSalary: salaryNum } : s));
+      setEditingStaff(null);
+      alert("Staff details updated successfully!");
+    } catch (err) {
+      console.error("Error updating staff:", err);
+      alert("Failed to update staff: " + err.message);
+    }
+  };
+
   useEffect(() => {
     if (activeTab === 'staff') {
       fetchStaff();
     } else if (activeTab === 'assignments') {
       fetchStaff();
       fetchAssignments();
+      fetchSubjects();
+      fetchAcademicYears();
     } else if (activeTab === 'academic') {
+      fetchAcademicYears();
+    } else if (activeTab === 'subjects') {
+      fetchSubjects();
       fetchAcademicYears();
     }
   }, [activeTab, selectedSchool]);
+
+  useEffect(() => {
+    setNewAssignment(prev => ({
+      ...prev,
+      class: effectiveClasses[0] || '',
+      section: '',
+      teacherId: '',
+      subject: ''
+    }));
+    setNewStaff(prev => ({
+      ...prev,
+      schoolId: selectedSchool === 'ALL' ? 'SCH_01' : selectedSchool
+    }));
+    setNewSubject(prev => ({
+      ...prev,
+      schoolId: selectedSchool === 'ALL' ? 'SCH_01' : selectedSchool,
+      academicYearId: activeAcademicYearId || 'AY_2026_27'
+    }));
+  }, [selectedSchool]);
 
   // If ALL schools are selected, force user to pick a school first
   if (selectedSchool === 'ALL') {
@@ -122,10 +364,10 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
     );
   }
 
-const normalizeSectionQuery = (sec) => {
-  if (!sec) return '';
-  return sec.replace(/^Section\s+/i, '').trim();
-};
+  const normalizeSectionQuery = (sec) => {
+    if (!sec) return '';
+    return sec.replace(/^Section\s+/i, '').trim();
+  };
 
   const handleAddAssignment = async (e) => {
     e.preventDefault();
@@ -134,15 +376,17 @@ const normalizeSectionQuery = (sec) => {
       return;
     }
 
-    if (!activeAcademicYearId || !activeAcademicYearId.trim()) {
-      alert("Configuration Error: Active academic year is missing for this school. Please configure and set the active academic year in the Academic Years tab first.");
-      return;
-    }
-
+    const effectiveYear = (activeAcademicYearId && activeAcademicYearId.trim()) ? activeAcademicYearId.trim() : 'AY_2026_27';
     const targetSchool = selectedSchool !== 'ALL' ? selectedSchool : 'SCH_01';
     const teacher = staffList.find(s => s.id === newAssignment.teacherId);
     if (!teacher) {
       alert("Selected teacher not found.");
+      return;
+    }
+
+    const teacherAuthUid = teacher.uid;
+    if (!teacherAuthUid) {
+      alert(`Staff member "${teacher.name}" does not have a linked Firebase Auth account (UID). Please register them with valid login credentials first.`);
       return;
     }
 
@@ -152,27 +396,30 @@ const normalizeSectionQuery = (sec) => {
     }
 
     const targetSections = newAssignment.section === 'ALL' 
-      ? sections 
+      ? effectiveSections 
       : [newAssignment.section];
     
     let successCount = 0;
+    const isSubjectAssignment = newAssignment.assignmentType === 'subject_teacher' && newAssignment.subject;
 
     for (const sec of targetSections) {
       const normSec = normalizeSectionQuery(sec);
       const existing = assignmentsList.find(a => 
         a.class === newAssignment.class && 
-        (normalizeSectionQuery(a.section) === normSec || a.section === sec) &&
+        (a.section === sec || normalizeSectionQuery(a.section) === normSec) &&
         (a.schoolId === targetSchool) &&
-        (a.academicYearId === activeAcademicYearId)
+        (a.academicYearId === effectiveYear) &&
+        (isSubjectAssignment ? a.subject === newAssignment.subject : (!a.subject || a.type === 'class_teacher'))
       );
 
       if (existing) {
-        if (existing.teacherId === teacher.id) {
+        if (existing.teacherId === teacherAuthUid || existing.teacherUid === teacherAuthUid) {
           // Already assigned to this exact teacher for this academic year
           continue;
         }
+        const roleLabel = isSubjectAssignment ? `Subject Teacher for ${newAssignment.subject}` : `Class Teacher`;
         const confirmReassign = window.confirm(
-          `Class ${newAssignment.class} (${sec}) in ${targetSchool} is currently assigned to "${existing.teacherName}".\n\nDo you want to explicitly reassign this section to "${teacher.name}"?`
+          `Class ${newAssignment.class} (${sec}) in ${targetSchool} already has "${existing.teacherName}" as ${roleLabel}.\n\nDo you want to explicitly reassign to "${teacher.name}"?`
         );
         if (!confirmReassign) {
           continue;
@@ -180,15 +427,24 @@ const normalizeSectionQuery = (sec) => {
       }
       
       try {
-        const assignmentId = `${targetSchool}_${activeAcademicYearId}_${newAssignment.class}_${normSec || sec}`;
+        const assignmentId = isSubjectAssignment 
+          ? `${targetSchool}_${effectiveYear}_${newAssignment.class}_${sec}_${newAssignment.subject}`
+          : `${targetSchool}_${effectiveYear}_${newAssignment.class}_${sec}`;
+
         const assignmentData = {
+          id: assignmentId,
           class: newAssignment.class,
           section: sec,
           normalizedSection: normSec,
-          teacherId: teacher.id,
+          teacherId: teacherAuthUid, // CANONICAL AUTH UID: matched against request.auth.uid
+          teacherUid: teacherAuthUid,
+          staffId: teacher.id, // Reference to staff collection document ID
           teacherName: teacher.name,
-          academicYearId: activeAcademicYearId,
+          academicYearId: effectiveYear,
           schoolId: targetSchool,
+          type: isSubjectAssignment ? 'subject_teacher' : 'class_teacher',
+          subject: isSubjectAssignment ? newAssignment.subject : null,
+          status: 'active',
           updatedAt: new Date().toISOString(),
           updatedBy: currentUser?.name || currentUser?.email || 'Administrator'
         };
@@ -197,6 +453,7 @@ const normalizeSectionQuery = (sec) => {
           assignmentData.createdAt = existing.createdAt || new Date().toISOString();
           assignmentData.reassignedFrom = existing.teacherName;
           assignmentData.previousTeacherId = existing.teacherId;
+          assignmentData.previousStaffId = existing.staffId || null;
         } else {
           assignmentData.createdAt = new Date().toISOString();
         }
@@ -209,8 +466,8 @@ const normalizeSectionQuery = (sec) => {
     }
 
     if (successCount > 0) {
-      alert(`Successfully assigned Class Teacher to ${successCount} section(s)!`);
-      setNewAssignment({ class: classes[0] || '', section: '', teacherId: '' });
+      alert(`Successfully assigned ${isSubjectAssignment ? 'Subject Teacher' : 'Class Teacher'} to ${successCount} section(s)!`);
+      setNewAssignment({ class: effectiveClasses[0] || '', section: '', teacherId: '', assignmentType: 'class_teacher', subject: '' });
       fetchAssignments();
     } else if (targetSections.length > 0) {
       alert("No changes made or section is already assigned to this teacher.");
@@ -221,9 +478,12 @@ const normalizeSectionQuery = (sec) => {
     if (window.confirm("Remove this class teacher assignment?")) {
       try {
         await deleteDoc(doc(db, "class_assignments", id));
+        setAssignmentsList(prev => prev.filter(a => a.id !== id));
+        alert("Assignment removed successfully.");
         fetchAssignments();
       } catch (error) {
         console.error("Error removing assignment", error);
+        alert("Failed to remove assignment: " + error.message);
       }
     }
   };
@@ -246,18 +506,16 @@ const normalizeSectionQuery = (sec) => {
 
   const handleAddClass = async () => {
     const classTrimmed = newClass.trim();
-    if (classTrimmed && !classes.some(c => c.toLowerCase() === classTrimmed.toLowerCase())) {
-      const updated = [...classes, classTrimmed];
+    if (classTrimmed && !effectiveClasses.some(c => c.toLowerCase() === classTrimmed.toLowerCase())) {
+      const updated = [...effectiveClasses, classTrimmed];
       setClasses(updated);
-      const defaultComps = selectedSchool === 'SCH_01'
-        ? getJSPSFeeComponents(classTrimmed, activeAcademicYearId || '2026-2027')
-        : getJSICFeeComponents(classTrimmed, activeAcademicYearId || '2026-2027');
+      const defaultComps = getSchoolDefaultFeeComponents(selectedSchool, classTrimmed, activeAcademicYearId || '2026-2027');
       setClassSettings(prev => ({
         ...prev,
         [classTrimmed]: normalizeClassFeeSettings({ academicYear: activeAcademicYearId || '2026-2027', components: defaultComps }, activeAcademicYearId || '2026-2027')
       }));
       setNewClass('');
-      await persistStructureToFirestore(updated, sections);
+      await persistStructureToFirestore(updated, effectiveSections);
       await auditLogGovernance({ userId: currentUser?.id, role: currentUser?.role, schoolId: selectedSchool, action: 'ADD_CLASS', newValue: classTrimmed });
     } else if (classTrimmed) {
       alert("Class already exists.");
@@ -266,20 +524,20 @@ const normalizeSectionQuery = (sec) => {
 
   const handleRemoveClass = async (cls) => {
     if (window.confirm(`Are you sure you want to remove ${cls}?`)) {
-      const updated = classes.filter(c => c !== cls);
+      const updated = effectiveClasses.filter(c => c !== cls);
       setClasses(updated);
-      await persistStructureToFirestore(updated, sections);
+      await persistStructureToFirestore(updated, effectiveSections);
       await auditLogGovernance({ userId: currentUser?.id, role: currentUser?.role, schoolId: selectedSchool, action: 'REMOVE_CLASS', oldValue: cls });
     }
   };
 
   const handleAddSection = async () => {
     const sectionTrimmed = newSection.trim();
-    if (sectionTrimmed && !sections.some(s => s.toLowerCase() === sectionTrimmed.toLowerCase())) {
-      const updated = [...sections, sectionTrimmed];
+    if (sectionTrimmed && !effectiveSections.some(s => s.toLowerCase() === sectionTrimmed.toLowerCase())) {
+      const updated = [...effectiveSections, sectionTrimmed];
       setSections(updated);
       setNewSection('');
-      await persistStructureToFirestore(classes, updated);
+      await persistStructureToFirestore(effectiveClasses, updated);
       await auditLogGovernance({ userId: currentUser?.id, role: currentUser?.role, schoolId: selectedSchool, action: 'ADD_SECTION', newValue: sectionTrimmed });
     } else if (sectionTrimmed) {
       alert("Section already exists.");
@@ -288,9 +546,9 @@ const normalizeSectionQuery = (sec) => {
 
   const handleRemoveSection = async (sec) => {
     if (window.confirm(`Are you sure you want to remove ${sec}?`)) {
-      const updated = sections.filter(s => s !== sec);
+      const updated = effectiveSections.filter(s => s !== sec);
       setSections(updated);
-      await persistStructureToFirestore(classes, updated);
+      await persistStructureToFirestore(effectiveClasses, updated);
       await auditLogGovernance({ userId: currentUser?.id, role: currentUser?.role, schoolId: selectedSchool, action: 'REMOVE_SECTION', oldValue: sec });
     }
   };
@@ -307,8 +565,13 @@ const normalizeSectionQuery = (sec) => {
 
   const handleAddStaff = async (e) => {
     e.preventDefault();
-    if (!newStaff.name || !newStaff.role || !newStaff.baseSalary || !newStaff.contact || !newStaff.password) {
-      alert("Please fill all required fields including Mobile Contact & Password!");
+    const cleanMobile = normalizeLoginId(newStaff.contact);
+    if (!newStaff.name?.trim() || !newStaff.role || !newStaff.baseSalary || !cleanMobile || !newStaff.password) {
+      alert("Please fill all required fields including Mobile Number & Password!");
+      return;
+    }
+    if (cleanMobile.length < 10 && !cleanMobile.includes('@')) {
+      alert("Please enter a valid 10-digit mobile number.");
       return;
     }
     if (newStaff.password.length < 6) {
@@ -316,37 +579,108 @@ const normalizeSectionQuery = (sec) => {
       return;
     }
 
+    const targetSchool = newStaff.schoolId || (selectedSchool !== 'ALL' ? selectedSchool : 'SCH_01');
+    const salaryNum = Number(newStaff.baseSalary) || 0;
+
+    // Deduplication check: Do not auto-link or duplicate staff with the same mobile in the school
+    const existingSameContact = staffList.find(s => 
+      (s.contact && normalizeLoginId(s.contact) === cleanMobile) ||
+      (s.loginId && normalizeLoginId(s.loginId) === cleanMobile)
+    );
+    if (existingSameContact) {
+      alert(`Staff member "${existingSameContact.name}" is already registered with mobile/ID "${cleanMobile}".\nPlease edit their existing profile rather than registering a duplicate.`);
+      return;
+    }
+
     try {
       const defaultPerms = DEFAULT_ROLE_PERMISSIONS[newStaff.role] || DEFAULT_ROLE_PERMISSIONS.Teacher;
-      const authUser = await createStaffAuthAccount(newStaff.contact.trim(), newStaff.password.trim());
-      await addDoc(collection(db, 'staff'), {
+      const authUser = await createStaffAuthAccount(cleanMobile, newStaff.password.trim());
+      
+      const newStaffPayload = {
         uid: authUser.uid,
         name: newStaff.name.trim(),
         role: newStaff.role,
+        designation: newStaff.designation || newStaff.role,
+        status: 'active',
+        isActive: true,
+        baseSalary: salaryNum,
         customPermissions: defaultPerms,
-        contact: newStaff.contact.trim(),
-        schoolId: newStaff.schoolId,
+        contact: cleanMobile,
+        mobile: cleanMobile,
+        loginId: cleanMobile,
+        schoolId: targetSchool,
         createdAt: serverTimestamp(),
         lastPaidDate: null
+      };
+
+      const staffDocRef = await addDoc(collection(db, 'staff'), newStaffPayload);
+
+      // Try updating legacy staff_salary collection if permitted
+      try {
+        const salaryPayload = {
+          baseSalary: salaryNum,
+          schoolId: targetSchool,
+          staffId: staffDocRef.id,
+          uid: authUser.uid,
+          updatedAt: serverTimestamp()
+        };
+        await setDoc(doc(db, 'staff_salary', staffDocRef.id), salaryPayload, { merge: true });
+        await setDoc(doc(db, 'staff_salary', authUser.uid), salaryPayload, { merge: true });
+      } catch (salErr) {
+        console.warn("staff_salary write restricted (Owner only policy enforced):", salErr?.message);
+      }
+
+      try {
+        await setDoc(doc(db, 'users', authUser.uid), {
+          name: newStaff.name.trim(),
+          role: newStaff.role,
+          schoolId: targetSchool,
+          customPermissions: defaultPerms
+        }, { merge: true });
+      } catch (uErr) {
+        console.warn("users profile write error:", uErr?.message);
+      }
+
+      await auditLogGovernance({ 
+        userId: currentUser?.id, 
+        role: currentUser?.role, 
+        schoolId: targetSchool, 
+        action: 'CREATE_STAFF', 
+        targetId: authUser.uid, 
+        newValue: newStaff.role 
       });
-      await setDoc(doc(db, 'staff_salary', authUser.uid), {
-        baseSalary: Number(newStaff.baseSalary),
-        schoolId: newStaff.schoolId
-      });
-      await setDoc(doc(db, 'users', authUser.uid), {
-        name: newStaff.name.trim(),
-        role: newStaff.role,
-        schoolId: newStaff.schoolId,
-        customPermissions: defaultPerms
-      });
-      await auditLogGovernance({ userId: currentUser?.id, role: currentUser?.role, schoolId: newStaff.schoolId, action: 'CREATE_STAFF', targetId: authUser.uid, newValue: newStaff.role });
+
+      // Immediately update local state so staff member appears without requiring a page refresh
+      const createdStaff = {
+        id: staffDocRef.id,
+        ...newStaffPayload,
+        createdAt: new Date()
+      };
+      setStaffList(prev => [createdStaff, ...prev]);
+
       setIsAddingStaff(false);
-      setNewStaff({ name: '', role: 'Teacher', baseSalary: '', contact: '', password: '', schoolId: selectedSchool === 'ALL' ? 'SCH_01' : selectedSchool });
-      alert("Staff registered successfully!");
-      fetchStaff();
+      setNewStaff({ 
+        name: '', 
+        role: 'Teacher', 
+        designation: 'Teacher',
+        baseSalary: '', 
+        contact: '', 
+        password: '', 
+        schoolId: selectedSchool === 'ALL' ? 'SCH_01' : selectedSchool 
+      });
+      alert(`Staff "${newStaff.name.trim()}" registered successfully!\nLogin Mobile: ${cleanMobile}\nBranch: ${targetSchool}`);
+      await fetchStaff();
     } catch (error) {
       console.error("Error adding staff:", error);
-      alert("Failed to register staff.");
+      let errMsg = "Failed to register staff.";
+      if (error?.code === 'auth/email-already-in-use') {
+        errMsg = `Mobile number "${cleanMobile}" is already registered in Firebase Authentication. If this staff account already exists, you can reset their password or update their profile.`;
+      } else if (error?.code === 'auth/weak-password') {
+        errMsg = "The password provided is too weak. Please use at least 6 characters.";
+      } else if (error?.message) {
+        errMsg += ` (${error.message})`;
+      }
+      alert(errMsg);
     }
   };
 
@@ -367,22 +701,67 @@ const normalizeSectionQuery = (sec) => {
   };
 
   const handleDeleteStaff = async (staffId, name, uid) => {
-    if (!window.confirm(`Are you sure you want to deactivate teacher "${name}"? Access will be revoked.`)) return;
+    if (!window.confirm(`Are you sure you want to remove staff member "${name}"? This will delete their staff record and revoke system access.`)) return;
 
     try {
+      // 1. Non-blocking Cloud Function deactivation (if deployed and available)
       if (uid) {
-        const deactivateFn = httpsCallable(functions, 'adminDeactivateStaff');
-        await deactivateFn({ uid });
+        try {
+          const deactivateFn = httpsCallable(functions, 'adminDeactivateStaff');
+          await deactivateFn({ uid });
+        } catch (fnErr) {
+          console.warn("Cloud function adminDeactivateStaff not available or failed (continuing with database cleanup):", fnErr?.message);
+        }
       }
-      // Soft delete in staff collection
-      await updateDoc(doc(db, 'staff', staffId), { status: 'archived', isActive: false });
-      await auditLogGovernance({ userId: currentUser?.id, role: currentUser?.role, schoolId: selectedSchool, action: 'DEACTIVATE_STAFF', targetId: staffId });
-      
-      alert(`Teacher "${name}" deactivated successfully.`);
+
+      // 2. Delete the staff record from Firestore
+      await deleteDoc(doc(db, 'staff', staffId));
+
+      // 3. Clean up linked user profile and salary record if present
+      if (uid) {
+        try {
+          await deleteDoc(doc(db, 'users', uid));
+        } catch (uErr) {
+          console.warn("Could not delete users doc:", uErr?.message);
+        }
+        try {
+          await deleteDoc(doc(db, 'staff_salary', uid));
+        } catch (sErr) {
+          console.warn("Could not delete staff_salary doc:", sErr?.message);
+        }
+      }
+
+      // 4. Clean up any class assignments pointing to this teacher
+      try {
+        const qAssignments = query(collection(db, 'class_assignments'), where('teacherId', '==', staffId));
+        const assignSnap = await getDocs(qAssignments);
+        for (const aDoc of assignSnap.docs) {
+          await deleteDoc(aDoc.ref);
+        }
+      } catch (assignErr) {
+        console.warn("Could not clean up class assignments:", assignErr?.message);
+      }
+
+      // 5. Audit log
+      try {
+        await auditLogGovernance({
+          userId: currentUser?.id,
+          role: currentUser?.role,
+          schoolId: selectedSchool,
+          action: 'DELETE_STAFF',
+          targetId: staffId
+        });
+      } catch (auditErr) {
+        console.warn("Could not write audit log:", auditErr?.message);
+      }
+
+      // 6. Immediately update local UI state
+      setStaffList(prev => prev.filter(s => s.id !== staffId));
+      alert(`Staff member "${name}" deleted successfully.`);
       fetchStaff();
     } catch (err) {
       console.error("Error removing staff:", err);
-      alert("Failed to deactivate staff.");
+      alert(`Failed to delete staff: ${err?.message || 'Permission denied or network error'}`);
     }
   };
 
@@ -395,7 +774,7 @@ const normalizeSectionQuery = (sec) => {
           <p style={{ fontSize: 13, color: 'var(--text-secondary)', margin: 0 }}>Manage classes, fee rules, and staff access permissions</p>
         </div>
 
-        <div style={{ display: 'flex', gap: 8, backgroundColor: 'var(--bg-secondary)', padding: 4, borderRadius: 12 }}>
+        <div style={{ display: 'flex', gap: 8, backgroundColor: 'var(--bg-secondary)', padding: 4, borderRadius: 12, flexWrap: 'wrap' }}>
           <button
             className={activeTab === 'school' ? 'btn-primary' : 'btn-secondary'}
             onClick={() => setActiveTab('school')}
@@ -423,6 +802,13 @@ const normalizeSectionQuery = (sec) => {
             style={{ padding: '8px 16px', fontSize: 13, fontWeight: 700 }}
           >
             📋 Class Teacher Assignments
+          </button>
+          <button
+            className={activeTab === 'subjects' ? 'btn-primary' : 'btn-secondary'}
+            onClick={() => setActiveTab('subjects')}
+            style={{ padding: '8px 16px', fontSize: 13, fontWeight: 700 }}
+          >
+            📚 Subject Management
           </button>
         </div>
       </div>
@@ -527,6 +913,58 @@ const normalizeSectionQuery = (sec) => {
               </table>
             )}
           </div>
+
+          {/* Year-End Bulk Promotion & Session Rollover Wizard Card */}
+          <div style={{ backgroundColor: 'var(--bg-primary)', border: '1px solid var(--border-light)', borderRadius: 12, padding: '22px 24px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 16 }}>
+              <div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <h3 style={{ margin: 0, fontSize: 17, fontWeight: 800 }}>🎓 Year-End Bulk Promotion & Session Rollover</h3>
+                  <span className="badge" style={{ backgroundColor: 'rgba(191, 87, 0, 0.1)', color: 'var(--brand-orange)', fontSize: 11 }}>
+                    Owner Protected
+                  </span>
+                </div>
+                <p style={{ margin: '6px 0 0 0', fontSize: 13, color: 'var(--text-secondary)', maxWidth: 680, lineHeight: 1.5 }}>
+                  Promote students to the next academic session with individual decision controls for <strong>Passed</strong>, <strong>Repeated/Failed</strong>, <strong>Supplementary</strong>, and <strong>Left</strong> students. Previous session records remain 100% untouched.
+                </p>
+              </div>
+
+              <div>
+                {isOwnerUser(currentUser) ? (
+                  <button
+                    type="button"
+                    className="btn-primary"
+                    onClick={() => setIsPromotionWizardOpen(true)}
+                    style={{ backgroundColor: 'var(--brand-orange)', borderColor: 'var(--brand-orange)', padding: '10px 18px', fontWeight: 700, display: 'flex', alignItems: 'center', gap: 8 }}
+                  >
+                    <Sparkles size={16} /> Open Promotion Wizard
+                  </button>
+                ) : (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 14px', borderRadius: 8, backgroundColor: 'rgba(100, 116, 139, 0.1)', color: 'var(--text-secondary)', fontSize: 13, fontWeight: 600 }}>
+                    <Shield size={16} /> Group Owner Only
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Promotion Wizard Modal */}
+          {isPromotionWizardOpen && (
+            <PromotionWizardModal
+              isOpen={isPromotionWizardOpen}
+              onClose={() => setIsPromotionWizardOpen(false)}
+              currentUser={currentUser}
+              selectedSchool={selectedSchool}
+              classes={effectiveClasses}
+              sections={effectiveSections}
+              academicYearsList={academicYearsList}
+              activeAcademicYearId={activeAcademicYearId}
+              classSettings={classSettings}
+              onPromotionComplete={() => {
+                fetchAcademicYears();
+              }}
+            />
+          )}
         </div>
       )}
 
@@ -548,7 +986,7 @@ const normalizeSectionQuery = (sec) => {
                 <button className="btn-primary" onClick={handleAddClass}>Add</button>
               </div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                {classes.map(c => (
+                {effectiveClasses.map(c => (
                   <div key={c} style={{ display: 'flex', alignItems: 'center', gap: 6, backgroundColor: 'var(--border-light)', padding: '6px 12px', borderRadius: 20, fontSize: 13, fontWeight: 600 }}>
                     {c}
                     <X size={14} style={{ cursor: 'pointer', color: 'var(--text-secondary)' }} onClick={() => handleRemoveClass(c)} />
@@ -571,7 +1009,7 @@ const normalizeSectionQuery = (sec) => {
                 <button className="btn-primary" onClick={handleAddSection}>Add</button>
               </div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                {sections.map(s => (
+                {effectiveSections.map(s => (
                   <div key={s} style={{ display: 'flex', alignItems: 'center', gap: 6, backgroundColor: 'var(--border-light)', padding: '6px 12px', borderRadius: 20, fontSize: 13, fontWeight: 600 }}>
                     {s}
                     <X size={14} style={{ cursor: 'pointer', color: 'var(--text-secondary)' }} onClick={() => handleRemoveSection(s)} />
@@ -599,13 +1037,11 @@ const normalizeSectionQuery = (sec) => {
                       if (!window.confirm("Are you sure you want to save this configuration? This will instantly affect all due fees.")) return;
                       try {
                         const normalizedMap = {};
-                        for (const cls of classes) {
+                        for (const cls of effectiveClasses) {
                           let cfg = classSettings[cls] || {};
                           let settings = normalizeClassFeeSettings(cfg, activeAcademicYearId);
-                          if (!settings.components || settings.components.length === 0 || !settings.components.some(c => c.id === 'tuition' && c.amount > 0)) {
-                             settings.components = selectedSchool === 'SCH_01'
-                               ? getJSPSFeeComponents(cls, activeAcademicYearId)
-                               : getJSICFeeComponents(cls, activeAcademicYearId);
+                          if (!settings.components || settings.components.length === 0) {
+                              settings.components = getSchoolDefaultFeeComponents(selectedSchool, cls, activeAcademicYearId);
                           }
                           normalizedMap[cls] = settings;
                         }
@@ -614,10 +1050,10 @@ const normalizeSectionQuery = (sec) => {
                             [selectedSchool]: normalizedMap
                           },
                           schoolClasses: {
-                            [selectedSchool]: classes
+                            [selectedSchool]: effectiveClasses
                           },
                           schoolSections: {
-                            [selectedSchool]: sections
+                            [selectedSchool]: effectiveSections
                           }
                         }, { merge: true });
                         alert("Settings saved to Cloud successfully!");
@@ -633,11 +1069,9 @@ const normalizeSectionQuery = (sec) => {
                 </div>
             </div>
 
-            {classes.map(cls => {
+            {effectiveClasses.map(cls => {
               const settings = normalizeClassFeeSettings(classSettings[cls] || {});
-              const defaultComps = selectedSchool === 'SCH_01'
-                ? getJSPSFeeComponents(cls, activeAcademicYearId)
-                : getJSICFeeComponents(cls, activeAcademicYearId);
+              const defaultComps = getSchoolDefaultFeeComponents(selectedSchool, cls, activeAcademicYearId);
               const components = settings.components?.length ? settings.components : defaultComps;
               const updateComponent = (id, updates) => {
                 setClassSettings(prev => ({
@@ -938,7 +1372,30 @@ const normalizeSectionQuery = (sec) => {
                             </div>
                           </td>
                           <td style={{ fontFamily: 'var(--font-mono)' }}>👤 {staff.contact || 'N/A'}</td>
-                          <td style={{ fontFamily: 'var(--font-mono)', fontWeight: 700 }}>₹ {Number(staff.baseSalary || 0).toLocaleString()}</td>
+                          <td style={{ fontFamily: 'var(--font-mono)', fontWeight: 700 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                              <span style={{ color: 'var(--text-secondary)' }}>₹</span>
+                              <input
+                                type="number"
+                                className="form-input"
+                                value={staff.baseSalary || 0}
+                                onChange={async (e) => {
+                                  const val = Number(e.target.value) || 0;
+                                  setStaffList(prev => prev.map(s => s.id === staff.id ? { ...s, baseSalary: val } : s));
+                                  try {
+                                    await updateDoc(doc(db, 'staff', staff.id), { baseSalary: val });
+                                    await setDoc(doc(db, 'staff_salary', staff.id), { baseSalary: val, schoolId: staff.schoolId, staffId: staff.id, uid: staff.uid || null }, { merge: true });
+                                    if (staff.uid) {
+                                      await setDoc(doc(db, 'staff_salary', staff.uid), { baseSalary: val, schoolId: staff.schoolId, staffId: staff.id, uid: staff.uid }, { merge: true });
+                                    }
+                                  } catch (err) {
+                                    console.error("Error updating base salary:", err);
+                                  }
+                                }}
+                                style={{ width: 110, padding: '4px 8px', margin: 0, fontWeight: 700, fontFamily: 'var(--font-mono)' }}
+                              />
+                            </div>
+                          </td>
                           <td style={{ textAlign: 'right', display: 'flex', gap: 8, justifyContent: 'flex-end', alignItems: 'center' }}>
                             <button
                               className="btn-secondary"
@@ -1009,9 +1466,9 @@ const normalizeSectionQuery = (sec) => {
                 <select className="form-input" value={newAssignment.teacherId} onChange={e => setNewAssignment({ ...newAssignment, teacherId: e.target.value })}>
                   <option value="">Select Teacher</option>
                   {staffList
-                    .filter(s => (s.role === 'Teacher' || s.role === 'Senior Teacher') && (!s.schoolId || s.schoolId === 'ALL' || s.schoolId === selectedSchool))
+                    .filter(s => !s.schoolId || s.schoolId === 'ALL' || s.schoolId === selectedSchool)
                     .map(t => (
-                      <option key={t.id} value={t.id}>{t.name} ({t.schoolId === 'ALL' ? 'All Campuses' : t.schoolId})</option>
+                      <option key={t.id} value={t.id}>{t.name} ({t.role || 'Teacher'} - {t.schoolId === 'ALL' ? 'All Campuses' : t.schoolId})</option>
                     ))}
                 </select>
               </div>

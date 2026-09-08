@@ -70,6 +70,16 @@ export default function App() {
             setCurrentView(v);
             isInitialAuthRef.current = false;
           }
+        } else if (ownerSnap.exists()) {
+          const profile = ownerSnap.data();
+          const staff = { id: firebaseUser.uid, ...profile, uid: firebaseUser.uid };
+          setCurrentUser(staff);
+          if (isInitialAuthRef.current) {
+            const v = staff.role === 'Teacher' || staff.role === 'Senior Teacher' ? 'teacher' : 'dashboard';
+            console.warn("APP LOG: setting currentView to " + v + " for User (Fallback)");
+            setCurrentView(v);
+            isInitialAuthRef.current = false;
+          }
         } else {
           await signOut(auth);
         }
@@ -90,18 +100,19 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [activeStudent, setActiveStudent] = useState(null);
 
-  const defaultClasses = ['Class 1', 'Class 2', 'Class 3', 'Class 4', 'Class 5', 'Class 6', 'Class 7', 'Class 8', 'Class 9', 'Class 10', 'Class 11 Art', 'Class 11 Science', 'Class 12 Art', 'Class 12 Science'];
+  const defaultJSPSClasses = ['Nursery', 'LKG', 'UKG', 'Class 1', 'Class 2', 'Class 3', 'Class 4', 'Class 5', 'Class 6', 'Class 7', 'Class 8'];
+  const defaultJSICClasses = ['Class 6', 'Class 7', 'Class 8', 'Class 9', 'Class 10', 'Class 11', 'Class 12', 'Class 11 Art', 'Class 11 Science', 'Class 12 Art', 'Class 12 Science'];
+  const defaultJSB2Classes = ['Nursery', 'LKG', 'UKG', 'Class 1', 'Class 2', 'Class 3', 'Class 4', 'Class 5', 'Class 6', 'Class 7', 'Class 8', 'Class 9', 'Class 10'];
+  const defaultClasses = defaultJSPSClasses;
   const defaultSections = ['Section A', 'Section B', 'Section C'];
   
   const [schoolClasses, setSchoolClasses] = useState(() => {
     try {
       const saved = localStorage.getItem('jeevan_school_classes');
       if (saved) return JSON.parse(saved);
-      const old = localStorage.getItem('eduerp_classes');
-      const base = old ? JSON.parse(old) : defaultClasses;
-      return { SCH_01: [...base], SCH_02: [...base], SCH_03: [...base] };
+      return { SCH_01: [...defaultJSPSClasses], SCH_02: [...defaultJSICClasses], SCH_03: [...defaultJSB2Classes] };
     } catch {
-      return { SCH_01: [...defaultClasses], SCH_02: [...defaultClasses], SCH_03: [...defaultClasses] };
+      return { SCH_01: [...defaultJSPSClasses], SCH_02: [...defaultJSICClasses], SCH_03: [...defaultJSB2Classes] };
     }
   });
 
@@ -221,11 +232,29 @@ export default function App() {
               migrated[schoolId][cls] = normalizeClassFeeSettings(classSetting);
             }
           }
-          setSchoolClassSettings(migrated);
+          setSchoolClassSettings(prev => ({
+            ...prev,
+            ...migrated
+          }));
         }
-        if (data.schoolClasses) setSchoolClasses(data.schoolClasses);
-        if (data.schoolSections) setSchoolSections(data.schoolSections);
-        if (data.activeAcademicYearId) setActiveAcademicYearId(data.activeAcademicYearId);
+        if (data.schoolClasses) {
+          setSchoolClasses(prev => ({
+            ...prev,
+            ...data.schoolClasses
+          }));
+        }
+        if (data.schoolSections) {
+          setSchoolSections(prev => ({
+            ...prev,
+            ...data.schoolSections
+          }));
+        }
+        if (data.activeAcademicYearId) {
+          setActiveAcademicYearId(prev => ({
+            ...prev,
+            ...data.activeAcademicYearId
+          }));
+        }
       }
     }, (error) => {
       console.warn("Settings snapshot permission denied (expected during E2E):", error.message);
@@ -396,6 +425,7 @@ export default function App() {
               lang={lang}
               activeStudent={activeStudent}
               userPermissions={userPermissions}
+              currentUser={currentUser}
               selectedSchool={selectedSchool}
               activeAcademicYearId={activeAcademicYearId[selectedSchool] || 'AY_2026_27'}
             />

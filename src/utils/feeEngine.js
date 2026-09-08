@@ -23,6 +23,42 @@
  *     Excess payment becomes Advance Payment.
  */
 
+export const isAdmissionCharge = (c) => {
+  if (!c) return false;
+  if (c.componentId === 'admission') return true;
+  if (typeof c.componentId === 'string' && c.componentId.toLowerCase().includes('admission')) return true;
+  if (typeof c.label === 'string' && c.label.toLowerCase().includes('admission')) return true;
+  if (typeof c.id === 'string' && c.id.toLowerCase().includes('admission')) return true;
+  return false;
+};
+
+export const sortLedgerCharges = (list) => {
+  if (!Array.isArray(list)) return [];
+  return [...list].sort((a, b) => {
+    // 1. Admission Fee ALWAYS on top (even when added to existing students)
+    const aAdm = isAdmissionCharge(a);
+    const bAdm = isAdmissionCharge(b);
+    if (aAdm && !bAdm) return -1;
+    if (!aAdm && bAdm) return 1;
+
+    // 2. Previous Year Due (arrears)
+    if (a.type === 'arrears' && b.type !== 'arrears') return -1;
+    if (b.type === 'arrears' && a.type !== 'arrears') return 1;
+
+    // 3. Oldest charge by dueDate
+    const timeA = new Date(a.dueDate).getTime();
+    const timeB = new Date(b.dueDate).getTime();
+    if (!isNaN(timeA) && !isNaN(timeB) && timeA !== timeB) return timeA - timeB;
+
+    // 4. Penalties (Late Fees) last
+    if (a.type === 'penalty' && b.type !== 'penalty') return 1;
+    if (b.type === 'penalty' && a.type !== 'penalty') return -1;
+
+    // 5. Lexical tiebreak
+    return (a.id || '').localeCompare(b.id || '');
+  });
+};
+
 // ─── 1. Generate Charge Schedule ────────────────────────────────────────────
 
 /**
@@ -64,7 +100,7 @@ export function generateChargeSchedule(student, feeTemplate, academicYear) {
       });
     }
   }
-  return charges;
+  return sortLedgerCharges(charges);
 }
 
 // ─── 2. Calculate Penalties (Late Fees) ──────────────────────────────────────
@@ -161,25 +197,10 @@ export function calculatePenalties(ledger, asOfDate, penaltyRules = []) {
  * @returns {{ ledger, allocations, advanceCredit }}
  */
 export function applyPaymentsAndAdjustments(charges, payments = [], adjustments = []) {
-  let ledger = charges.map(c => ({ ...c }));
+  // Always sort charges immediately: Admission Fee ALWAYS on top, then arrears, then oldest dueDate
+  let ledger = sortLedgerCharges(charges.map(c => ({ ...c })));
   let advanceCredit = 0;
   const allAllocations = [];
-
-  // Sort helper: arrears first, then by dueDate ASC, penalties last, then id
-  const sortCharges = (list) =>
-    list.sort((a, b) => {
-      if (a.type === 'arrears' && b.type !== 'arrears') return -1;
-      if (b.type === 'arrears' && a.type !== 'arrears') return 1;
-
-      const timeA = new Date(a.dueDate).getTime();
-      const timeB = new Date(b.dueDate).getTime();
-      if (timeA !== timeB) return timeA - timeB;
-
-      if (a.type === 'penalty' && b.type !== 'penalty') return 1;
-      if (b.type === 'penalty' && a.type !== 'penalty') return -1;
-
-      return a.id.localeCompare(b.id);
-    });
 
   // Apply fee adjustments (concessions / waivers) first
   for (const adj of adjustments) {
@@ -203,7 +224,7 @@ export function applyPaymentsAndAdjustments(charges, payments = [], adjustments 
     let remaining = Number(payment.amount);
     if (remaining <= 0) continue;
 
-    ledger = sortCharges(ledger);
+    ledger = sortLedgerCharges(ledger);
 
     for (const charge of ledger) {
       if (remaining <= 0) break;
@@ -370,24 +391,29 @@ export function summarizeDues(student, ledger, advanceCredit = 0, filterAcademic
  * when available; the built-in defaults match the final business rules.
  */
 export function calculateStudentDue({ student, charges, classSettings, payments, adjustments }) {
-  if (!charges) {
-    return {
-      totalDue: 0,
-      totalPaid: 0,
-      totalConcession: 0,
-      advanceCredit: 0,
-      ledger: [],
-      missingCharges: true
-    };
+  let baseCharges = charges;
+
+  // Use permanent stored charges if available; otherwise fallback to schedule
+  // generated from classSettings so students without imported charges (e.g. JSIC) show dues
+  if (!baseCharges || baseCharges.length === 0) {
+    if (classSettings && classSettings.components && classSettings.components.some(c => c.enabled && c.amount > 0)) {
+      const academicYear = student.academicYear || '2026-2027';
+      baseCharges = generateChargeSchedule(student, classSettings, academicYear);
+    } else {
+      return {
+        totalDue: 0,
+        totalPaid: 0,
+        totalConcession: 0,
+        advanceCredit: 0,
+        ledger: [],
+        missingCharges: true
+      };
+    }
   }
 
   const academicYear = student.academicYear || '2026-2027';
   const policy = classSettings?.duePolicy || {};
 
-  const baseCharges = charges;
-  // NOTE: calculateOpeningArrears via legacy dueAmount is intentionally NOT
-  // called here. The source of truth for arrears is the ledger carried forward
-  // by closeAcademicYear. Legacy seeding must be done explicitly at enrolment.
   const withArrears = [...baseCharges];
 
   // Late Fee rules derived from class policy (or built-in defaults)
@@ -702,7 +728,7 @@ export function getJSICFeeComponents(className, academicYear) {
     hasAdmission = className === 'Class 9'; // Class 10 has 0 default but is configurable
     tuition = 6000;
     exam = 500;
-  } else if (['Class 11 Art', 'Class 11 Arts', 'Class 12 Art', 'Class 12 Arts'].includes(className)) {
+  } else if (['Class 11 Art', 'Class 11 Arts', 'Class 12 Art', 'Class 12 Arts', 'Class 11', 'Class 12'].includes(className)) {
     const is11 = className.includes('11');
     admission = is11 ? 1500 : 0;
     hasAdmission = is11;
@@ -795,5 +821,23 @@ export function getJSPSFeeComponents(className, academicYear) {
     }
     return { ...comp, amount: 0, enabled: false };
   });
+}
+
+/**
+ * Universal helper returning default fee components for any school branch (SCH_01, SCH_02, SCH_03, etc.)
+ */
+export function getSchoolDefaultFeeComponents(schoolId, className, academicYear) {
+  if (schoolId === 'SCH_01') {
+    return getJSPSFeeComponents(className, academicYear);
+  }
+  if (schoolId === 'SCH_02') {
+    return getJSICFeeComponents(className, academicYear);
+  }
+  // SCH_03 (Jeevan Shilp Adarsh Shala) or generic branch fallback:
+  // If high school / intermediate classes, use secondary schedule; otherwise primary schedule
+  if (['Class 9', 'Class 10', 'Class 11', 'Class 12', 'Class 11 Art', 'Class 11 Science', 'Class 12 Art', 'Class 12 Science'].includes(className)) {
+    return getJSICFeeComponents(className, academicYear);
+  }
+  return getJSPSFeeComponents(className, academicYear);
 }
 

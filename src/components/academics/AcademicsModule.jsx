@@ -85,6 +85,7 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
 
         querySnapshot.forEach((doc) => {
           const data = doc.data();
+          if (data.status === 'Deleted' || data.status === 'archived' || data.isDeleted === true) return;
           list.push({ id: doc.id, ...data });
           initialAtt[doc.id] = 'P';
           initialMarks[doc.id] = 75;
@@ -124,7 +125,7 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
     // Check if the current user is assigned to this class and section
     const currentYear = activeAcademicYearId || 'AY_2026_27';
     const normSelectedSec = normalizeSectionQuery(selectedSection);
-    const targetSchool = selectedSchool || currentUser?.schoolId || 'SCH_01';
+    const targetSchool = (selectedSchool && selectedSchool !== 'ALL') ? selectedSchool : (currentUser?.schoolId || 'SCH_01');
 
     const assigned = assignments.find(a => 
       a.class === selectedClass && 
@@ -152,7 +153,7 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
   const handleSaveAttendanceBatch = async () => {
     setIsSavingAttendance(true);
     try {
-      const targetSchool = selectedSchool || 'SCH_01';
+      const targetSchool = (selectedSchool && selectedSchool !== 'ALL') ? selectedSchool : (currentUser?.schoolId || 'SCH_01');
       const academicYearId = activeAcademicYearId || 'AY_2026_27';
       const normSec = normalizeSectionQuery(selectedSection);
       
@@ -186,8 +187,8 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
   const handleSaveSubjectMarksBatch = async () => {
     setIsSavingMarks(true);
     try {
-      const targetSchool = selectedSchool || 'SCH_01';
-      const academicYearId = 'AY_2025_26';
+      const targetSchool = (selectedSchool && selectedSchool !== 'ALL') ? selectedSchool : (currentUser?.schoolId || 'SCH_01');
+      const academicYearId = activeAcademicYearId || 'AY_2026_27';
       
       const savePromises = classStudents.map(student => {
         const score = marksMap[student.id];

@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   Search, Sun, Moon, GraduationCap, Menu, LogOut, Shield, User, Briefcase, 
-  X, Users, BookOpen, DollarSign, Settings as SettingsIcon, LayoutDashboard, ArrowRight 
+  X, Users, BookOpen, DollarSign, Settings as SettingsIcon, LayoutDashboard, ArrowRight, Download 
 } from 'lucide-react';
 import { collection, query, where, getDocs, limit } from 'firebase/firestore';
 import { db } from '../../firebase';
@@ -30,8 +30,52 @@ export default function Navbar({
   const [isOpen, setIsOpen] = useState(false);
   const [matchingStudents, setMatchingStudents] = useState([]);
   const [highlightedIndex, setHighlightedIndex] = useState(-1);
+  const [installPrompt, setInstallPrompt] = useState(null);
+  const [isAppInstalled, setIsAppInstalled] = useState(false);
   const containerRef = useRef(null);
   const inputRef = useRef(null);
+
+  // Monitor PWA installability and beforeinstallprompt event
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      if (window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true) {
+        setIsAppInstalled(true);
+      }
+
+      const handleBeforeInstall = (e) => {
+        e.preventDefault();
+        setInstallPrompt(e);
+      };
+
+      const handleInstalled = () => {
+        setIsAppInstalled(true);
+        setInstallPrompt(null);
+      };
+
+      window.addEventListener('beforeinstallprompt', handleBeforeInstall);
+      window.addEventListener('appinstalled', handleInstalled);
+
+      return () => {
+        window.removeEventListener('beforeinstallprompt', handleBeforeInstall);
+        window.removeEventListener('appinstalled', handleInstalled);
+      };
+    }
+  }, []);
+
+  const handleInstallApp = async () => {
+    if (!installPrompt) {
+      alert(lang === 'hi' 
+        ? 'ऐप इंस्टॉल करने के लिए ब्राउज़र के एड्रेस बार (URL बार) में दाईं ओर दिख रहे इंस्टॉल आइकन (स्क्रीन/डाउन एरो) पर क्लिक करें, या ब्राउज़र मेनू (तीन डॉट्स) > "Install Jeevanshilp Group" चुनें।' 
+        : 'To install the desktop app, click the Install icon (screen with down arrow) in your browser address bar, or open the browser menu (three dots) > "Install Jeevanshilp Group".');
+      return;
+    }
+    installPrompt.prompt();
+    const { outcome } = await installPrompt.userChoice;
+    if (outcome === 'accepted') {
+      setInstallPrompt(null);
+      setIsAppInstalled(true);
+    }
+  };
 
   const getRoleBadgeColor = () => {
     switch (userRole) {
@@ -77,7 +121,7 @@ export default function Navbar({
         const matches = [];
         snap.forEach(docSnap => {
           const data = docSnap.data();
-          if (data.status === 'Deleted' || data.status === 'archived') return;
+          if (data.status === 'Deleted' || data.status === 'archived' || data.isDeleted === true) return;
           const nameMatch = (data.name || '').toLowerCase().includes(term);
           const rollMatch = String(data.roll || '').toLowerCase().includes(term);
           const fatherMatch = (data.fatherName || data.parentName || '').toLowerCase().includes(term);
@@ -215,9 +259,9 @@ export default function Navbar({
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <img
-            src="/logo.jpg"
+            src="/logo.png"
             alt="Jeevan Shilp"
-            style={{ width: 36, height: 36, borderRadius: '50%', objectFit: 'cover', border: '2px solid var(--border-light)', flexShrink: 0 }}
+            style={{ width: 38, height: 38, borderRadius: '50%', objectFit: 'cover', border: '2px solid var(--border-light)', flexShrink: 0 }}
           />
           <div style={{ display: 'flex', flexDirection: 'column' }}>
             <div style={{ fontWeight: 800, fontSize: 16, color: 'var(--text-primary)', lineHeight: 1.2 }}>{dict.appName}</div>
@@ -226,7 +270,7 @@ export default function Navbar({
         </div>
 
         {/* Branch Selector */}
-        {(userRole === 'Owner' || userRole === 'Administrator') ? (
+        {(userRole === 'Owner' || userRole === 'Administrator' || userRole === 'Admin') ? (
           <select
             value={selectedSchool}
             onChange={(e) => setSelectedSchool(e.target.value)}
@@ -455,6 +499,34 @@ export default function Navbar({
 
       {/* Right Controls & Profile */}
       <div className="topbar-actions" style={{ display: 'flex', alignItems: 'center', gap: 12, flexShrink: 0 }}>
+        {/* Desktop App Install Button */}
+        {!isAppInstalled && (
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={handleInstallApp}
+            style={{
+              padding: '6px 14px',
+              fontSize: 13,
+              fontWeight: 800,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 8,
+              backgroundColor: 'rgba(59, 130, 246, 0.1)',
+              color: 'var(--brand-blue, #3b82f6)',
+              borderColor: 'rgba(59, 130, 246, 0.35)',
+              height: 38,
+              borderRadius: 8,
+              cursor: 'pointer',
+              transition: 'all 0.2s ease'
+            }}
+            title={lang === 'hi' ? 'डेस्कटॉप ऐप डाउनलोड करें / इंस्टॉल करें' : 'Download Desktop App / Install'}
+          >
+            <Download size={16} />
+            <span>{lang === 'hi' ? 'ऐप डाउनलोड करें' : 'Download App'}</span>
+          </button>
+        )}
+
         {/* Language Switcher Button */}
         <button
           className="btn-secondary"

@@ -8,15 +8,31 @@ const checkAdminRole = async (context) => {
     throw new functions.https.HttpsError('unauthenticated', 'User must be authenticated.');
   }
   
-  const userRecord = await admin.firestore().collection('users').doc(context.auth.uid).get();
-  if (!userRecord.exists) {
-    throw new functions.https.HttpsError('permission-denied', 'User profile not found.');
+  // Direct Owner email bypass
+  const email = context.auth.token && context.auth.token.email;
+  if (email === 'jeevanshilporg@gmail.com') {
+    return;
   }
 
-  const role = userRecord.data().role;
-  if (role !== 'Administrator' && role !== 'Owner') {
-    throw new functions.https.HttpsError('permission-denied', 'Requires Administrator privileges.');
+  // Check users collection
+  const userRecord = await admin.firestore().collection('users').doc(context.auth.uid).get();
+  if (userRecord.exists) {
+    const role = userRecord.data().role;
+    if (role === 'Administrator' || role === 'Owner' || role === 'Admin') {
+      return;
+    }
   }
+
+  // Check staff collection fallback
+  const staffRecord = await admin.firestore().collection('staff').where('uid', '==', context.auth.uid).get();
+  if (!staffRecord.empty) {
+    const role = staffRecord.docs[0].data().role;
+    if (role === 'Administrator' || role === 'Owner' || role === 'Admin') {
+      return;
+    }
+  }
+
+  throw new functions.https.HttpsError('permission-denied', 'Requires Administrator privileges.');
 };
 
 exports.adminUpdateUserPassword = functions.https.onCall(async (data, context) => {

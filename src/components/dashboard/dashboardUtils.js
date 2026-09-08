@@ -58,6 +58,7 @@ export async function fetchAuthoritativeFeeSummary(selectedSchool, activeAcademi
     
     studentsSnap.forEach(d => {
       const student = { id: d.id, ...d.data() };
+      if (student.status === 'Deleted' || student.status === 'archived' || student.isDeleted === true) return;
       const sSchool = student.schoolId;
       const sClass = student.class;
       let sSettings = { components: [] };

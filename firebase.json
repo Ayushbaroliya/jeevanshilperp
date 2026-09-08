@@ -1,5 +1,6 @@
 {
     "hosting":  {
+                    "site": "jeevanshilporg-51db8",
                     "public":  "dist",
                     "ignore":  [
                                    "firebase.json",

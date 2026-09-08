@@ -117,12 +117,38 @@ describe("School ERP Phase 4 Security Rules", () => {
       }));
     });
 
-    it("Physical deletion of student profile -> denied for all roles", async () => {
+    it("Physical deletion of student profile -> allowed for Admin/Owner of same school, denied for Teacher / other roles", async () => {
       await testEnv.withSecurityRulesDisabled(async (context) => {
         await context.firestore().collection("students").doc("s_del_01").set({ schoolId: "SCH_01", name: "Delete Test" });
+        await context.firestore().collection("students").doc("s_del_02").set({ schoolId: "SCH_02", name: "Delete Test 2" });
+        await context.firestore().collection("students").doc("s_del_noschool").set({ name: "No School Test" });
       });
+      const teacherDb = testEnv.authenticatedContext("teacher123").firestore();
+      await assertFails(teacherDb.collection("students").doc("s_del_01").delete());
+
+      const acctDb = testEnv.authenticatedContext("acct123").firestore();
+      await assertFails(acctDb.collection("students").doc("s_del_01").delete());
+
+      // SCH_01 Admin CANNOT delete SCH_02 student (cross-school protection)
+      const adminDb = testEnv.authenticatedContext("admin123").firestore();
+      await assertFails(adminDb.collection("students").doc("s_del_02").delete());
+
+      // Student without schoolId CANNOT be deleted
+      await assertFails(adminDb.collection("students").doc("s_del_noschool").delete());
+
+      // SCH_01 Admin CAN delete SCH_01 student
+      await assertSucceeds(adminDb.collection("students").doc("s_del_01").delete());
+
+      // Owner can delete student across schools
       const ownerDb = testEnv.authenticatedContext("owner123").firestore();
-      await assertFails(ownerDb.collection("students").doc("s_del_01").delete());
+      await assertSucceeds(ownerDb.collection("students").doc("s_del_02").delete());
+
+      // Owner authenticated by email (even without users/ doc) can delete student
+      await testEnv.withSecurityRulesDisabled(async (context) => {
+        await context.firestore().collection("students").doc("s_del_03").set({ schoolId: "SCH_01", name: "Delete Test 3" });
+      });
+      const emailOwnerDb = testEnv.authenticatedContext("email_owner", { email: "jeevanshilporg@gmail.com" }).firestore();
+      await assertSucceeds(emailOwnerDb.collection("students").doc("s_del_03").delete());
     });
 
     it("Physical deletion of enrollment -> denied for all roles", async () => {
@@ -278,6 +304,101 @@ describe("School ERP Phase 4 Security Rules", () => {
       
       const ownerDb = testEnv.authenticatedContext("owner123").firestore();
       await assertSucceeds(ownerDb.collection("users").doc("teacher123").update({ role: "Administrator" }));
+    });
+  });
+
+  describe("STRICT CROSS-SCHOOL (SCH_01 vs SCH_02) CREATE & UPDATE ISOLATION", () => {
+    // admin123 is assigned to SCH_01
+    // acct123 is assigned to SCH_01
+
+    it("1. students: SCH_01 Admin CANNOT create SCH_02 student; CAN create SCH_01; CANNOT update to SCH_02", async () => {
+      const adminDb = testEnv.authenticatedContext("admin123").firestore();
+      await assertFails(adminDb.collection("students").add({ schoolId: "SCH_02", name: "Cross School" }));
+      await assertSucceeds(adminDb.collection("students").doc("stu_sch01").set({ schoolId: "SCH_01", name: "Valid Student" }));
+      // Attempting to change schoolId to SCH_02 on update -> denied
+      await assertFails(adminDb.collection("students").doc("stu_sch01").update({ schoolId: "SCH_02" }));
+    });
+
+    it("2. enrollments: SCH_01 Admin CANNOT create SCH_02 enrollment; CAN create SCH_01; CANNOT update to SCH_02", async () => {
+      const adminDb = testEnv.authenticatedContext("admin123").firestore();
+      await assertFails(adminDb.collection("enrollments").add({ schoolId: "SCH_02", studentId: "s1" }));
+      await assertSucceeds(adminDb.collection("enrollments").doc("enr_sch01").set({ schoolId: "SCH_01", studentId: "s1" }));
+      await assertFails(adminDb.collection("enrollments").doc("enr_sch01").update({ schoolId: "SCH_02" }));
+    });
+
+    it("3. fee_charges: SCH_01 Admin CANNOT create SCH_02 charge; CAN create SCH_01; CANNOT update", async () => {
+      const adminDb = testEnv.authenticatedContext("admin123").firestore();
+      await assertFails(adminDb.collection("fee_charges").add({ schoolId: "SCH_02", amount: 5000 }));
+      await assertSucceeds(adminDb.collection("fee_charges").doc("chg_sch01").set({ schoolId: "SCH_01", amount: 5000 }));
+      await assertFails(adminDb.collection("fee_charges").doc("chg_sch01").update({ amount: 6000 }));
+    });
+
+    it("4. payroll: SCH_01 Admin CANNOT create payroll for any school (Owner only); Owner CAN create", async () => {
+      const adminDb = testEnv.authenticatedContext("admin123").firestore();
+      const ownerDb = testEnv.authenticatedContext("owner123").firestore();
+      await assertFails(adminDb.collection("payroll").add({ schoolId: "SCH_01", staffId: "st1", netPay: 20000 }));
+      await assertFails(adminDb.collection("payroll").add({ schoolId: "SCH_02", staffId: "st2", netPay: 20000 }));
+      await assertSucceeds(ownerDb.collection("payroll").add({ schoolId: "SCH_01", staffId: "st1", netPay: 20000 }));
+    });
+
+    it("5. class_assignments: SCH_01 Admin CANNOT create SCH_02 assignment; CAN create SCH_01; CANNOT update to SCH_02", async () => {
+      const adminDb = testEnv.authenticatedContext("admin123").firestore();
+      await assertFails(adminDb.collection("class_assignments").add({ schoolId: "SCH_02", class: "Class 1", section: "A" }));
+      await assertSucceeds(adminDb.collection("class_assignments").doc("ca_sch01").set({ schoolId: "SCH_01", class: "Class 1", section: "A" }));
+      await assertFails(adminDb.collection("class_assignments").doc("ca_sch01").update({ schoolId: "SCH_02" }));
+    });
+
+    it("6. attendance_logs: SCH_01 Admin CANNOT create SCH_02 attendance; CAN create SCH_01", async () => {
+      const adminDb = testEnv.authenticatedContext("admin123").firestore();
+      await assertFails(adminDb.collection("attendance_logs").add({ schoolId: "SCH_02", date: "2026-09-07" }));
+      await assertSucceeds(adminDb.collection("attendance_logs").doc("att_sch01").set({ schoolId: "SCH_01", date: "2026-09-07" }));
+      await assertFails(adminDb.collection("attendance_logs").doc("att_sch01").update({ schoolId: "SCH_02" }));
+    });
+
+    it("7. exam_marks: SCH_01 Admin CANNOT create SCH_02 marks; CAN create SCH_01", async () => {
+      const adminDb = testEnv.authenticatedContext("admin123").firestore();
+      await assertFails(adminDb.collection("exam_marks").add({ schoolId: "SCH_02", mark: 90 }));
+      await assertSucceeds(adminDb.collection("exam_marks").doc("ex_sch01").set({ schoolId: "SCH_01", mark: 90 }));
+      await assertFails(adminDb.collection("exam_marks").doc("ex_sch01").update({ schoolId: "SCH_02" }));
+    });
+
+    it("8. staff: SCH_01 Admin CANNOT create SCH_02 staff; CAN create SCH_01; CANNOT update to SCH_02", async () => {
+      const adminDb = testEnv.authenticatedContext("admin123").firestore();
+      await assertFails(adminDb.collection("staff").add({ schoolId: "SCH_02", name: "Staff 2", role: "Teacher" }));
+      await assertSucceeds(adminDb.collection("staff").doc("staff_sch01").set({ schoolId: "SCH_01", name: "Staff 1", role: "Teacher" }));
+      await assertFails(adminDb.collection("staff").doc("staff_sch01").update({ schoolId: "SCH_02" }));
+    });
+
+    it("9. users: SCH_01 Admin CANNOT create user claiming SCH_02; CAN create with SCH_01", async () => {
+      const adminDb = testEnv.authenticatedContext("admin123").firestore();
+      await assertFails(adminDb.collection("users").doc("new_user_sch02").set({ schoolId: "SCH_02", role: "Teacher" }));
+      await assertSucceeds(adminDb.collection("users").doc("new_user_sch01").set({ schoolId: "SCH_01", role: "Teacher" }));
+      await assertFails(adminDb.collection("users").doc("new_user_sch01").update({ schoolId: "SCH_02" }));
+    });
+
+    it("10. fee_adjustments: SCH_01 Admin CANNOT create SCH_02 adjustment; CAN create SCH_01", async () => {
+      const adminDb = testEnv.authenticatedContext("admin123").firestore();
+      await assertFails(adminDb.collection("fee_adjustments").add({ schoolId: "SCH_02", amount: 100 }));
+      await assertSucceeds(adminDb.collection("fee_adjustments").doc("fa_sch01").set({ schoolId: "SCH_01", amount: 100 }));
+      await assertFails(adminDb.collection("fee_adjustments").doc("fa_sch01").update({ schoolId: "SCH_02" }));
+    });
+
+    it("11. student_ledger: SCH_01 Admin/Acct CANNOT create SCH_02 payment/charge; CAN create SCH_01", async () => {
+      const adminDb = testEnv.authenticatedContext("admin123").firestore();
+      const acctDb = testEnv.authenticatedContext("acct123").firestore();
+      await assertFails(adminDb.collection("student_ledger").add({ schoolId: "SCH_02", amount: 100 }));
+      await assertFails(acctDb.collection("student_ledger").add({ schoolId: "SCH_02", amount: 100 }));
+      await assertSucceeds(acctDb.collection("student_ledger").doc("sl_sch01").set({ schoolId: "SCH_01", amount: 100 }));
+      await assertFails(acctDb.collection("student_ledger").doc("sl_sch01").update({ schoolId: "SCH_02" }));
+    });
+
+    it("12. invoices: SCH_01 Admin/Acct CANNOT create SCH_02 invoice; CAN create SCH_01", async () => {
+      const adminDb = testEnv.authenticatedContext("admin123").firestore();
+      const acctDb = testEnv.authenticatedContext("acct123").firestore();
+      await assertFails(adminDb.collection("invoices").add({ schoolId: "SCH_02", total: 1000 }));
+      await assertFails(acctDb.collection("invoices").add({ schoolId: "SCH_02", total: 1000 }));
+      await assertSucceeds(acctDb.collection("invoices").doc("inv_sch01").set({ schoolId: "SCH_01", total: 1000 }));
+      await assertFails(acctDb.collection("invoices").doc("inv_sch01").update({ schoolId: "SCH_02" }));
     });
   });
 });

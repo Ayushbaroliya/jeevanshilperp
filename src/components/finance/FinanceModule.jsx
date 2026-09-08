@@ -3,16 +3,28 @@ import { ArrowLeft, CreditCard, Briefcase, Plus, Download, Filter, AlertCircle, 
 import { collection, getDocs, doc, runTransaction, query, where, orderBy, addDoc, getDoc, updateDoc , writeBatch} from 'firebase/firestore';
 import * as XLSX from 'xlsx';
 import { auth, db } from '../../firebase';
-import { t } from '../../utils/translations';
+import { t, SCHOOLS } from '../../utils/translations';
 import SchoolFolderPicker from '../common/SchoolFolderPicker';
-import { calculateStudentDue, normalizeClassFeeSettings, calculatePenalties, applyPaymentsAndAdjustments, summarizeDues } from '../../utils/feeEngine';
+import { 
+  calculateStudentDue, 
+  normalizeClassFeeSettings, 
+  calculatePenalties, 
+  applyPaymentsAndAdjustments, 
+  summarizeDues,
+  sortLedgerCharges,
+  getJSPSFeeComponents,
+  getJSICFeeComponents,
+  getSchoolDefaultFeeComponents
+} from '../../utils/feeEngine';
 import { generateFeeReceipt } from '../../utils/pdfGenerator';
 
 function getAcademicYear() {
   return "2026-2027";
 }
 
-export default function FinanceModule({ onNavigate, userPermissions, lang = 'en', selectedSchool, setSelectedSchool, classes = [] }) {
+const SCHOOL_OPTIONS = SCHOOLS.map(s => ({ id: s.id, name: s.name }));
+
+export default function FinanceModule({ onNavigate, userPermissions, lang = 'en', selectedSchool, setSelectedSchool, classes = [], activeAcademicYearId = 'AY_2026_27' }) {
   const [activeTab, setActiveTab] = useState('classwise');
   const [prefilledStudentId, setPrefilledStudentId] = useState('');
   const dict = t[lang] || t.en;
@@ -65,92 +77,180 @@ export default function FinanceModule({ onNavigate, userPermissions, lang = 'en'
         )}
       </div>
 
-      {activeTab === 'classwise' && <ClasswiseDueFeesReport onCollectFee={handleSelectStudentForPayment} onNavigate={onNavigate} dict={dict} selectedSchool={selectedSchool} classes={classes} />}
-      {activeTab === 'record' && canRecord && <RecordPayment subOnNavigate={onNavigate} dict={dict} prefilledStudentId={prefilledStudentId} selectedSchool={selectedSchool} userPermissions={userPermissions} />}
-      {activeTab === 'adjustments' && canAdjust && <FeeAdjustmentModule selectedSchool={selectedSchool} userPermissions={userPermissions} />}
-      {activeTab === 'invoices' && <InvoicesModule subOnNavigate={onNavigate} userPermissions={userPermissions} dict={dict} selectedSchool={selectedSchool} />}
+      {activeTab === 'classwise' && (
+        <ClasswiseDueFeesReport
+          onCollectFee={handleSelectStudentForPayment}
+          onNavigate={onNavigate}
+          dict={dict}
+          selectedSchool={selectedSchool}
+          classes={classes}
+          activeAcademicYearId={activeAcademicYearId}
+        />
+      )}
+      {activeTab === 'record' && canRecord && (
+        <RecordPayment
+          subOnNavigate={onNavigate}
+          dict={dict}
+          prefilledStudentId={prefilledStudentId}
+          selectedSchool={selectedSchool}
+          setSelectedSchool={setSelectedSchool}
+          userPermissions={userPermissions}
+          classes={classes}
+          activeAcademicYearId={activeAcademicYearId}
+        />
+      )}
+      {activeTab === 'adjustments' && canAdjust && (
+        <FeeAdjustmentModule
+          selectedSchool={selectedSchool}
+          setSelectedSchool={setSelectedSchool}
+          classes={classes}
+          userPermissions={userPermissions}
+          activeAcademicYearId={activeAcademicYearId}
+        />
+      )}
+      {activeTab === 'invoices' && (
+        <InvoicesModule
+          subOnNavigate={onNavigate}
+          userPermissions={userPermissions}
+          dict={dict}
+          selectedSchool={selectedSchool}
+        />
+      )}
     </div>
   );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// CLASSWISE DUES REPORT (Using V4 Engine)
+// CLASSWISE DUES REPORT (Strictly Using Permanent Fee Charges)
 // ────────────────────────────────────────────────────────────────────────────
-function ClasswiseDueFeesReport({ onCollectFee, onNavigate, dict, selectedSchool, classes = [] }) {
+function ClasswiseDueFeesReport({ onCollectFee, onNavigate, dict, selectedSchool, classes = [], activeAcademicYearId = 'AY_2026_27' }) {
   const [selectedClass, setSelectedClass] = useState('ALL');
   const [searchQuery, setSearchQuery] = useState('');
   const [dueList, setDueList] = useState([]);
+  const [isLoading, setIsLoading] = useState(false);
+
+  const canonicalYearId = activeAcademicYearId === '2026-2027' ? 'AY_2026_27' : (activeAcademicYearId || 'AY_2026_27');
+  const canonicalYearLabel = canonicalYearId === 'AY_2026_27' ? '2026-2027' : (activeAcademicYearId || '2026-2027');
 
   useEffect(() => {
     const fetchCloudDues = async () => {
+      setIsLoading(true);
       try {
         let studentQ = collection(db, "students");
         let chargeQ = collection(db, 'fee_charges');
+        let paymentQ = collection(db, 'student_ledger');
+        let adjustmentQ = collection(db, 'fee_adjustments');
+
         if (selectedSchool && selectedSchool !== 'ALL') {
           studentQ = query(studentQ, where("schoolId", "==", selectedSchool));
           chargeQ = query(chargeQ, where("schoolId", "==", selectedSchool));
+          paymentQ = query(paymentQ, where("schoolId", "==", selectedSchool));
+          adjustmentQ = query(adjustmentQ, where("schoolId", "==", selectedSchool));
         }
         
-        const [studentSnap, paymentSnap, adjustmentSnap, chargeSnap, settingsSnap] = await Promise.all([
+        const [studentSnap, paymentSnap, adjustmentSnap, chargeSnap, settingsDoc] = await Promise.all([
           getDocs(studentQ),
-          getDocs(query(collection(db, 'student_ledger'), where('type', '==', 'credit'))),
-          getDocs(query(collection(db, 'fee_adjustments'), where('status', '==', 'approved'))),
+          getDocs(paymentQ),
+          getDocs(adjustmentQ),
           getDocs(chargeQ),
-          getDoc(doc(db, 'school_settings', 'settings'))
+          getDoc(doc(db, 'school_settings', 'settings')).catch(() => null)
         ]);
 
-        const storedSettings = settingsSnap.exists() ? (settingsSnap.data().schoolClassSettings || {}) : {};
+        const storedSettings = settingsDoc && settingsDoc.exists() ? (settingsDoc.data().schoolClassSettings || {}) : {};
 
         const paymentsByStudent = {};
-        paymentSnap.forEach(d => { const p = d.data(); (paymentsByStudent[p.studentId] ||= []).push({ ...p, id: d.id }); });
+        paymentSnap.forEach(d => {
+          const p = d.data();
+          if (p.type === 'credit' || !p.type) {
+            (paymentsByStudent[p.studentId] ||= []).push({ ...p, id: d.id });
+          }
+        });
         
         const adjustmentsByStudent = {};
-        adjustmentSnap.forEach(d => { const a = d.data(); (adjustmentsByStudent[a.studentId] ||= []).push({ ...a, id: d.id }); });
+        adjustmentSnap.forEach(d => {
+          const a = d.data();
+          if (a.status === 'approved' || !a.status) {
+            (adjustmentsByStudent[a.studentId] ||= []).push({ ...a, id: d.id });
+          }
+        });
 
         const chargesByStudent = {};
-        chargeSnap.forEach(d => { const c = d.data(); (chargesByStudent[c.studentId] ||= []).push({ ...c, id: d.id }); });
+        chargeSnap.forEach(d => {
+          const c = d.data();
+          const isYearMatch = !c.academicYearId && !c.academicYear
+            ? true
+            : (c.academicYearId === canonicalYearId ||
+               c.academicYear === canonicalYearLabel ||
+               c.academicYearId === activeAcademicYearId ||
+               c.academicYear === activeAcademicYearId ||
+               c.academicYear === '2026-27');
+          if (isYearMatch) {
+            (chargesByStudent[c.studentId] ||= []).push({ ...c, id: d.id });
+          }
+        });
 
         const cloudDues = [];
         studentSnap.forEach((d) => {
           const data = d.data();
+          if (data.status === 'Deleted' || data.status === 'archived' || data.isDeleted === true) return;
           const studentObj = { id: d.id, ...data };
-          
-          const sClass = studentObj.class;
-          const sSchool = studentObj.schoolId || selectedSchool;
-          const classSettings = normalizeClassFeeSettings(storedSettings[sSchool]?.[sClass] || {});
+          const studentSchool = data.schoolId || selectedSchool || 'SCH_01';
           const dbCharges = chargesByStudent[d.id] || [];
-          
-          if (dbCharges.length === 0) {
-            cloudDues.push({
-              id: d.id, name: data.name || 'Student', class: data.class || '', section: data.section || '',
-              contact: data.contact || '', dueAmount: 0, status: 'Not Billed', unbilled: true
+
+          let summary;
+          if (dbCharges.length > 0) {
+            const res = applyPaymentsAndAdjustments(
+              dbCharges,
+              paymentsByStudent[d.id] || [],
+              adjustmentsByStudent[d.id] || []
+            );
+            summary = summarizeDues(studentObj, res.ledger, res.advanceCredit);
+          } else {
+            // If no permanent charges in DB for this student, fall back to class settings fee schedule
+            let rawSettings = storedSettings[studentSchool]?.[data.class];
+            if (!rawSettings || !rawSettings.components || rawSettings.components.length === 0) {
+              rawSettings = {
+                components: getSchoolDefaultFeeComponents(studentSchool, data.class, '2026-2027')
+              };
+            }
+            const classSettings = normalizeClassFeeSettings(rawSettings);
+            summary = calculateStudentDue({
+              student: studentObj,
+              charges: null,
+              classSettings,
+              payments: paymentsByStudent[d.id] || [],
+              adjustments: adjustmentsByStudent[d.id] || []
             });
-            return;
           }
 
-          const summary = calculateStudentDue({
-            student: studentObj,
-            charges: dbCharges,
-            classSettings,
-            payments: paymentsByStudent[d.id] || [],
-            adjustments: adjustmentsByStudent[d.id] || []
-          });
-
-          if (summary.totalDue > 0) {
+          if (summary && summary.totalDue > 0) {
             cloudDues.push({
-              id: d.id, name: data.name || 'Student', class: data.class || '', section: data.section || '',
-              contact: data.contact || '', dueAmount: summary.totalDue, status: summary.penaltyDue > 0 ? 'Penalty Applied' : 'Due'
+              id: d.id,
+              name: data.name || 'Student',
+              class: data.class || '',
+              section: data.section || '',
+              contact: data.contact || data.parentContact || '',
+              dueAmount: summary.totalDue,
+              status: summary.penaltyDue > 0 ? 'Penalty Applied' : 'Due'
             });
           }
         });
 
         setDueList(cloudDues);
       } catch (err) {
-        console.error(err);
+        console.error("fetchCloudDues error:", err);
+      } finally {
+        setIsLoading(false);
       }
     };
     fetchCloudDues();
-  }, [selectedSchool]);
+  }, [selectedSchool, activeAcademicYearId]);
+
+  const schoolClassList = useMemo(() => {
+    const configured = (classes || []).filter(Boolean);
+    const fromDues = dueList.map(s => s.class).filter(Boolean);
+    return [...new Set([...configured, ...fromDues])].sort();
+  }, [classes, dueList]);
 
   const filtered = dueList.filter(item => {
     if (selectedClass !== 'ALL' && item.class !== selectedClass) return false;
@@ -160,71 +260,33 @@ function ClasswiseDueFeesReport({ onCollectFee, onNavigate, dict, selectedSchool
 
   return (
     <div className="glass-card" style={{ padding: 24 }}>
-      <h2>Classwise Due Fees Directory</h2>
-      <div style={{ display: 'flex', gap: 10, marginBottom: 20, flexWrap: 'wrap' }}>
-        <select value={selectedClass} onChange={e => setSelectedClass(e.target.value)} className="form-input" style={{ width: 300 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, flexWrap: 'wrap', gap: 12 }}>
+        <div>
+          <h2 style={{ margin: 0, fontSize: 20, fontWeight: 800 }}>Classwise Due Fees Directory</h2>
+          <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>
+            Branch: <strong>{SCHOOLS.find(s => s.id === selectedSchool)?.name || (selectedSchool === 'ALL' ? 'All Branches' : selectedSchool)}</strong> ({dueList.length} student{dueList.length === 1 ? '' : 's'} with outstanding dues)
+          </span>
+        </div>
+      </div>
+
+      <div style={{ display: 'flex', gap: 10, marginBottom: 20, flexWrap: 'wrap', alignItems: 'center' }}>
+        <select value={selectedClass} onChange={e => setSelectedClass(e.target.value)} className="form-input" style={{ width: 260 }}>
           <option value="ALL">All Classes</option>
-          {[...new Set([...(classes || []), ...dueList.map(s => s.class)])].filter(Boolean).sort().map(c => <option key={c} value={c}>{c}</option>)}
+          {schoolClassList.map(c => <option key={c} value={c}>{c}</option>)}
         </select>
-        <button className="btn-secondary" onClick={async () => {
-          if (!window.confirm("Assess Late Fees for all students in the selected view?")) return;
-          // Implementation of late fee assessment
-          try {
-            const rules = [
-              { id: 'sept_late', label: 'Late Fee – September', deadline: '2026-09-10', graceDays: 5, amount: 100, waiveIfCleared: false },
-              { id: 'dec_late',  label: 'Late Fee – December',  deadline: '2026-12-10', graceDays: 5, amount: 500, waiveIfCleared: true  }
-            ];
-            
-            let studentQ = collection(db, "students");
-            if (selectedSchool && selectedSchool !== 'ALL') studentQ = query(studentQ, where("schoolId", "==", selectedSchool));
-            const studentSnap = await getDocs(studentQ);
-            const allStudents = studentSnap.docs.map(d => ({id: d.id, ...d.data()}));
-            
-            // Filter by class if needed
-            const targetStudents = selectedClass === 'ALL' ? allStudents : allStudents.filter(s => s.class === selectedClass);
-            
-            const batch = writeBatch(db);
-            let count = 0;
-            
-            for (const student of targetStudents) {
-               const cSnap = await getDocs(query(collection(db, 'fee_charges'), where('studentId', '==', student.id)));
-               if (cSnap.empty) continue; // Not billed yet
-               
-               const pSnap = await getDocs(query(collection(db, 'student_ledger'), where('studentId', '==', student.id), where('type', '==', 'credit')));
-               const aSnap = await getDocs(query(collection(db, 'fee_adjustments'), where('studentId', '==', student.id), where('status', '==', 'approved')));
-               
-               const charges = cSnap.docs.map(d => ({id: d.id, ...d.data()}));
-               const payments = pSnap.docs.map(d => ({id: d.id, ...d.data()}));
-               const adjustments = aSnap.docs.map(d => ({id: d.id, ...d.data()}));
-               
-               const res = applyPaymentsAndAdjustments(charges, payments, adjustments);
-               const penalties = calculatePenalties(res.ledger, new Date().toISOString(), rules);
-               
-               for (const p of penalties) {
-                  // Ensure we don't already have this penalty in fee_charges
-                  const exists = charges.some(c => c.type === 'penalty' && c.relatedRuleId === p.relatedRuleId);
-                  if (!exists) {
-                     const pid = `chg_${student.id}_${student.academicYear || 'AY_2025_26'}_penalty_${p.relatedRuleId}`;
-                     batch.set(doc(collection(db, 'fee_charges'), pid), {
-                        ...p,
-                        id: pid,
-                        studentId: student.id,
-                        schoolId: selectedSchool,
-                        academicYear: student.academicYear || 'AY_2025_26',
-                        createdAt: new Date().toISOString()
-                     }, { merge: true });
-                     count++;
-                  }
-               }
-            }
-            await batch.commit();
-            alert(`Successfully assessed ${count} new late fees.`);
-            window.location.reload();
-          } catch(e) {
-             console.error(e);
-             alert("Error assessing late fees.");
-          }
-        }}> Assess Late Fees </button>
+        
+        <div style={{ position: 'relative', minWidth: 240 }}>
+          <input
+            type="text"
+            className="form-input"
+            placeholder="Search student name..."
+            value={searchQuery}
+            onChange={e => setSearchQuery(e.target.value)}
+            style={{ paddingLeft: 36, width: '100%' }}
+          />
+          <Search size={16} style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-secondary)' }} />
+        </div>
+
         <button className="btn-primary" onClick={() => {
           const exportData = filtered.map(item => ({
             'Student Name': item.name,
@@ -237,74 +299,143 @@ function ClasswiseDueFeesReport({ onCollectFee, onNavigate, dict, selectedSchool
           const ws = XLSX.utils.json_to_sheet(exportData);
           const wb = XLSX.utils.book_new();
           XLSX.utils.book_append_sheet(wb, ws, "Due Fees List");
-          XLSX.writeFile(wb, `Due_Fees_List_${selectedClass}_${new Date().toISOString().split('T')[0]}.xlsx`);
+          XLSX.writeFile(wb, `Due_Fees_${selectedSchool}_${selectedClass}_${new Date().toISOString().split('T')[0]}.xlsx`);
         }} style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
           <Download size={16} /> Export to Excel
         </button>
       </div>
 
-
-      <table className="modern-table">
-        <thead>
-          <tr>
-            <th>Student</th>
-            <th>Class</th>
-            <th>Pending Amount</th>
-            <th>Action</th>
-          </tr>
-        </thead>
-        <tbody>
-          {filtered.map(item => (
-            <tr key={item.id}>
-              <td>{item.name}</td>
-              <td>{item.class}</td>
-              <td style={{ color: 'var(--danger)', fontWeight: 'bold' }}>₹ {item.dueAmount.toLocaleString()}</td>
-              <td>
-                <button className="btn-primary" onClick={() => onCollectFee(item.id)}>Collect</button>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      {isLoading ? (
+        <div style={{ textAlign: 'center', padding: '40px 0', color: 'var(--text-secondary)' }}>
+          Loading due fees from permanent records...
+        </div>
+      ) : filtered.length === 0 ? (
+        <div style={{ textAlign: 'center', padding: '40px 0', color: 'var(--text-secondary)' }}>
+          No students with outstanding fee dues found in this view.
+        </div>
+      ) : (
+        <div style={{ overflowX: 'auto' }}>
+          <table className="modern-table">
+            <thead>
+              <tr>
+                <th>Student</th>
+                <th>Class</th>
+                <th>Section</th>
+                <th>Pending Amount</th>
+                <th>Status</th>
+                <th style={{ textAlign: 'right' }}>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map(item => (
+                <tr key={item.id}>
+                  <td style={{ fontWeight: 600 }}>{item.name}</td>
+                  <td>{item.class}</td>
+                  <td>{item.section || 'A'}</td>
+                  <td style={{ color: 'var(--danger)', fontWeight: 'bold' }}>₹ {item.dueAmount.toLocaleString()}</td>
+                  <td>
+                    <span className="badge danger">{item.status}</span>
+                  </td>
+                  <td style={{ textAlign: 'right' }}>
+                    <button className="btn-primary" onClick={() => onCollectFee(item.id)}>Collect</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// RECORD PAYMENT (V4 FIFO ALLOCATION)
+// RECORD PAYMENT (School → Class → Student → Fee Record Workflow)
 // ────────────────────────────────────────────────────────────────────────────
-function RecordPayment({ subOnNavigate, dict, prefilledStudentId, selectedSchool, userPermissions }) {
-  const [allStudents, setAllStudents] = useState([]);
+function RecordPayment({ subOnNavigate, dict, prefilledStudentId, selectedSchool, setSelectedSchool, userPermissions, classes = [], activeAcademicYearId = 'AY_2026_27' }) {
+  const [currentSchool, setCurrentSchool] = useState(selectedSchool === 'ALL' ? 'SCH_02' : selectedSchool);
+  const [selectedClass, setSelectedClass] = useState('');
+  const [allSchoolStudents, setAllSchoolStudents] = useState([]);
   const [selectedStudentId, setSelectedStudentId] = useState(prefilledStudentId || '');
   const [receiptNumber, setReceiptNumber] = useState('');
   const [manualAllocations, setManualAllocations] = useState({});
   const paymentAmount = Object.values(manualAllocations).reduce((sum, val) => sum + (Number(val) || 0), 0);
   const [isProcessing, setIsProcessing] = useState(false);
   const [refreshTrigger, setRefreshTrigger] = useState(0);
-  
+
+  // Sync if prop selectedSchool changes
+  useEffect(() => {
+    if (selectedSchool && selectedSchool !== 'ALL' && selectedSchool !== currentSchool) {
+      setCurrentSchool(selectedSchool);
+      setSelectedClass('');
+      setSelectedStudentId('');
+    }
+  }, [selectedSchool]);
+
   // Ledger state
   const [currentLedger, setCurrentLedger] = useState([]);
   const [currentSummary, setCurrentSummary] = useState(null);
 
+  // Fetch all students for the current school
   useEffect(() => {
-    console.log("RecordPayment fetching students for school:", selectedSchool);
-    getDocs(query(collection(db, "students"), where('schoolId', '==', selectedSchool)))
+    if (!currentSchool || currentSchool === 'ALL') {
+      setAllSchoolStudents([]);
+      return;
+    }
+    getDocs(query(collection(db, "students"), where('schoolId', '==', currentSchool)))
       .then(snap => {
-        console.log("Students fetched count:", snap.size);
-        setAllStudents(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+        const list = snap.docs
+          .map(d => ({ id: d.id, ...d.data() }))
+          .filter(s => s.status !== 'Deleted' && s.status !== 'archived' && !s.isDeleted);
+        setAllSchoolStudents(list);
       })
       .catch(e => console.error("Students Query Error:", e));
-  }, [selectedSchool]);
+  }, [currentSchool]);
 
+  // Handle prefilledStudentId (e.g. from Due Fees "Collect" button)
   useEffect(() => {
-    if (!prefilledStudentId && allStudents.length > 0) setSelectedStudentId(allStudents[0].id);
-  }, [allStudents, prefilledStudentId]);
+    if (prefilledStudentId && allSchoolStudents.length > 0) {
+      const target = allSchoolStudents.find(s => s.id === prefilledStudentId);
+      if (target) {
+        if (target.schoolId && target.schoolId !== currentSchool) {
+          setCurrentSchool(target.schoolId);
+          if (setSelectedSchool) setSelectedSchool(target.schoolId);
+        }
+        setSelectedClass(target.class || '');
+        setSelectedStudentId(target.id);
+      }
+    }
+  }, [prefilledStudentId, allSchoolStudents]);
 
-  const selectedStudentObj = allStudents.find(s => s.id === selectedStudentId);
+  // School-specific classes
+  const schoolClassList = useMemo(() => {
+    const defaultClasses = currentSchool === 'SCH_01'
+      ? ['Nursery', 'LKG', 'UKG', 'Class 1', 'Class 2', 'Class 3', 'Class 4', 'Class 5', 'Class 6', 'Class 7', 'Class 8']
+      : currentSchool === 'SCH_03'
+      ? ['Nursery', 'LKG', 'UKG', 'Class 1', 'Class 2', 'Class 3', 'Class 4', 'Class 5', 'Class 6', 'Class 7', 'Class 8', 'Class 9', 'Class 10']
+      : ['Class 6', 'Class 7', 'Class 8', 'Class 9', 'Class 10', 'Class 11', 'Class 12', 'Class 11 Art', 'Class 11 Science', 'Class 12 Art', 'Class 12 Science'];
+    const fromProp = (currentSchool === selectedSchool && classes && classes.length > 0) ? classes : [];
+    const fromStudents = allSchoolStudents.map(s => s.class).filter(Boolean);
+    return [...new Set([...fromProp, ...fromStudents, ...defaultClasses])].filter(Boolean).sort();
+  }, [currentSchool, selectedSchool, classes, allSchoolStudents]);
+
+  // Students in selected school + selected class ONLY
+  const classStudents = useMemo(() => {
+    if (!selectedClass) return [];
+    return allSchoolStudents
+      .filter(s => s.class === selectedClass)
+      .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  }, [allSchoolStudents, selectedClass]);
+
+  const selectedStudentObj = allSchoolStudents.find(s => s.id === selectedStudentId);
 
   useEffect(() => {
     const fetchLedger = async () => {
-      if (!selectedStudentObj) return;
+      if (!selectedStudentObj) {
+        setCurrentLedger([]);
+        setCurrentSummary(null);
+        return;
+      }
       try {
         const [paymentSnap, adjustmentSnap, settingsDoc, chargeSnap] = await Promise.all([
           getDocs(query(collection(db, 'student_ledger'), where('type', '==', 'credit'), where('studentId', '==', selectedStudentId))),
@@ -315,39 +446,42 @@ function RecordPayment({ subOnNavigate, dict, prefilledStudentId, selectedSchool
         
         const payments = paymentSnap.docs.map(d => ({ ...d.data(), id: d.id }));
         const adjustments = adjustmentSnap.docs.map(d => ({ ...d.data(), id: d.id }));
-        const storedSettings = settingsDoc.exists() ? (settingsDoc.data().schoolClassSettings || {}) : {};
-        const classSettings = normalizeClassFeeSettings(storedSettings[selectedSchool]?.[selectedStudentObj.class] || {});
         const dbCharges = chargeSnap.docs.map(d => ({ ...d.data(), id: d.id }));
 
-        if (dbCharges.length === 0) {
-          setCurrentLedger([]);
-          setCurrentSummary({
-            totalDue: 0,
-            totalPaid: 0,
-            totalConcession: 0,
-            advanceCredit: 0,
-            ledger: [],
-            missingCharges: true
+        let summary;
+        if (dbCharges.length > 0) {
+          const res = applyPaymentsAndAdjustments(dbCharges, payments, adjustments);
+          summary = summarizeDues(selectedStudentObj, res.ledger, res.advanceCredit);
+          summary.totalPaid = payments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+        } else {
+          // If no charges in DB, normalize class settings
+          const storedSettings = settingsDoc.exists() ? (settingsDoc.data().schoolClassSettings || {}) : {};
+          let rawSettings = storedSettings[currentSchool]?.[selectedStudentObj.class];
+          if (!rawSettings || !rawSettings.components || rawSettings.components.length === 0) {
+            rawSettings = {
+              components: getSchoolDefaultFeeComponents(currentSchool, selectedStudentObj.class, '2026-2027')
+            };
+          }
+          const classSettings = normalizeClassFeeSettings(rawSettings);
+          summary = calculateStudentDue({
+            student: selectedStudentObj,
+            charges: null,
+            classSettings,
+            payments,
+            adjustments
           });
-          return;
         }
 
-        const summary = calculateStudentDue({
-          student: selectedStudentObj,
-          charges: dbCharges,
-          classSettings,
-          payments,
-          adjustments
-        });
-
-        setCurrentLedger(summary.ledger);
+        const sortedLedger = sortLedgerCharges(summary.ledger || []);
+        summary.ledger = sortedLedger;
+        setCurrentLedger(sortedLedger);
         setCurrentSummary(summary);
       } catch (e) {
         console.error("fetchLedger failed:", e);
       }
     };
     fetchLedger();
-  }, [selectedStudentId, selectedSchool, selectedStudentObj, refreshTrigger]);
+  }, [selectedStudentId, currentSchool, selectedStudentObj, refreshTrigger]);
 
   const previewAllocation = useMemo(() => {
     if (!currentLedger || !paymentAmount || isNaN(paymentAmount) || Number(paymentAmount) <= 0) return null;
@@ -396,7 +530,7 @@ function RecordPayment({ subOnNavigate, dict, prefilledStudentId, selectedSchool
       }
 
       // Prevent duplicate receipt submission
-      const existingInvoiceQ = query(collection(db, "invoices"), where("receiptId", "==", receiptNumber.trim()), where("schoolId", "==", selectedSchool));
+      const existingInvoiceQ = query(collection(db, "invoices"), where("receiptId", "==", receiptNumber.trim()), where("schoolId", "==", currentSchool));
       const existingInvoices = await getDocs(existingInvoiceQ);
       if (!existingInvoices.empty) {
         setIsProcessing(false);
@@ -410,7 +544,7 @@ function RecordPayment({ subOnNavigate, dict, prefilledStudentId, selectedSchool
           timestamp: now,
           action: 'record_payment',
           academicYearId: selectedStudentObj?.academicYear || getAcademicYear(),
-          schoolId: selectedSchool,
+          schoolId: currentSchool,
           relevantChargeIds: allocatedChargeIds
         };
 
@@ -422,7 +556,7 @@ function RecordPayment({ subOnNavigate, dict, prefilledStudentId, selectedSchool
           date: now,
           status: 'completed',
           recordedBy: auditData.userId,
-          schoolId: selectedSchool,
+          schoolId: currentSchool,
           academicYear: auditData.academicYearId,
           allocations: myAllocations,
           auditTrail: auditData
@@ -437,7 +571,7 @@ function RecordPayment({ subOnNavigate, dict, prefilledStudentId, selectedSchool
           date: now,
           amount: val,
           status: 'Paid',
-          schoolId: selectedSchool,
+          schoolId: currentSchool,
           allocations: myAllocationsForInvoice
         });
       });
@@ -455,151 +589,262 @@ function RecordPayment({ subOnNavigate, dict, prefilledStudentId, selectedSchool
   };
 
   return (
-    <div style={{ maxWidth: 800, margin: '0 auto' }}>
+    <div style={{ maxWidth: 860, margin: '0 auto' }}>
       <div className="glass-card" style={{ padding: 24 }}>
-        <h2>{dict.recordFeePayment}</h2>
+        <h2 style={{ marginTop: 0, marginBottom: 20, fontSize: 20, fontWeight: 800 }}>{dict.recordFeePayment}</h2>
         
-        <select className="form-input" value={selectedStudentId} onChange={e => setSelectedStudentId(e.target.value)} style={{ marginBottom: 20 }}>
-          {allStudents.map(s => <option key={s.id} value={s.id}>{s.name} - {s.class}</option>)}
-        </select>
-
-        {/* TRANSPARENT STATEMENT */}
-        {currentSummary ? (
-          <div style={{ padding: 16, background: 'var(--bg-secondary)', borderRadius: 8, marginBottom: 20 }}>
-            <div data-testid="debug-summary" style={{ display: 'none' }}>{JSON.stringify(currentSummary)}</div>
-            <h3 style={{ marginTop: 0 }}>{dict.financialSummary}</h3>
-            <table className="modern-table" style={{ fontSize: 12 }}>
-              <thead>
-                <tr>
-                  <th>{dict.feeCategory}</th>
-                  <th>Total Due</th>
-                  <th>Previously Paid</th>
-                  <th>Collecting Now</th>
-                  <th>Balance</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {currentSummary.ledger.map((c, index) => {
-                  let isPreviousFullyCovered = true;
-                  for (let i = 0; i < index; i++) {
-                    const prevCharge = currentSummary.ledger[i];
-                    const prevInput = Number(manualAllocations[prevCharge.id]) || 0;
-                    if (prevCharge.netDue > 0 && prevInput < prevCharge.netDue) {
-                      isPreviousFullyCovered = false;
-                      break;
-                    }
-                  }
-                  
-                  const isFullyPaid = c.netDue === 0;
-                  const isInputDisabled = isFullyPaid || !isPreviousFullyCovered;
-
-                  const collectingNowAmount = manualAllocations[c.id] !== undefined ? manualAllocations[c.id] : '';
-                  const balanceAfter = c.netDue - (Number(collectingNowAmount) || 0);
-                  
-                  let displayLabel = c.label;
-                  if (displayLabel === 'September' || displayLabel.toLowerCase().includes('september')) {
-                    displayLabel = displayLabel.toLowerCase().includes('late fee') ? 'Late Fee - October / अक्टूबर लेट फीस' : 'October Installment / अक्टूबर की किस्त';
-                  }
-
-                  return (
-                    <tr key={c.id}>
-                      <td>{displayLabel}</td>
-                      <td>₹{c.originalAmount - c.allocatedAdjusted}</td>
-                      <td style={{ color: 'var(--success)' }}>₹{c.allocatedPaid}</td>
-                      <td style={{ color: 'var(--brand-primary)', fontWeight: 'bold' }}>
-                        <input
-                          type="number"
-                          className="form-input"
-                          style={{ width: 120, padding: '4px 8px', borderColor: isInputDisabled ? 'transparent' : 'var(--brand-primary)' }}
-                          disabled={isInputDisabled}
-                          max={c.netDue}
-                          value={collectingNowAmount}
-                          onChange={e => {
-                            let val = e.target.value;
-                            if (val !== '' && Number(val) > c.netDue) val = c.netDue;
-                            setManualAllocations(prev => ({ ...prev, [c.id]: val }));
-                          }}
-                          placeholder={isFullyPaid ? "Paid" : "₹ 0"}
-                        />
-                      </td>
-                      <td style={{ fontWeight: 'bold' }}>₹{balanceAfter}</td>
-                      <td>
-                         <span className={`badge ${balanceAfter === 0 ? 'success' : balanceAfter < (c.originalAmount - c.allocatedAdjusted) ? 'warning' : 'danger'}`}>
-                           {balanceAfter === 0 ? 'PAID' : balanceAfter < (c.originalAmount - c.allocatedAdjusted) ? 'PARTIAL' : 'DUE'}
-                         </span>
-                      </td>
-                    </tr>
-                  );
-                })}
-                {(() => {
-                  let allChargesFullyCovered = true;
-                  for (const c of currentSummary.ledger) {
-                    if (c.netDue > 0 && (Number(manualAllocations[c.id]) || 0) < c.netDue) {
-                      allChargesFullyCovered = false;
-                      break;
-                    }
-                  }
-                  const advanceVal = manualAllocations['advance'] !== undefined ? manualAllocations['advance'] : '';
-                  
-                  return (
-                    <tr>
-                      <td style={{ fontWeight: 'bold', color: 'var(--success)' }}>Advance Payment / अग्रिम भुगतान</td>
-                      <td>-</td>
-                      <td>-</td>
-                      <td>
-                        <input
-                           type="number"
-                           className="form-input"
-                           style={{ width: 120, padding: '4px 8px', borderColor: !allChargesFullyCovered ? 'transparent' : 'var(--brand-primary)' }}
-                           disabled={!allChargesFullyCovered}
-                           value={advanceVal}
-                           onChange={e => setManualAllocations(prev => ({ ...prev, 'advance': e.target.value }))}
-                           placeholder="₹ 0"
-                        />
-                      </td>
-                      <td colSpan="2">-</td>
-                    </tr>
-                  );
-                })()}
-              </tbody>
-            </table>
-            <div style={{ marginTop: 10, fontSize: 16, fontWeight: 'bold', color: 'var(--danger)' }}>
-              {dict.outstandingDue}: ₹{currentSummary.totalDue}
-            </div>
-            {currentSummary.advanceCredit > 0 && (
-              <div style={{ color: 'var(--success)', fontWeight: 'bold' }}>{dict.walletBalance}: ₹{currentSummary.advanceCredit}</div>
-            )}
+        {/* HIERARCHICAL SELECTOR: School → Class → Student */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 16, marginBottom: 24, padding: 18, background: 'var(--bg-secondary)', borderRadius: 10, border: '1px solid var(--border-light)' }}>
+          {/* 1. School Selector */}
+          <div>
+            <label className="form-label" style={{ fontWeight: 700, fontSize: 13, display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+              <span className="badge" style={{ padding: '2px 7px', fontSize: 11, background: 'var(--brand-primary)', color: '#fff' }}>1</span>
+              Select School
+            </label>
+            <select
+              id="fee-record-school-select"
+              className="form-input"
+              value={currentSchool}
+              onChange={e => {
+                const newSchool = e.target.value;
+                setCurrentSchool(newSchool);
+                if (setSelectedSchool) setSelectedSchool(newSchool);
+                setSelectedClass('');
+                setSelectedStudentId('');
+                setManualAllocations({});
+                setCurrentLedger([]);
+                setCurrentSummary(null);
+              }}
+            >
+              {SCHOOL_OPTIONS.map(sch => (
+                <option key={sch.id} value={sch.id}>{sch.name}</option>
+              ))}
+            </select>
           </div>
-        ) : null}
 
-        {/* PAYMENT INPUT */}
-        <div style={{ display: 'flex', gap: 16, marginBottom: 20 }}>
-          <div style={{ flex: 1 }}>
-            <label className="form-label">{dict.amountReceived} (Auto-Sum)</label>
-            <div style={{ fontSize: 24, fontWeight: '900', padding: '10px 0', color: 'var(--success)' }}>
-              ₹ {paymentAmount}
-            </div>
+          {/* 2. Class Selector */}
+          <div>
+            <label className="form-label" style={{ fontWeight: 700, fontSize: 13, display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+              <span className="badge" style={{ padding: '2px 7px', fontSize: 11, background: 'var(--brand-primary)', color: '#fff' }}>2</span>
+              Select Class
+            </label>
+            <select
+              id="fee-record-class-select"
+              className="form-input"
+              value={selectedClass}
+              onChange={e => {
+                setSelectedClass(e.target.value);
+                setSelectedStudentId('');
+                setManualAllocations({});
+                setCurrentLedger([]);
+                setCurrentSummary(null);
+              }}
+            >
+              <option value="">-- Choose Class --</option>
+              {schoolClassList.map(c => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+            </select>
           </div>
-          <div style={{ flex: 1 }}>
-            <label className="form-label">{dict.receiptVoucherNo}</label>
-            <input type="text" className="form-input" value={receiptNumber} onChange={e => setReceiptNumber(e.target.value)} placeholder="Physical Book #" />
+
+          {/* 3. Student Selector */}
+          <div>
+            <label className="form-label" style={{ fontWeight: 700, fontSize: 13, display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+              <span className="badge" style={{ padding: '2px 7px', fontSize: 11, background: 'var(--brand-primary)', color: '#fff' }}>3</span>
+              Select Student
+            </label>
+            <select
+              id="fee-record-student-select"
+              className="form-input"
+              disabled={!selectedClass}
+              value={selectedStudentId}
+              onChange={e => {
+                setSelectedStudentId(e.target.value);
+                setManualAllocations({});
+              }}
+              style={{
+                opacity: !selectedClass ? 0.6 : 1,
+                cursor: !selectedClass ? 'not-allowed' : 'pointer',
+                borderColor: selectedStudentId ? 'var(--brand-primary)' : undefined
+              }}
+            >
+              {!selectedClass ? (
+                <option value="">Select Class first...</option>
+              ) : classStudents.length === 0 ? (
+                <option value="">No students found in {selectedClass}</option>
+              ) : (
+                <>
+                  <option value="">-- Choose Student ({classStudents.length}) --</option>
+                  {classStudents.map(s => (
+                    <option key={s.id} value={s.id}>
+                      {s.name} {s.roll ? `(Roll: ${s.roll})` : ''} {s.section ? `- ${s.section}` : ''}
+                    </option>
+                  ))}
+                </>
+              )}
+            </select>
           </div>
         </div>
 
-        <button className="btn-primary" onClick={handleRecordPayment} disabled={isProcessing || !paymentAmount || !receiptNumber}>
-          {isProcessing ? 'Recording...' : dict.recordFeePayment}
-        </button>
+        {/* 4. FEE RECORD STATEMENT */}
+        {!selectedStudentId ? (
+          <div style={{ textAlign: 'center', padding: '40px 20px', color: 'var(--text-secondary)', background: 'var(--bg-secondary)', borderRadius: 8 }}>
+            <AlertCircle size={32} style={{ margin: '0 auto 12px', opacity: 0.6 }} />
+            <p style={{ margin: 0, fontWeight: 600 }}>Please select a School, Class, and Student above to view fee record and collect payments.</p>
+          </div>
+        ) : currentSummary ? (
+          <>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14, flexWrap: 'wrap', gap: 8 }}>
+              <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)' }}>
+                Student: <strong>{selectedStudentObj?.name}</strong> | Class: <strong>{selectedStudentObj?.class}</strong> {selectedStudentObj?.section ? `(${selectedStudentObj?.section})` : ''} {selectedStudentObj?.roll ? `| Roll: ${selectedStudentObj?.roll}` : ''}
+              </span>
+              <span className="badge" style={{ backgroundColor: 'var(--bg-secondary)', fontSize: 12 }}>
+                {SCHOOLS.find(s => s.id === currentSchool)?.name || currentSchool}
+              </span>
+            </div>
+
+            <div style={{ padding: 16, background: 'var(--bg-secondary)', borderRadius: 8, marginBottom: 20 }}>
+              <div data-testid="debug-summary" style={{ display: 'none' }}>{JSON.stringify(currentSummary)}</div>
+              <h3 style={{ marginTop: 0 }}>{dict.financialSummary}</h3>
+              <table className="modern-table" style={{ fontSize: 12 }}>
+                <thead>
+                  <tr>
+                    <th>{dict.feeCategory}</th>
+                    <th>Total Due</th>
+                    <th>Previously Paid</th>
+                    <th>Collecting Now</th>
+                    <th>Balance</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {currentSummary.ledger.map((c, index) => {
+                    let isPreviousFullyCovered = true;
+                    for (let i = 0; i < index; i++) {
+                      const prevCharge = currentSummary.ledger[i];
+                      const prevInput = Number(manualAllocations[prevCharge.id]) || 0;
+                      if (prevCharge.netDue > 0 && prevInput < prevCharge.netDue) {
+                        isPreviousFullyCovered = false;
+                        break;
+                      }
+                    }
+                    
+                    const isFullyPaid = c.netDue === 0;
+                    const isInputDisabled = isFullyPaid || !isPreviousFullyCovered;
+
+                    const collectingNowAmount = manualAllocations[c.id] !== undefined ? manualAllocations[c.id] : '';
+                    const balanceAfter = c.netDue - (Number(collectingNowAmount) || 0);
+                    
+                    let displayLabel = c.label;
+                    if (displayLabel === 'September' || displayLabel.toLowerCase().includes('september')) {
+                      displayLabel = displayLabel.toLowerCase().includes('late fee') ? 'Late Fee - October / अक्टूबर लेट फीस' : 'October Installment / अक्टूबर की किस्त';
+                    }
+
+                    return (
+                      <tr key={c.id}>
+                        <td>{displayLabel}</td>
+                        <td>₹{c.originalAmount - (c.allocatedAdjusted || 0)}</td>
+                        <td style={{ color: 'var(--success)' }}>₹{c.allocatedPaid}</td>
+                        <td style={{ color: 'var(--brand-primary)', fontWeight: 'bold' }}>
+                          <input
+                            type="number"
+                            className="form-input"
+                            style={{ width: 120, padding: '4px 8px', borderColor: isInputDisabled ? 'transparent' : 'var(--brand-primary)' }}
+                            disabled={isInputDisabled}
+                            max={c.netDue}
+                            value={collectingNowAmount}
+                            onChange={e => {
+                              let val = e.target.value;
+                              if (val !== '' && Number(val) > c.netDue) val = c.netDue;
+                              setManualAllocations(prev => ({ ...prev, [c.id]: val }));
+                            }}
+                            placeholder={isFullyPaid ? "Paid" : "₹ 0"}
+                          />
+                        </td>
+                        <td style={{ fontWeight: 'bold' }}>₹{balanceAfter}</td>
+                        <td>
+                           <span className={`badge ${balanceAfter === 0 ? 'success' : balanceAfter < (c.originalAmount - (c.allocatedAdjusted || 0)) ? 'warning' : 'danger'}`}>
+                             {balanceAfter === 0 ? 'PAID' : balanceAfter < (c.originalAmount - (c.allocatedAdjusted || 0)) ? 'PARTIAL' : 'DUE'}
+                           </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {(() => {
+                    let allChargesFullyCovered = true;
+                    for (const c of currentSummary.ledger) {
+                      if (c.netDue > 0 && (Number(manualAllocations[c.id]) || 0) < c.netDue) {
+                        allChargesFullyCovered = false;
+                        break;
+                      }
+                    }
+                    const advanceVal = manualAllocations['advance'] !== undefined ? manualAllocations['advance'] : '';
+                    
+                    return (
+                      <tr>
+                        <td style={{ fontWeight: 'bold', color: 'var(--success)' }}>Advance Payment / अग्रिम भुगतान</td>
+                        <td>-</td>
+                        <td>-</td>
+                        <td>
+                          <input
+                             type="number"
+                             className="form-input"
+                             style={{ width: 120, padding: '4px 8px', borderColor: !allChargesFullyCovered ? 'transparent' : 'var(--brand-primary)' }}
+                             disabled={!allChargesFullyCovered}
+                             value={advanceVal}
+                             onChange={e => setManualAllocations(prev => ({ ...prev, 'advance': e.target.value }))}
+                             placeholder="₹ 0"
+                          />
+                        </td>
+                        <td colSpan="2">-</td>
+                      </tr>
+                    );
+                  })()}
+                </tbody>
+              </table>
+              <div style={{ marginTop: 10, fontSize: 16, fontWeight: 'bold', color: 'var(--danger)' }}>
+                {dict.outstandingDue}: ₹{currentSummary.totalDue}
+              </div>
+              {currentSummary.advanceCredit > 0 && (
+                <div style={{ color: 'var(--success)', fontWeight: 'bold' }}>{dict.walletBalance}: ₹{currentSummary.advanceCredit}</div>
+              )}
+            </div>
+
+            {/* PAYMENT INPUT */}
+            <div style={{ display: 'flex', gap: 16, marginBottom: 20 }}>
+              <div style={{ flex: 1 }}>
+                <label className="form-label">{dict.amountReceived} (Auto-Sum)</label>
+                <div style={{ fontSize: 24, fontWeight: '900', padding: '10px 0', color: 'var(--success)' }}>
+                  ₹ {paymentAmount}
+                </div>
+              </div>
+              <div style={{ flex: 1 }}>
+                <label className="form-label">{dict.receiptVoucherNo}</label>
+                <input type="text" className="form-input" value={receiptNumber} onChange={e => setReceiptNumber(e.target.value)} placeholder="Physical Book #" />
+              </div>
+            </div>
+
+            <button className="btn-primary" onClick={handleRecordPayment} disabled={isProcessing || !paymentAmount || !receiptNumber}>
+              {isProcessing ? 'Recording...' : dict.recordFeePayment}
+            </button>
+          </>
+        ) : (
+          <div style={{ textAlign: 'center', padding: '30px 0', color: 'var(--text-secondary)' }}>
+            Loading student fee record...
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// FEE ADJUSTMENT MODULE (V4 Exact Charge Selection)
+// FEE ADJUSTMENT MODULE (V4 Exact Charge Selection & 3-Step Cascading Dropdowns)
 // ────────────────────────────────────────────────────────────────────────────
-function FeeAdjustmentModule({ selectedSchool, userPermissions }) {
-  const [students, setStudents] = useState([]);
+function FeeAdjustmentModule({ selectedSchool, setSelectedSchool, userPermissions, classes = [], activeAcademicYearId = 'AY_2026_27' }) {
+  const [currentSchool, setCurrentSchool] = useState(() => (selectedSchool && selectedSchool !== 'ALL' ? selectedSchool : 'SCH_02'));
+  const [selectedClass, setSelectedClass] = useState('');
+  const [allSchoolStudents, setAllSchoolStudents] = useState([]);
   const [studentId, setStudentId] = useState('');
   const [currentLedger, setCurrentLedger] = useState([]);
   const [selectedChargeId, setSelectedChargeId] = useState('');
@@ -608,21 +853,73 @@ function FeeAdjustmentModule({ selectedSchool, userPermissions }) {
   const [isSaving, setIsSaving] = useState(false);
   const [refreshTrigger, setRefreshTrigger] = useState(0);
 
-  const selectedStudentObj = students.find(s => s.id === studentId);
-
+  // Sync if prop selectedSchool changes
   useEffect(() => {
-    getDocs(query(collection(db, 'students'), where('schoolId', '==', selectedSchool)))
-      .then(snap => setStudents(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
+    if (selectedSchool && selectedSchool !== 'ALL' && selectedSchool !== currentSchool) {
+      setCurrentSchool(selectedSchool);
+      setSelectedClass('');
+      setStudentId('');
+      setSelectedChargeId('');
+      setCurrentLedger([]);
+    }
   }, [selectedSchool]);
+
+  // Fetch all active students for currentSchool
+  useEffect(() => {
+    if (!currentSchool || currentSchool === 'ALL') {
+      setAllSchoolStudents([]);
+      return;
+    }
+    getDocs(query(collection(db, 'students'), where('schoolId', '==', currentSchool)))
+      .then(snap => {
+        const list = snap.docs
+          .map(d => ({ id: d.id, ...d.data() }))
+          .filter(s => s.status !== 'Deleted' && s.status !== 'archived' && !s.isDeleted);
+        setAllSchoolStudents(list);
+      })
+      .catch(e => console.error("FeeAdjustmentModule students query error:", e));
+  }, [currentSchool]);
+
+  // School-specific classes
+  const schoolClassList = useMemo(() => {
+    const defaultClasses = currentSchool === 'SCH_01'
+      ? ['Nursery', 'LKG', 'UKG', 'Class 1', 'Class 2', 'Class 3', 'Class 4', 'Class 5', 'Class 6', 'Class 7', 'Class 8']
+      : currentSchool === 'SCH_03'
+      ? ['Nursery', 'LKG', 'UKG', 'Class 1', 'Class 2', 'Class 3', 'Class 4', 'Class 5', 'Class 6', 'Class 7', 'Class 8', 'Class 9', 'Class 10']
+      : ['Class 6', 'Class 7', 'Class 8', 'Class 9', 'Class 10', 'Class 11', 'Class 12', 'Class 11 Art', 'Class 11 Science', 'Class 12 Art', 'Class 12 Science'];
+    const fromProp = (currentSchool === selectedSchool && classes && classes.length > 0) ? classes : [];
+    const fromStudents = allSchoolStudents.map(s => s.class).filter(Boolean);
+    return [...new Set([...fromProp, ...fromStudents, ...defaultClasses])].filter(Boolean).sort();
+  }, [currentSchool, selectedSchool, classes, allSchoolStudents]);
+
+  // Students in selected school + selected class ONLY
+  const classStudents = useMemo(() => {
+    if (!selectedClass) return [];
+    return allSchoolStudents
+      .filter(s => s.class === selectedClass)
+      .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  }, [allSchoolStudents, selectedClass]);
+
+  const selectedStudentObj = allSchoolStudents.find(s => s.id === studentId);
 
   useEffect(() => {
     const fetchLedger = async () => {
-      if (!selectedStudentObj) { setCurrentLedger([]); return; }
+      if (!selectedStudentObj || !studentId) {
+        setCurrentLedger([]);
+        return;
+      }
       
       try {
+        let paymentQ = query(collection(db, 'student_ledger'), where('type', '==', 'credit'), where('studentId', '==', studentId));
+        let adjQ = query(collection(db, 'fee_adjustments'), where('status', '==', 'approved'), where('studentId', '==', studentId));
+        if (currentSchool && currentSchool !== 'ALL') {
+          paymentQ = query(paymentQ, where('schoolId', '==', currentSchool));
+          adjQ = query(adjQ, where('schoolId', '==', currentSchool));
+        }
+
         const [paymentSnap, adjustmentSnap, settingsDoc, chargeSnap] = await Promise.all([
-          getDocs(query(collection(db, 'student_ledger'), where('type', '==', 'credit'), where('studentId', '==', studentId))),
-          getDocs(query(collection(db, 'fee_adjustments'), where('status', '==', 'approved'), where('studentId', '==', studentId))),
+          getDocs(paymentQ),
+          getDocs(adjQ),
           getDoc(doc(db, 'school_settings', 'settings')),
           getDocs(query(collection(db, 'fee_charges'), where('studentId', '==', studentId)))
         ]);
@@ -630,114 +927,252 @@ function FeeAdjustmentModule({ selectedSchool, userPermissions }) {
         const payments = paymentSnap.docs.map(d => ({ ...d.data(), id: d.id }));
         const adjustments = adjustmentSnap.docs.map(d => ({ ...d.data(), id: d.id }));
         const storedSettings = settingsDoc.exists() ? (settingsDoc.data().schoolClassSettings || {}) : {};
-        const classSettings = normalizeClassFeeSettings(storedSettings[selectedSchool]?.[selectedStudentObj.class] || {});
-        const dbCharges = chargeSnap.docs.map(d => ({ ...d.data(), id: d.id }));
-
-        if (dbCharges.length === 0) {
-          setCurrentLedger([]);
-          return;
+        let rawSettings = storedSettings[currentSchool]?.[selectedStudentObj.class];
+        if (!rawSettings || !rawSettings.components || rawSettings.components.length === 0) {
+          rawSettings = {
+            components: getSchoolDefaultFeeComponents(currentSchool, selectedStudentObj.class, '2026-2027')
+          };
         }
+        const classSettings = normalizeClassFeeSettings(rawSettings);
+        const dbCharges = chargeSnap.docs.map(d => ({ ...d.data(), id: d.id }));
 
         const summary = calculateStudentDue({
           student: selectedStudentObj,
-          charges: dbCharges,
+          charges: dbCharges.length > 0 ? dbCharges : null,
           classSettings,
           payments,
           adjustments
         });
 
         setCurrentLedger(summary.ledger.filter(c => c.netDue > 0));
-      } catch (e) { console.error(e); }
+      } catch (e) {
+        console.error("fetchLedger failed in FeeAdjustmentModule:", e);
+      }
     };
     fetchLedger();
-  }, [studentId, students, selectedSchool, selectedStudentObj, refreshTrigger]);
+  }, [studentId, currentSchool, selectedStudentObj, refreshTrigger]);
 
   const handleAdjustment = async () => {
     const value = Number(amount);
     if (!studentId || !selectedChargeId || value <= 0 || !reason.trim()) return alert("Fill all fields correctly");
-    
-    const targetCharge = currentLedger.find(c => c.id === selectedChargeId);
-    if (value > targetCharge.netDue) return alert("Adjustment cannot exceed the net due of this charge");
 
     setIsSaving(true);
     try {
-      const now = new Date().toISOString();
-      const auditData = {
-        userId: auth.currentUser?.uid || 'unknown',
-        role: userPermissions?.role || 'unknown',
-        timestamp: now,
-        action: 'create_adjustment',
-        academicYearId: selectedStudentObj?.academicYear || getAcademicYear(),
-        schoolId: selectedSchool,
-        relevantChargeIds: [selectedChargeId]
-      };
+      const charge = currentLedger.find(c => c.id === selectedChargeId);
+      if (!charge) return alert("Charge not found");
+      if (value > charge.netDue) return alert("Adjustment exceeds current net due of the selected charge");
 
+      const now = new Date().toISOString();
       await addDoc(collection(db, 'fee_adjustments'), {
         studentId,
         chargeId: selectedChargeId,
         amount: value,
         reason: reason.trim(),
         status: 'approved',
-        type: 'waiver',
-        schoolId: selectedSchool,
-        academicYear: auditData.academicYearId,
-        recordedBy: auditData.userId,
-        auditTrail: auditData,
-        createdAt: now
+        date: now,
+        createdAt: now,
+        approvedBy: auth.currentUser?.uid || 'unknown',
+        schoolId: currentSchool,
+        academicYear: selectedStudentObj?.academicYear || activeAcademicYearId || getAcademicYear()
       });
-      alert('Adjustment saved successfully!');
-      setAmount(''); setReason(''); setSelectedChargeId('');
+
+      alert("Fee concession/adjustment applied successfully!");
+      setAmount('');
+      setReason('');
+      setSelectedChargeId('');
       setRefreshTrigger(prev => prev + 1);
     } catch (e) {
       console.error(e);
-      alert('Failed: ' + e.message);
+      alert("Error: " + e.message);
     } finally {
       setIsSaving(false);
     }
   };
 
   return (
-    <div className="glass-card" style={{ padding: 24 }}>
-      <h2>Reduce Fee / फीस कम करें</h2>
-      <div className="form-group">
-        <label className="form-label">Select Student</label>
-        <select className="form-input" value={studentId} onChange={e => setStudentId(e.target.value)}>
-          <option value="">-- Choose --</option>
-          {students.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-        </select>
-      </div>
-      
-      {currentLedger.length > 0 && (
-        <div className="form-group">
-          <label className="form-label">Select Unpaid Charge to Adjust</label>
-          <select className="form-input" value={selectedChargeId} onChange={e => setSelectedChargeId(e.target.value)}>
-            <option value="">-- Select Charge --</option>
-            {currentLedger.map(c => <option key={c.id} value={c.id}>{c.label} (Due: ₹{c.netDue})</option>)}
-          </select>
+    <div style={{ maxWidth: 860, margin: '0 auto' }}>
+      <div className="glass-card" style={{ padding: 24 }}>
+        <h2 style={{ marginTop: 0, marginBottom: 20, fontSize: 20, fontWeight: 800 }}>Fee Adjustments & Concessions</h2>
+        
+        {/* 3-STEP HIERARCHICAL SELECTOR: School → Class → Student */}
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+          gap: 16,
+          marginBottom: 24,
+          padding: 18,
+          background: 'var(--bg-secondary)',
+          borderRadius: 10,
+          border: '1px solid var(--border-light)'
+        }}>
+          {/* 1. School Selector */}
+          <div>
+            <label className="form-label" style={{ fontWeight: 700, fontSize: 13, display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+              <span className="badge" style={{ padding: '2px 7px', fontSize: 11, background: 'var(--brand-primary)', color: '#fff' }}>1</span>
+              Select School
+            </label>
+            <select
+              id="adjustment-school-select"
+              className="form-input"
+              value={currentSchool}
+              onChange={e => {
+                const newSchool = e.target.value;
+                setCurrentSchool(newSchool);
+                if (setSelectedSchool) setSelectedSchool(newSchool);
+                setSelectedClass('');
+                setStudentId('');
+                setSelectedChargeId('');
+                setCurrentLedger([]);
+              }}
+            >
+              {SCHOOL_OPTIONS.map(sch => (
+                <option key={sch.id} value={sch.id}>{sch.name}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* 2. Class Selector */}
+          <div>
+            <label className="form-label" style={{ fontWeight: 700, fontSize: 13, display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+              <span className="badge" style={{ padding: '2px 7px', fontSize: 11, background: 'var(--brand-primary)', color: '#fff' }}>2</span>
+              Select Class
+            </label>
+            <select
+              id="adjustment-class-select"
+              className="form-input"
+              value={selectedClass}
+              onChange={e => {
+                setSelectedClass(e.target.value);
+                setStudentId('');
+                setSelectedChargeId('');
+                setCurrentLedger([]);
+              }}
+            >
+              <option value="">-- Choose Class --</option>
+              {schoolClassList.map(c => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* 3. Student Selector */}
+          <div>
+            <label className="form-label" style={{ fontWeight: 700, fontSize: 13, display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+              <span className="badge" style={{ padding: '2px 7px', fontSize: 11, background: 'var(--brand-primary)', color: '#fff' }}>3</span>
+              Select Student
+            </label>
+            <select
+              id="adjustment-student-select"
+              className="form-input"
+              disabled={!selectedClass}
+              value={studentId}
+              onChange={e => {
+                setStudentId(e.target.value);
+                setSelectedChargeId('');
+              }}
+              style={{
+                opacity: !selectedClass ? 0.6 : 1,
+                cursor: !selectedClass ? 'not-allowed' : 'pointer',
+                borderColor: studentId ? 'var(--brand-primary)' : undefined
+              }}
+            >
+              {!selectedClass ? (
+                <option value="">Select Class first...</option>
+              ) : classStudents.length === 0 ? (
+                <option value="">No students found in {selectedClass}</option>
+              ) : (
+                <>
+                  <option value="">-- Choose Student ({classStudents.length}) --</option>
+                  {classStudents.map(s => (
+                    <option key={s.id} value={s.id}>
+                      {s.name} {s.roll ? `(Roll: ${s.roll})` : ''} {s.section ? `- ${s.section}` : ''}
+                    </option>
+                  ))}
+                </>
+              )}
+            </select>
+          </div>
         </div>
-      )}
 
-      <div className="form-group">
-        <label className="form-label">Adjustment Amount</label>
-        <input type="number" className="form-input" value={amount} onChange={e => setAmount(e.target.value)} />
+        {/* DETAILS AND CONCESSION FORM */}
+        {!studentId ? (
+          <div style={{ textAlign: 'center', padding: '36px 20px', color: 'var(--text-secondary)', background: 'var(--bg-secondary)', borderRadius: 8 }}>
+            <AlertCircle size={32} style={{ margin: '0 auto 12px', opacity: 0.6 }} />
+            <p style={{ margin: 0, fontWeight: 600 }}>Please select a School, Class, and Student above to apply fee adjustments and concessions.</p>
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {selectedStudentObj && (
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 16px', background: 'var(--bg-secondary)', borderRadius: 8, flexWrap: 'wrap', gap: 8 }}>
+                <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)' }}>
+                  Student: <strong>{selectedStudentObj.name}</strong> | Class: <strong>{selectedStudentObj.class}</strong> {selectedStudentObj.section ? `(${selectedStudentObj.section})` : ''} {selectedStudentObj.roll ? `| Roll: ${selectedStudentObj.roll}` : ''}
+                </span>
+                <span className="badge" style={{ backgroundColor: 'var(--card-bg)', fontSize: 12 }}>
+                  {SCHOOLS.find(s => s.id === currentSchool)?.name || currentSchool}
+                </span>
+              </div>
+            )}
+
+            {currentLedger.length > 0 ? (
+              <>
+                <div>
+                  <label className="form-label" style={{ fontWeight: 700 }}>Select Unpaid Fee Charge</label>
+                  <select className="form-input" value={selectedChargeId} onChange={e => setSelectedChargeId(e.target.value)}>
+                    <option value="">-- Choose specific charge to discount --</option>
+                    {currentLedger.map(c => (
+                      <option key={c.id} value={c.id}>
+                        {c.label} (Net Due: ₹{c.netDue})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {selectedChargeId && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 14, padding: 16, background: 'var(--bg-secondary)', borderRadius: 8 }}>
+                    <div>
+                      <label className="form-label" style={{ fontWeight: 700 }}>Concession Amount (₹)</label>
+                      <input
+                        type="number"
+                        className="form-input"
+                        value={amount}
+                        onChange={e => setAmount(e.target.value)}
+                        placeholder="e.g. 500"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="form-label" style={{ fontWeight: 700 }}>Reason / Justification</label>
+                      <input
+                        type="text"
+                        className="form-input"
+                        value={reason}
+                        onChange={e => setReason(e.target.value)}
+                        placeholder="e.g. Sibling discount approved by Principal"
+                      />
+                    </div>
+
+                    <button className="btn-primary" onClick={handleAdjustment} disabled={isSaving} style={{ alignSelf: 'flex-start' }}>
+                      {isSaving ? "Saving..." : "Apply Concession"}
+                    </button>
+                  </div>
+                )}
+              </>
+            ) : (
+              <div style={{ color: 'var(--text-secondary)', padding: 16, background: 'var(--bg-secondary)', borderRadius: 8, textAlign: 'center' }}>
+                Student has no unpaid active charges available for adjustments.
+              </div>
+            )}
+          </div>
+        )}
       </div>
-
-      <div className="form-group">
-        <label className="form-label">Audit Reason (Mandatory)</label>
-        <input type="text" className="form-input" value={reason} onChange={e => setReason(e.target.value)} />
-      </div>
-
-      <button className="btn-primary" onClick={handleAdjustment} disabled={isSaving || !selectedChargeId}>
-        {isSaving ? 'Saving...' : 'Reduce Fee / फीस कम करें'}
-      </button>
     </div>
   );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// INVOICES (Read-Only History)
+// RECEIPT HISTORY (INVOICES)
 // ────────────────────────────────────────────────────────────────────────────
-function InvoicesModule({ selectedSchool, dict }) {
+function InvoicesModule({ subOnNavigate, userPermissions, dict, selectedSchool }) {
   const [invoices, setInvoices] = useState([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');

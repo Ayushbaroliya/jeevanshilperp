@@ -28,18 +28,54 @@ if (import.meta.env.VITE_E2E_TESTING === 'true' && typeof window !== 'undefined'
   window.e2eFirestore = { db, collection, doc, getDocs, query, where, runTransaction };
 }
 
-export const staffAuthEmail = (contact) => `${String(contact).trim().toLowerCase().replace(/[^a-z0-9._-]/g, '')}@jeevanshilpgroup.local`;
+export const normalizeLoginId = (contact) => {
+  if (!contact) return '';
+  const str = String(contact).trim();
+  if (str.includes('@')) {
+    return str.toLowerCase().trim();
+  }
+  // Strip spaces, dashes, parentheses and country code symbols
+  let clean = str.replace(/[^a-zA-Z0-9._-]/g, '').toLowerCase();
+  // If Indian mobile with country code +91 or 91 (12 digits)
+  if (/^91[0-9]{10}$/.test(clean)) {
+    clean = clean.slice(2);
+  } else if (/^0[0-9]{10}$/.test(clean)) {
+    clean = clean.slice(1);
+  }
+  return clean;
+};
+
+export const staffAuthEmail = (contact) => {
+  const norm = normalizeLoginId(contact);
+  if (!norm) return '';
+  if (norm.includes('@')) return norm;
+  return `${norm}@jeevanshilpgroup.local`;
+};
 
 // Uses a secondary Firebase app so creating a staff account does not sign the current admin out.
 export const createStaffAuthAccount = async (contact, password) => {
+  const email = staffAuthEmail(contact);
   const secondary = initializeApp(firebaseConfig, `staff-creator-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   const secondaryAuth = getAuth(secondary);
   try {
-    const credential = await createUserWithEmailAndPassword(secondaryAuth, staffAuthEmail(contact), password);
+    const credential = await createUserWithEmailAndPassword(secondaryAuth, email, password);
     await signOut(secondaryAuth);
     return credential.user;
+  } catch (err) {
+    if (err.code === 'auth/email-already-in-use') {
+      try {
+        const existingCred = await signInWithEmailAndPassword(secondaryAuth, email, password);
+        await signOut(secondaryAuth);
+        return existingCred.user;
+      } catch (signErr) {
+        throw err;
+      }
+    }
+    throw err;
   } finally {
-    await deleteApp(secondary);
+    try {
+      await deleteApp(secondary);
+    } catch (_) {}
   }
 };
 

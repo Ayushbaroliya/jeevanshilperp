@@ -31,7 +31,7 @@ export default function OperationsDashboard({ onNavigate, selectedSchool, classS
         totalStudents = 0;
         studentsSnap.forEach(d => {
           const s = d.data();
-          if (s.status !== 'Deleted' && s.status !== 'archived') {
+          if (s.status !== 'Deleted' && s.status !== 'archived' && !s.isDeleted) {
             totalStudents++;
             if (s.class) uniqueClasses.add(s.class);
           }

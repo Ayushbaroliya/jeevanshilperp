@@ -64,24 +64,28 @@ export default function StaffSalaryModule({ lang = 'en', selectedSchool, current
         const validStaff = [];
         
         let salaries = {};
-        if (isOwner) {
-          try {
-            const salarySnapshot = await getDocs(collection(db, 'staff_salary'));
-            salarySnapshot.forEach(d => {
-              salaries[d.id] = d.data().baseSalary;
-            });
-          } catch (err) {
-            console.error("Could not fetch salaries:", err);
-          }
+        try {
+          const salarySnapshot = await getDocs(collection(db, 'staff_salary'));
+          salarySnapshot.forEach(d => {
+            const data = d.data();
+            if (data?.baseSalary !== undefined) {
+              salaries[d.id] = Number(data.baseSalary);
+              if (data.staffId) salaries[data.staffId] = Number(data.baseSalary);
+              if (data.uid) salaries[data.uid] = Number(data.baseSalary);
+            }
+          });
+        } catch (err) {
+          console.error("Could not fetch salaries:", err);
         }
 
         snapshot.docs.forEach(d => {
           const data = d.data();
           if (data.status !== 'archived' && data.isActive !== false) {
+            const resolvedSalary = salaries[d.id] ?? (data.uid ? salaries[data.uid] : undefined) ?? data.baseSalary ?? data.salary ?? 0;
             validStaff.push({ 
               id: d.id, 
               ...data,
-              baseSalary: salaries[d.id] || 0
+              baseSalary: Number(resolvedSalary)
             });
           }
         });
@@ -470,12 +474,26 @@ export default function StaffSalaryModule({ lang = 'en', selectedSchool, current
                           className="form-input" 
                           value={staff.baseSalary || 0} 
                           onChange={async (e) => {
-                            const newSalary = Number(e.target.value);
+                            const newSalary = Number(e.target.value) || 0;
                             setStaffList(prev => prev.map(s => s.id === staff.id ? { ...s, baseSalary: newSalary } : s));
                             try {
-                              const { doc, setDoc } = await import('firebase/firestore');
-                              await setDoc(doc(db, 'staff_salary', staff.id), { baseSalary: newSalary, schoolId: staff.schoolId }, { merge: true });
-                            } catch(err) { console.error(err); }
+                              const { doc, setDoc, updateDoc } = await import('firebase/firestore');
+                              await updateDoc(doc(db, 'staff', staff.id), { baseSalary: newSalary });
+                              await setDoc(doc(db, 'staff_salary', staff.id), { 
+                                baseSalary: newSalary, 
+                                schoolId: staff.schoolId,
+                                staffId: staff.id,
+                                uid: staff.uid || null
+                              }, { merge: true });
+                              if (staff.uid) {
+                                await setDoc(doc(db, 'staff_salary', staff.uid), { 
+                                  baseSalary: newSalary, 
+                                  schoolId: staff.schoolId,
+                                  staffId: staff.id,
+                                  uid: staff.uid
+                                }, { merge: true });
+                              }
+                            } catch(err) { console.error('Error saving staff salary:', err); }
                           }}
                           style={{ width: 100, textAlign: 'right', padding: '4px 8px', margin: 0 }} 
                         />

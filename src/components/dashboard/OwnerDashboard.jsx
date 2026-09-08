@@ -33,7 +33,7 @@ export default function OwnerDashboard({ onNavigate, lang, selectedSchool, setSe
         let counts = { SCH_01: 0, SCH_02: 0, SCH_03: 0 };
         allStudentsSnap.forEach(doc => {
           const s = doc.data();
-          if (s.status !== 'Deleted' && s.status !== 'archived') {
+          if (s.status !== 'Deleted' && s.status !== 'archived' && !s.isDeleted) {
             const sid = s.schoolId || 'SCH_01';
             counts[sid] = (counts[sid] || 0) + 1;
           }
@@ -45,14 +45,17 @@ export default function OwnerDashboard({ onNavigate, lang, selectedSchool, setSe
         setSchoolStudentCounts(counts);
         setStudentsLoading(false);
 
-        let recentQ = query(collection(db, 'students'), orderBy('createdAt', 'desc'), limit(4));
+        let recentQ = query(collection(db, 'students'), orderBy('createdAt', 'desc'), limit(10));
         if (selectedSchool !== 'ALL') {
-          recentQ = query(collection(db, 'students'), where('schoolId', '==', selectedSchool), orderBy('createdAt', 'desc'), limit(4));
+          recentQ = query(collection(db, 'students'), where('schoolId', '==', selectedSchool), orderBy('createdAt', 'desc'), limit(10));
         }
         const recentSnapshot = await getDocs(recentQ);
         const recent = [];
         recentSnapshot.forEach(doc => {
-          recent.push({ id: doc.id, ...doc.data() });
+          const s = doc.data();
+          if (s.status !== 'Deleted' && s.status !== 'archived' && !s.isDeleted && recent.length < 4) {
+            recent.push({ id: doc.id, ...s });
+          }
         });
         setRecentStudents(recent);
 
