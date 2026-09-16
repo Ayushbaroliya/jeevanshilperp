@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { GraduationCap, Check, BookOpen, Calendar, Award, AlertCircle } from 'lucide-react';
-import { collection, addDoc, getDocs, query, where, doc, setDoc } from 'firebase/firestore';
+import { collection, getDocs, query, where, doc, setDoc } from 'firebase/firestore';
 import { db } from '../../firebase';
 import SchoolFolderPicker from '../common/SchoolFolderPicker';
 
@@ -9,6 +9,9 @@ const normalizeSectionQuery = (sec) => {
   return sec.replace(/^Section\s+/i, '').trim();
 };
 
+const DEFAULT_SUBJECTS = ['Mathematics', 'Science', 'English', 'Social Science', 'Hindi', 'Computer'];
+const EXAM_TYPES = ['Quarterly', 'Half Yearly', 'Final Exam'];
+
 export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2', 'Class 3', 'Class 4', 'Class 5', 'Class 6', 'Class 7', 'Class 8', 'Class 9', 'Class 10'], globalSections = ['Section A', 'Section B', 'Section C'], currentUser, userPermissions, selectedSchool, setSelectedSchool, activeAcademicYearId = 'AY_2026_27' }) {
   const [activeTab, setActiveTab] = useState('attendance'); // 'attendance' | 'marks'
   const [selectedClass, setSelectedClass] = useState(globalClasses[0] || 'Class 1');
@@ -16,7 +19,7 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
   const [attendanceDate, setAttendanceDate] = useState(new Date().toISOString().split('T')[0]);
   const [assignments, setAssignments] = useState([]);
 
-  const [selectedSubject, setSelectedSubject] = useState('Mathematics');
+  const [selectedSubject, setSelectedSubject] = useState('');
   const [selectedExam, setSelectedExam] = useState('Quarterly');
 
   const [classStudents, setClassStudents] = useState([]);
@@ -25,10 +28,53 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
   const [isSavingAttendance, setIsSavingAttendance] = useState(false);
   const [isSavingMarks, setIsSavingMarks] = useState(false);
 
-  const subjects = ['Mathematics', 'Science', 'English', 'Social Science', 'Hindi', 'Computer'];
-  const exams = ['Quarterly', 'Half Yearly', 'Final Exam'];
+  // Dynamic subjects loaded from Firestore; fallback to DEFAULT_SUBJECTS for display only
+  const [firestoreSubjects, setFirestoreSubjects] = useState([]);
+  const [isLoadingSubjects, setIsLoadingSubjects] = useState(false);
 
-  // Reset class and section selections cleanly on school switch
+  // Derived: subjects to show in UI — Firestore first, then defaults (NEVER written to DB)
+  const availableSubjects = firestoreSubjects.length > 0
+    ? firestoreSubjects.map(s => s.name)
+    : DEFAULT_SUBJECTS;
+
+  // ── Load Firestore subjects for this school/class ──────────────────────────
+  useEffect(() => {
+    const loadSubjects = async () => {
+      const targetSchool = (selectedSchool && selectedSchool !== 'ALL') ? selectedSchool : currentUser?.schoolId;
+      if (!targetSchool) return;
+      setIsLoadingSubjects(true);
+      try {
+        // Fetch subjects matching school; filter for this class or ALL in JS to avoid composite index
+        const snap = await getDocs(query(collection(db, 'subjects'), where('schoolId', '==', targetSchool)));
+        const list = [];
+        snap.forEach(d => {
+          const data = d.data();
+          if (!data.isActive && data.status !== 'active' && data.isActive !== undefined) return;
+          // Include if applicable to ALL classes or this specific class
+          if (!data.class || data.class === 'ALL' || data.class === selectedClass) {
+            list.push({ id: d.id, ...data });
+          }
+        });
+        list.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+        setFirestoreSubjects(list);
+      } catch (err) {
+        console.warn('Could not load subjects from Firestore, using defaults:', err.message);
+        setFirestoreSubjects([]);
+      } finally {
+        setIsLoadingSubjects(false);
+      }
+    };
+    loadSubjects();
+  }, [selectedSchool, selectedClass, currentUser?.schoolId]);
+
+  // When availableSubjects change, make sure selectedSubject is valid
+  useEffect(() => {
+    if (availableSubjects.length > 0 && !availableSubjects.includes(selectedSubject)) {
+      setSelectedSubject(availableSubjects[0]);
+    }
+  }, [availableSubjects]);
+
+  // ── Reset class/section on school switch ─────────────────────────────────
   useEffect(() => {
     if (globalClasses && globalClasses.length > 0) {
       setSelectedClass(globalClasses[0]);
@@ -38,14 +84,14 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
     }
   }, [selectedSchool]);
 
+  // ── Load assignments ──────────────────────────────────────────────────────
   useEffect(() => {
     const fetchAssignments = async () => {
       try {
-        let q = query(collection(db, "class_assignments"));
         const targetSchool = (selectedSchool && selectedSchool !== 'ALL') ? selectedSchool : currentUser?.schoolId;
-        if (targetSchool) {
-          q = query(collection(db, "class_assignments"), where("schoolId", "==", targetSchool));
-        }
+        const q = targetSchool
+          ? query(collection(db, 'class_assignments'), where('schoolId', '==', targetSchool))
+          : query(collection(db, 'class_assignments'));
         const querySnapshot = await getDocs(q);
         const assigns = [];
         querySnapshot.forEach((doc) => {
@@ -53,29 +99,35 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
         });
         setAssignments(assigns);
       } catch (err) {
-        console.error("Error fetching assignments:", err);
+        console.error('Error fetching assignments:', err);
       }
     };
     fetchAssignments();
   }, [selectedSchool, currentUser]);
 
-
+  // ── Load students; CLEAR stale attendance/marks on context switch ──────────
   useEffect(() => {
+    // IMPORTANT: clear maps immediately to prevent stale data leaking across contexts
+    setAttendanceMap({});
+    setMarksMap({});
+    setClassStudents([]);
+
     const fetchClassStudents = async () => {
       try {
         const targetSchool = (selectedSchool && selectedSchool !== 'ALL') ? selectedSchool : currentUser?.schoolId;
-        
+        const normSec = normalizeSectionQuery(selectedSection);
+
         let q = query(
-          collection(db, "students"),
-          where("class", "==", selectedClass),
-          where("section", "==", normalizeSectionQuery(selectedSection))
+          collection(db, 'students'),
+          where('class', '==', selectedClass),
+          where('section', '==', normSec)
         );
         if (targetSchool) {
           q = query(
-            collection(db, "students"),
-            where("class", "==", selectedClass),
-            where("section", "==", normalizeSectionQuery(selectedSection)),
-            where("schoolId", "==", targetSchool)
+            collection(db, 'students'),
+            where('class', '==', selectedClass),
+            where('section', '==', normSec),
+            where('schoolId', '==', targetSchool)
           );
         }
         const querySnapshot = await getDocs(q);
@@ -83,33 +135,33 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
         const initialAtt = {};
         const initialMarks = {};
 
-        querySnapshot.forEach((doc) => {
-          const data = doc.data();
+        querySnapshot.forEach((d) => {
+          const data = d.data();
           if (data.status === 'Deleted' || data.status === 'archived' || data.isDeleted === true) return;
-          list.push({ id: doc.id, ...data });
-          initialAtt[doc.id] = 'P';
-          initialMarks[doc.id] = 75;
+          list.push({ id: d.id, ...data });
+          initialAtt[d.id] = 'P';
+          initialMarks[d.id] = '';
         });
 
         setClassStudents(list);
         setAttendanceMap(initialAtt);
         setMarksMap(initialMarks);
       } catch (err) {
-        console.error("Error fetching students for academics:", err);
+        console.error('Error fetching students for academics:', err);
       }
     };
     fetchClassStudents();
   }, [selectedClass, selectedSection, selectedSchool]);
 
-  // If ALL schools are selected, force user to pick a school first
+  // ── ALL guard ─────────────────────────────────────────────────────────────
   if (selectedSchool === 'ALL') {
     return (
       <div style={{ padding: 24 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 24 }}>
           <h1 style={{ fontSize: 24, fontWeight: 800, margin: 0 }}>Academics & Activities</h1>
         </div>
-        <SchoolFolderPicker 
-          title="Select Branch for Academics" 
+        <SchoolFolderPicker
+          title="Select Branch for Academics"
           description="Please select a specific school branch to manage attendance, grades, and activities."
           onSelectSchool={(schoolId) => setSelectedSchool && setSelectedSchool(schoolId)}
         />
@@ -117,32 +169,40 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
     );
   }
 
+  // ── Authorization ─────────────────────────────────────────────────────────
   const isAttendanceAllowed = () => {
     if (!currentUser) return false;
-    // Admins, Principals, Owners, Directors can bypass
-    if (currentUser.role === 'Administrator' || currentUser.role === 'Principal' || currentUser.role === 'Owner' || currentUser.role === 'Director') return true;
-    
-    // Check if the current user is assigned to this class and section
+    const role = currentUser.role;
+    if (role === 'Administrator' || role === 'Principal' || role === 'Owner' || role === 'Director') return true;
+
+    // Canonical Auth UID is the primary identity; staff doc id is secondary fallback
+    const myUid = currentUser.uid;
+    const myDocId = currentUser.id;
     const currentYear = activeAcademicYearId || 'AY_2026_27';
     const normSelectedSec = normalizeSectionQuery(selectedSection);
-    const targetSchool = (selectedSchool && selectedSchool !== 'ALL') ? selectedSchool : (currentUser?.schoolId || 'SCH_01');
+    const targetSchool = (selectedSchool && selectedSchool !== 'ALL') ? selectedSchool : (currentUser?.schoolId || '');
 
-    const assigned = assignments.find(a => 
-      a.class === selectedClass && 
+    const assigned = assignments.find(a =>
+      a.class === selectedClass &&
       (!a.section || a.section === 'All' || normalizeSectionQuery(a.section) === normSelectedSec) &&
       (!a.schoolId || a.schoolId === targetSchool) &&
       (!a.academicYearId || a.academicYearId === currentYear || a.academicYearId === 'AY_2025_26')
     );
-    return assigned && (assigned.teacherId === currentUser.id || assigned.teacherId === currentUser.uid);
+    if (!assigned) return false;
+
+    // Check against both uid (canonical) and id (legacy) to handle both storage formats
+    const tid = assigned.teacherId;
+    const tuid = assigned.teacherUid;
+    return (myUid && (tid === myUid || tuid === myUid)) ||
+           (myDocId && (tid === myDocId || tuid === myDocId));
   };
-  
+
   const canMark = isAttendanceAllowed();
 
+  // ── Attendance handlers ───────────────────────────────────────────────────
   const handleMarkAll = (status) => {
     const updated = {};
-    classStudents.forEach(s => {
-      updated[s.id] = status;
-    });
+    classStudents.forEach(s => { updated[s.id] = status; });
     setAttendanceMap(updated);
   };
 
@@ -153,14 +213,15 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
   const handleSaveAttendanceBatch = async () => {
     setIsSavingAttendance(true);
     try {
-      const targetSchool = (selectedSchool && selectedSchool !== 'ALL') ? selectedSchool : (currentUser?.schoolId || 'SCH_01');
+      const targetSchool = (selectedSchool && selectedSchool !== 'ALL') ? selectedSchool : (currentUser?.schoolId || '');
       const academicYearId = activeAcademicYearId || 'AY_2026_27';
       const normSec = normalizeSectionQuery(selectedSection);
-      
+      const savedBy = currentUser?.uid || currentUser?.id || 'unknown';
+
       const savePromises = classStudents.map(student => {
         const status = attendanceMap[student.id] || 'P';
         const attendanceId = `${targetSchool}_${academicYearId}_${selectedClass}_${normSec || selectedSection}_${student.id}_${attendanceDate}`;
-        return setDoc(doc(db, "attendance_logs", attendanceId), {
+        return setDoc(doc(db, 'attendance_logs', attendanceId), {
           academicYearId,
           schoolId: targetSchool,
           class: selectedClass,
@@ -168,34 +229,37 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
           normalizedSection: normSec,
           studentId: student.id,
           date: attendanceDate,
-          status: status,
-          savedBy: currentUser?.id || currentUser?.uid || 'unknown',
+          status,
+          savedBy,
           createdAt: new Date().toISOString()
         });
       });
-      
+
       await Promise.all(savePromises);
       alert(`Attendance saved for ${selectedClass} (${selectedSection}) on ${attendanceDate}!`);
     } catch (err) {
-      console.error("Error saving attendance:", err);
-      alert("Failed to save attendance.");
+      console.error('Error saving attendance:', err);
+      alert('Failed to save attendance. Check Firestore rules / network.');
     } finally {
       setIsSavingAttendance(false);
     }
   };
 
+  // ── Marks handlers ────────────────────────────────────────────────────────
   const handleSaveSubjectMarksBatch = async () => {
+    if (!selectedSubject) { alert('Please select a subject first.'); return; }
     setIsSavingMarks(true);
     try {
-      const targetSchool = (selectedSchool && selectedSchool !== 'ALL') ? selectedSchool : (currentUser?.schoolId || 'SCH_01');
+      const targetSchool = (selectedSchool && selectedSchool !== 'ALL') ? selectedSchool : (currentUser?.schoolId || '');
       const academicYearId = activeAcademicYearId || 'AY_2026_27';
-      
+      const savedBy = currentUser?.uid || currentUser?.id || 'unknown';
+
       const savePromises = classStudents.map(student => {
         const score = marksMap[student.id];
-        if (score === undefined || score === '') return Promise.resolve(); // Skip empty
-        
+        if (score === undefined || score === '') return Promise.resolve(); // Skip blank
+
         const marksId = `${targetSchool}_${academicYearId}_${selectedClass}_${selectedSection}_${student.id}_${selectedExam}_${selectedSubject}`;
-        return setDoc(doc(db, "exam_marks", marksId), {
+        return setDoc(doc(db, 'exam_marks', marksId), {
           academicYearId,
           schoolId: targetSchool,
           class: selectedClass,
@@ -203,29 +267,30 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
           studentId: student.id,
           subject: selectedSubject,
           exam: selectedExam,
-          marks: score,
+          marks: Number(score),
           maxMarks: 100,
-          savedBy: currentUser?.id || currentUser?.uid || 'unknown',
+          savedBy,
           createdAt: new Date().toISOString()
         });
       });
-      
+
       await Promise.all(savePromises);
       alert(`Marks saved for ${selectedSubject} (${selectedExam})!`);
     } catch (err) {
-      console.error("Error saving marks:", err);
-      alert("Failed to save subject marks.");
+      console.error('Error saving marks:', err);
+      alert('Failed to save subject marks. Check Firestore rules / network.');
     } finally {
       setIsSavingMarks(false);
     }
   };
 
   const validScores = Object.values(marksMap)
-    .filter(v => v !== 'A' && v !== 'Absent' && v !== '' && !isNaN(Number(v)))
+    .filter(v => v !== '' && !isNaN(Number(v)))
     .map(v => Number(v));
   const avgScore = validScores.length > 0 ? Math.round(validScores.reduce((a, b) => a + b, 0) / validScores.length) : 0;
   const topScore = validScores.length > 0 ? Math.max(...validScores) : 0;
 
+  // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
       {/* Header Controls */}
@@ -336,7 +401,9 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
                           <td style={{ fontWeight: 600 }}>{student.name}</td>
                           <td style={{ textAlign: 'center' }}>
                             <div style={{ display: 'inline-flex', gap: 8 }}>
+                              {[{ key: 'P', label: 'Present', color: '#10b981' }, { key: 'A', label: 'Absent', color: '#ef4444' }, { key: 'L', label: 'Late', color: '#f59e0b' }].map(({ key, label, color }) => (
                                 <button
+                                  key={key}
                                   type="button"
                                   style={{
                                     padding: '8px 16px',
@@ -345,48 +412,16 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
                                     fontWeight: 700,
                                     cursor: canMark ? 'pointer' : 'not-allowed',
                                     opacity: canMark ? 1 : 0.6,
-                                    backgroundColor: currentStatus === 'P' ? '#10b981' : 'var(--bg-secondary)',
-                                    color: currentStatus === 'P' ? '#fff' : 'var(--text-secondary)'
+                                    backgroundColor: currentStatus === key ? color : 'var(--bg-secondary)',
+                                    color: currentStatus === key ? '#fff' : 'var(--text-secondary)',
+                                    transition: 'background 0.15s'
                                   }}
-                                  onClick={() => canMark && handleStatusChange(student.id, 'P')}
+                                  onClick={() => canMark && handleStatusChange(student.id, key)}
                                   disabled={!canMark}
                                 >
-                                  Present
+                                  {label}
                                 </button>
-                                <button
-                                  type="button"
-                                  style={{
-                                    padding: '8px 16px',
-                                    borderRadius: 8,
-                                    border: 'none',
-                                    fontWeight: 700,
-                                    cursor: canMark ? 'pointer' : 'not-allowed',
-                                    opacity: canMark ? 1 : 0.6,
-                                    backgroundColor: currentStatus === 'A' ? '#ef4444' : 'var(--bg-secondary)',
-                                    color: currentStatus === 'A' ? '#fff' : 'var(--text-secondary)'
-                                  }}
-                                  onClick={() => canMark && handleStatusChange(student.id, 'A')}
-                                  disabled={!canMark}
-                                >
-                                  Absent
-                                </button>
-                                <button
-                                  type="button"
-                                  style={{
-                                    padding: '8px 16px',
-                                    borderRadius: 8,
-                                    border: 'none',
-                                    fontWeight: 700,
-                                    cursor: canMark ? 'pointer' : 'not-allowed',
-                                    opacity: canMark ? 1 : 0.6,
-                                    backgroundColor: currentStatus === 'L' ? '#f59e0b' : 'var(--bg-secondary)',
-                                    color: currentStatus === 'L' ? '#fff' : 'var(--text-secondary)'
-                                  }}
-                                  onClick={() => canMark && handleStatusChange(student.id, 'L')}
-                                  disabled={!canMark}
-                                >
-                                  Late
-                                </button>
+                              ))}
                             </div>
                           </td>
                         </tr>
@@ -418,15 +453,23 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
                 </select>
               </div>
               <div>
-                <label className="form-label" style={{ fontWeight: 700 }}>Subject</label>
+                <label className="form-label" style={{ fontWeight: 700 }}>Subject {isLoadingSubjects && <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>loading...</span>}</label>
                 <select className="form-input" value={selectedSubject} onChange={e => setSelectedSubject(e.target.value)}>
-                  {subjects.map(subj => <option key={subj} value={subj}>{subj}</option>)}
+                  {firestoreSubjects.length === 0 && (
+                    <option value="" disabled>— Default subjects (no custom configured) —</option>
+                  )}
+                  {availableSubjects.map(subj => <option key={subj} value={subj}>{subj}</option>)}
                 </select>
+                {firestoreSubjects.length === 0 && (
+                  <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 4 }}>
+                    ℹ️ Using built-in defaults. Add custom subjects in Settings → Subject Management.
+                  </div>
+                )}
               </div>
               <div>
                 <label className="form-label" style={{ fontWeight: 700 }}>Exam Type</label>
                 <select className="form-input" value={selectedExam} onChange={e => setSelectedExam(e.target.value)}>
-                  {exams.map(ex => <option key={ex} value={ex}>{ex}</option>)}
+                  {EXAM_TYPES.map(ex => <option key={ex} value={ex}>{ex}</option>)}
                 </select>
               </div>
             </div>
@@ -451,13 +494,13 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
           <div className="glass-card" style={{ padding: 20 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
               <h2 style={{ fontSize: 16, fontWeight: 700, margin: 0 }}>
-                {selectedSubject} Gradebook ({selectedExam}) - {selectedClass} {selectedSection}
+                {selectedSubject || '—'} Gradebook ({selectedExam}) — {selectedClass} {selectedSection}
               </h2>
               <button
                 className="btn-primary"
                 onClick={handleSaveSubjectMarksBatch}
-                disabled={isSavingMarks || selectedSchool === 'ALL'}
-                style={{ opacity: (isSavingMarks || selectedSchool === 'ALL') ? 0.5 : 1, cursor: (isSavingMarks || selectedSchool === 'ALL') ? 'not-allowed' : 'pointer' }}
+                disabled={isSavingMarks || selectedSchool === 'ALL' || !selectedSubject}
+                style={{ opacity: (isSavingMarks || selectedSchool === 'ALL' || !selectedSubject) ? 0.5 : 1, cursor: (isSavingMarks || selectedSchool === 'ALL' || !selectedSubject) ? 'not-allowed' : 'pointer' }}
               >
                 <Check size={18} /> {isSavingMarks ? 'Saving...' : 'Save'}
               </button>
@@ -481,10 +524,10 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
                   </thead>
                   <tbody>
                     {classStudents.map(student => {
-                      const score = Number(marksMap[student.id] || 0);
-                      const isPass = score >= 35;
-                      const pct = score; // Assuming out of 100
-                      const grade = pct >= 90 ? 'A+' : pct >= 80 ? 'A' : pct >= 70 ? 'B+' : pct >= 60 ? 'B' : pct >= 50 ? 'C' : pct >= 33 ? 'D' : 'F';
+                      const raw = marksMap[student.id];
+                      const score = raw === '' || raw === undefined ? null : Number(raw);
+                      const isPass = score !== null && score >= 35;
+                      const grade = score === null ? '—' : score >= 90 ? 'A+' : score >= 80 ? 'A' : score >= 70 ? 'B+' : score >= 60 ? 'B' : score >= 50 ? 'C' : score >= 33 ? 'D' : 'F';
 
                       return (
                         <tr key={student.id}>
@@ -498,7 +541,8 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
                               max="100"
                               className="form-input"
                               style={{ width: 100, fontWeight: 700, textAlign: 'center' }}
-                              value={marksMap[student.id] !== undefined ? marksMap[student.id] : 75}
+                              value={marksMap[student.id] !== undefined ? marksMap[student.id] : ''}
+                              placeholder="—"
                               onChange={e => {
                                 const val = e.target.value;
                                 setMarksMap(prev => ({ ...prev, [student.id]: val }));
@@ -506,12 +550,18 @@ export default function AcademicsModule({ globalClasses = ['Class 1', 'Class 2',
                             />
                           </td>
                           <td style={{ textAlign: 'right' }}>
-                            <span className="badge" style={{ backgroundColor: isPass ? 'rgba(16, 185, 129, 0.1)' : 'rgba(239, 68, 68, 0.1)', color: isPass ? 'var(--success)' : 'var(--danger)', fontWeight: 700, marginRight: 8 }}>
-                              {isPass ? 'PASS' : 'FAIL'}
-                            </span>
-                            <span className="badge" style={{ backgroundColor: 'rgba(59, 130, 246, 0.1)', color: 'var(--brand-blue)', fontWeight: 700 }}>
-                              {grade}
-                            </span>
+                            {score !== null ? (
+                              <>
+                                <span className="badge" style={{ backgroundColor: isPass ? 'rgba(16, 185, 129, 0.1)' : 'rgba(239, 68, 68, 0.1)', color: isPass ? 'var(--success)' : 'var(--danger)', fontWeight: 700, marginRight: 8 }}>
+                                  {isPass ? 'PASS' : 'FAIL'}
+                                </span>
+                                <span className="badge" style={{ backgroundColor: 'rgba(59, 130, 246, 0.1)', color: 'var(--brand-blue)', fontWeight: 700 }}>
+                                  {grade}
+                                </span>
+                              </>
+                            ) : (
+                              <span style={{ color: 'var(--text-secondary)', fontSize: 13 }}>Not entered</span>
+                            )}
                           </td>
                         </tr>
                       );

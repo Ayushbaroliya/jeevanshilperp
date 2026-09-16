@@ -12,14 +12,44 @@ This file is the **single source of truth** for the project's state. Update this
 
 ---
 
-## 🔁 Last Iteration — Session 7 (2026-09-05)
+## 🔁 Last Iteration — Session 8 (2026-09-12)
 
 ### ✅ Changes Made This Session
 
-#### 1. Fee Waiver Reason in Student Transaction History
+#### 1. Father's Name Input in Student Registration Form
 - **File**: `src/components/students/StudentsModule.jsx`
-- **What**: `StudentLedger` now fetches `fee_adjustments` (approved waivers) and appends them to `paymentHistory`, showing the stored `reason` field. If reason is empty, displays `"Reason not recorded"`.
-- **Waiver rows** appear in the payment history table as: `Fee Waiver (reason text)` with status `Approved`.
+- **What**: Added `Father's Name / पिता का नाम` input field to the Add Student registration form (`isAddingStudent`), binding to existing `fatherName` state and saving directly into both `students` and `enrollments` Firestore collections.
+- Remains fully editable in the student edit modal.
+
+#### 2. Classwise Student Directory Excel Export
+- **File**: `src/components/students/StudentsModule.jsx`
+- **What**:
+  - **Selected Class View**: Added "Export [Class] to Excel" button exporting that specific class roster.
+  - **All Classes View**: Added "Export All Classes (Excel)" button exporting a single workbook with a separate worksheet tab for each class, plus an "All Students Summary" tab.
+  - Columns: S.No., Roll No., Student Name, Father's Name, Class, Section, Contact, Admission Type, Attendance, and Live Due (₹).
+
+#### 3. Classwise Finance Dues Excel Export
+- **File**: `src/components/finance/FinanceModule.jsx`
+- **What**:
+  - Enhanced `ClasswiseDueFeesReport` to include `fatherName` and `roll` in dues state and display them under student names.
+  - When a class is selected, exports that specific class's due fees.
+  - When "All Classes" is selected, exports a multi-tab Excel workbook with a separate worksheet for each class, plus an "All Dues Summary" tab.
+#### 4. Date-Wise Receipt Filtering & Collection Totals
+- **File**: `src/components/finance/FinanceModule.jsx`
+- **What**:
+  - Implemented 5 date filter modes in `InvoicesModule` (Receipt History): Today, Yesterday, Custom Date, Date Range, and All Dates.
+  - Added daily & range totals calculation and summary cards: Total Receipts, Total Collected, Cash, Online/UPI, and Other Methods.
+  - Added date-range summary footer at the bottom of the table.
+  - Enriched invoice display with Father's Name, Section, Roll No., Payment Method badge, dynamic fee allocations, and school branch.
+  - Future-proof generic allocation model: zero hardcoded fee categories (compatible with future transport payments).
+
+---
+
+## 📋 Previous Sessions Summary
+
+### Session 7 (2026-09-05)
+- Fee Waiver Reason in Student Transaction History (`StudentsModule.jsx`)
+- Add Teacher / Add Staff Button in Staff & Salary Module (`StaffSalaryModule.jsx`)
 
 #### 2. Add Teacher / Add Staff Button in Staff & Salary Module
 - **Files**: `src/components/staff/StaffSalaryModule.jsx`, `src/App.jsx`

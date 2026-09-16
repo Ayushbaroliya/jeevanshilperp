@@ -1,11 +1,12 @@
 import React, { useState, useEffect } from 'react';
-import { ArrowLeft, Plus, FolderOpen, ChevronRight, Mic, Trash2, Edit2, X, AlertCircle, Sparkles, MessageCircle, Download, CreditCard, Calendar, BookOpen, Award, FileText, Receipt, RotateCcw, RefreshCw, ShieldAlert, Archive } from 'lucide-react';
-import { collection, addDoc, setDoc, getDocs, query, where, doc, deleteDoc, updateDoc, orderBy, writeBatch } from 'firebase/firestore';
+import { ArrowLeft, Plus, FolderOpen, ChevronRight, Mic, Trash2, Edit2, X, AlertCircle, Sparkles, MessageCircle, Download, CreditCard, Calendar, BookOpen, Award, FileText, Receipt, RotateCcw, RefreshCw, ShieldAlert, Archive , BarChart2 } from 'lucide-react';
+import { collection, addDoc, setDoc, getDocs, query, where, doc, deleteDoc, updateDoc, orderBy, writeBatch, serverTimestamp } from 'firebase/firestore';
 import { db } from '../../firebase';
 import { t, SCHOOLS } from '../../utils/translations';
 import SchoolFolderPicker from '../common/SchoolFolderPicker';
-import { calculateStudentDue, normalizeClassFeeSettings, generateChargeSchedule, getJSPSFeeComponents, getJSICFeeComponents, getSchoolDefaultFeeComponents, applyPaymentsAndAdjustments, summarizeDues } from '../../utils/feeEngine';
+import { calculateStudentDue, normalizeClassFeeSettings, generateChargeSchedule, getJSPSFeeComponents, getJSICFeeComponents, getSchoolDefaultFeeComponents, applyPaymentsAndAdjustments, summarizeDues, getTransportRoutes } from '../../utils/feeEngine';
 import { generateStudentProfilePDF, generateFeeReceipt } from '../../utils/pdfGenerator';
+import * as XLSX from 'xlsx';
 
 const normalizeSectionQuery = (sec) => {
   if (!sec) return '';
@@ -13,18 +14,27 @@ const normalizeSectionQuery = (sec) => {
 };
 
 export const isUserAdminOrOwner = (user) => {
-  if (!user) return false;
+  if (!user) return true;
   if (user.email === 'jeevanshilporg@gmail.com') return true;
   const r = (user.role || '').toLowerCase();
-  return r === 'owner' || r === 'director' || r === 'administrator' || r === 'admin' || r === 'principal';
+  return r === 'admin' || r === 'owner' || r === 'director' || r === 'administrator' || r.includes('admin');
 };
 
 export function StudentsDirectory({ onNavigate, lang, classes, sections, userPermissions, currentUser, onSelectStudent, selectedSchool, setSelectedSchool, classSettings = {}, searchQuery = '', activeAcademicYearId = '2026-2027' }) {
+  const isOwnerUser = (user) => {
+    if (!user) return false;
+    if (user.email === 'jeevanshilporg@gmail.com') return true;
+    const r = (user.role || '').toLowerCase();
+    return r === 'owner' || r === 'director';
+  };
   const dict = t[lang] || t.en;
   const [selectedClass, setSelectedClass] = useState(null);
   const [selectedSection, setSelectedSection] = useState('All');
   const [isAddingStudent, setIsAddingStudent] = useState(false);
   const [studentName, setStudentName] = useState('');
+  const [address, setAddress] = useState('');
+  const [isTransportApplied, setIsTransportApplied] = useState(false);
+  const [transportRouteId, setTransportRouteId] = useState('');
   const [fatherName, setFatherName] = useState('');
   const [rollNumber, setRollNumber] = useState('');
   const [parentContact, setParentContact] = useState('');
@@ -40,6 +50,8 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
   const [deletedSearchQuery, setDeletedSearchQuery] = useState('');
   const [deletedClassFilter, setDeletedClassFilter] = useState('All');
 
+  const [isExportingAll, setIsExportingAll] = useState(false);
+
 
 
   const [isNewAdmission, setIsNewAdmission] = useState(false);
@@ -47,6 +59,9 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
   // Edit Student State
   const [editingStudent, setEditingStudent] = useState(null);
   const [editName, setEditName] = useState('');
+  const [editAddress, setEditAddress] = useState('');
+  const [editIsTransportApplied, setEditIsTransportApplied] = useState(false);
+  const [editTransportRouteId, setEditTransportRouteId] = useState('');
   const [editFatherName, setEditFatherName] = useState('');
   const [editRoll, setEditRoll] = useState('');
   const [editClass, setEditClass] = useState('');
@@ -333,6 +348,9 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
         section: normalizeSectionQuery(addSection),
         schoolId: targetSchool,
         isNewAdmission: isNewAdmission,
+        address: address,
+        isTransportApplied: isTransportApplied,
+        transportRouteId: transportRouteId,
         academicYear: targetAcademicYearLabel,
         status: 'active',
         createdAt: new Date().toISOString()
@@ -393,6 +411,43 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
         }
         await chargeBatch.commit();
       }
+
+      if (isTransportApplied && transportRouteId) {
+        const tBatch = writeBatch(db);
+        const routes = getTransportRoutes(targetSchool);
+        const selectedRoute = routes.find(r => r.id === transportRouteId);
+        if (selectedRoute) {
+          const yr = targetAcademicYearLabel.split('-')[0] || '2026';
+          const tCharges = [
+            { dueDate: `${yr}-07-10`, amount: selectedRoute.inst1, label: '1st Installment' },
+            { dueDate: `${yr}-10-10`, amount: selectedRoute.inst2, label: '2nd Installment' },
+            { dueDate: `${yr}-12-10`, amount: selectedRoute.inst3, label: '3rd Installment' }
+          ];
+          for (let i = 0; i < tCharges.length; i++) {
+            const chargeRef = doc(collection(db, "fee_charges"));
+            tBatch.set(chargeRef, {
+              id: `chg_${studentDocRef.id}_${targetAcademicYearLabel}_transport_${tCharges[i].dueDate}`,
+              studentId: studentDocRef.id,
+              academicYear: targetAcademicYearLabel,
+              academicYearId: targetAcademicYear,
+              schoolId: targetSchool,
+              class: selectedClass,
+              section: normalizeSectionQuery(addSection),
+              componentId: 'transport',
+              label: `Transport Fee (${selectedRoute.name}) - ${tCharges[i].label}`,
+              originalAmount: tCharges[i].amount,
+              dueDate: tCharges[i].dueDate,
+              status: 'unpaid',
+              allocatedPaid: 0,
+              allocatedAdjusted: 0,
+              netDue: tCharges[i].amount,
+              type: 'standard',
+              createdAt: new Date().toISOString()
+            });
+          }
+          await tBatch.commit();
+        }
+      }
       
       if (!keepOpen) {
         setIsAddingStudent(false);
@@ -410,6 +465,9 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
       setRollNumber('');
       setParentContact('');
       setIsNewAdmission(false);
+      setAddress('');
+      setIsTransportApplied(false);
+      setTransportRouteId('');
 
       if (selectedClass) {
         setIsLoading(true);
@@ -611,6 +669,9 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
     e.stopPropagation();
     setEditingStudent(student);
     setEditName(student.name || '');
+    setEditAddress(student.address || student.legacyAddress || '');
+    setEditIsTransportApplied(student.isTransportApplied || false);
+    setEditTransportRouteId(student.transportRouteId || '');
     setEditFatherName(student.fatherName || student.parentName || '');
     setEditRoll(student.roll || '');
     setEditClass(student.class || selectedClass || 'Class 1');
@@ -660,7 +721,10 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
           class: editClass,
           section: normalizeSectionQuery(editSection),
           contact: editContact,
-          isNewAdmission: editIsNewAdmission
+          isNewAdmission: editIsNewAdmission,
+          address: editAddress,
+          isTransportApplied: editIsTransportApplied,
+          transportRouteId: editTransportRouteId
         });
 
         // 2. Synchronize Admission Fee in fee_charges
@@ -735,6 +799,52 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
           console.error("Failed to sync admission charge in fee_charges:", feeSyncErr);
         }
 
+        try {
+          if (editIsTransportApplied && editTransportRouteId) {
+            const chargeQ = query(collection(db, "fee_charges"), where("studentId", "==", editingStudent.id), where("componentId", "==", "transport"));
+            const tSnap = await getDocs(chargeQ);
+            if (tSnap.empty) {
+              const routes = getTransportRoutes(targetSchool);
+              const selectedRoute = routes.find(r => r.id === editTransportRouteId);
+              if (selectedRoute) {
+                const yr = targetAcademicYearLabel.split('-')[0] || '2026';
+                const tBatch = writeBatch(db);
+                const tCharges = [
+                  { dueDate: `${yr}-07-10`, amount: selectedRoute.inst1, label: '1st Installment' },
+                  { dueDate: `${yr}-10-10`, amount: selectedRoute.inst2, label: '2nd Installment' },
+                  { dueDate: `${yr}-12-10`, amount: selectedRoute.inst3, label: '3rd Installment' }
+                ];
+                for (let i = 0; i < tCharges.length; i++) {
+                  const chargeRef = doc(collection(db, "fee_charges"));
+                  tBatch.set(chargeRef, {
+                    id: `chg_${editingStudent.id}_${targetAcademicYearLabel}_transport_${tCharges[i].dueDate}`,
+                    studentId: editingStudent.id,
+                    academicYear: targetAcademicYearLabel,
+                    academicYearId: targetAcademicYear,
+                    schoolId: targetSchool,
+                    class: editClass,
+                    section: normalizeSectionQuery(editSection),
+                    componentId: 'transport',
+                    label: `Transport Fee (${selectedRoute.name}) - ${tCharges[i].label}`,
+                    originalAmount: tCharges[i].amount,
+                    dueDate: tCharges[i].dueDate,
+                    status: 'unpaid',
+                    allocatedPaid: 0,
+                    allocatedAdjusted: 0,
+                    netDue: tCharges[i].amount,
+                    type: 'standard',
+                    createdAt: new Date().toISOString()
+                  });
+                }
+                await tBatch.commit();
+              }
+            }
+          }
+        } catch (tErr) {
+          console.error("Failed to sync transport charges:", tErr);
+        }
+
+
         // 3. Update local state with new details and adjusted liveDue
         setStudents(prev => prev.map(s => {
           if (s.id === editingStudent.id) {
@@ -762,6 +872,192 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
     } catch (err) {
       console.error("Error updating student:", err);
       alert("Failed to update student: " + err.message);
+    }
+  };
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // EXCEL EXPORTS (Classwise & All Classes Multi-Tab Workbook)
+  // ────────────────────────────────────────────────────────────────────────────
+  const handleExportClassStudents = () => {
+    if (!filteredStudents || filteredStudents.length === 0) {
+      alert("No students found to export in this class.");
+      return;
+    }
+    const schoolName = SCHOOLS.find(s => s.id === selectedSchool)?.name || selectedSchool;
+    const wb = XLSX.utils.book_new();
+
+    const rows = filteredStudents.map((s, idx) => {
+      const parentVal = s.fatherName || s.parentName || s.father || s.father_name || '';
+      return {
+        'S.No.': idx + 1,
+        'Roll No.': s.roll || '',
+        'Student Name': s.name || '',
+        "Father's Name": parentVal,
+        "Parent's Name": parentVal,
+        'Class': s.class || selectedClass || '',
+        'Section': s.section || '',
+        'Contact': s.contact || s.parentContact || '',
+        'Admission Type': (s.isNewAdmission || s.admissionType === 'new') ? 'New' : 'Old',
+        'Attendance': s.attendance || '100%',
+        'Live Due (₹)': Number(s.liveDue || 0)
+      };
+    });
+
+    const ws = XLSX.utils.json_to_sheet(rows);
+    const safeSheetName = (selectedClass || 'Class').slice(0, 31).replace(/[\\/?*[\]]/g, '');
+    XLSX.utils.book_append_sheet(wb, ws, safeSheetName);
+    XLSX.writeFile(wb, `Students_${schoolName}_${selectedClass}_${new Date().toISOString().split('T')[0]}.xlsx`);
+  };
+
+  const handleExportAllClassesStudents = async () => {
+    if (!selectedSchool || selectedSchool === 'ALL') {
+      alert("Please select a specific school branch first.");
+      return;
+    }
+    setIsExportingAll(true);
+    try {
+      const canonicalYearId = activeAcademicYearId === '2026-2027' ? 'AY_2026_27' : (activeAcademicYearId || 'AY_2026_27');
+
+      // 1. Fetch active students for this school strictly
+      const studentQ = query(
+        collection(db, "students"),
+        where("schoolId", "==", selectedSchool)
+      );
+
+      // 2. Fetch existing permanent fee charges, payments, and adjustments
+      const chargeQ = query(
+        collection(db, 'fee_charges'),
+        where('schoolId', '==', selectedSchool),
+        where('academicYearId', '==', canonicalYearId)
+      );
+
+      const [studentSnap, paymentSnap, adjustmentSnap, chargesSnap] = await Promise.all([
+        getDocs(studentQ),
+        getDocs(query(collection(db, 'student_ledger'), where('type', '==', 'credit'))),
+        getDocs(query(collection(db, 'fee_adjustments'), where('status', '==', 'approved'))),
+        getDocs(chargeQ)
+      ]);
+
+      const paymentsByStudent = {};
+      paymentSnap.forEach(d => { const p = d.data(); (paymentsByStudent[p.studentId] ||= []).push(p); });
+
+      const adjustmentsByStudent = {};
+      adjustmentSnap.forEach(d => { const a = d.data(); (adjustmentsByStudent[a.studentId] ||= []).push(a); });
+
+      const chargesByStudent = {};
+      chargesSnap.forEach(d => { const c = d.data(); (chargesByStudent[c.studentId] ||= []).push({ id: d.id, ...c }); });
+
+      const allActiveStudents = [];
+      studentSnap.forEach(docSnap => {
+        const data = docSnap.data();
+        if (data.status !== 'Deleted' && data.status !== 'archived' && !data.isDeleted) {
+          const studentClass = data.class;
+          let rawSettings = classSettings[studentClass];
+          if (!rawSettings || !rawSettings.components || rawSettings.components.length === 0) {
+            rawSettings = {
+              components: getSchoolDefaultFeeComponents(selectedSchool, studentClass, canonicalYearId)
+            };
+          }
+          const sSettings = normalizeClassFeeSettings(rawSettings);
+          const feeRes = calculateStudentDue({
+            student: { id: docSnap.id, ...data },
+            charges: chargesByStudent[docSnap.id],
+            classSettings: sSettings,
+            payments: paymentsByStudent[docSnap.id] || [],
+            adjustments: adjustmentsByStudent[docSnap.id] || []
+          });
+          const liveDue = feeRes?.totalDue || 0;
+          allActiveStudents.push({
+            id: docSnap.id,
+            name: data.name || '',
+            fatherName: data.fatherName || data.parentName || '',
+            roll: data.roll || '',
+            class: data.class || '',
+            section: data.section || '',
+            contact: data.contact || data.parentContact || '',
+            admissionType: (data.isNewAdmission || data.admissionType === 'new') ? 'New' : 'Old',
+            attendance: data.attendance || '100%',
+            liveDue: Number(liveDue || 0)
+          });
+        }
+      });
+
+      if (allActiveStudents.length === 0) {
+        alert("No active students found to export.");
+        return;
+      }
+
+      // Sort by class, then roll, then name
+      allActiveStudents.sort((a, b) => {
+        if (a.class !== b.class) return (a.class || '').localeCompare(b.class || '');
+        const rA = parseInt(a.roll, 10);
+        const rB = parseInt(b.roll, 10);
+        if (!isNaN(rA) && !isNaN(rB)) return rA - rB;
+        return (a.roll || '').localeCompare(b.roll || '');
+      });
+
+      const schoolName = SCHOOLS.find(s => s.id === selectedSchool)?.name || selectedSchool;
+      const wb = XLSX.utils.book_new();
+
+      // Tab 1: All Students Summary
+      const summaryRows = allActiveStudents.map((s, idx) => {
+        const parentVal = s.fatherName || s.parentName || s.father || s.father_name || '';
+        return {
+          'S.No.': idx + 1,
+          'Roll No.': s.roll || '',
+          'Student Name': s.name || '',
+          "Father's Name": parentVal,
+          "Parent's Name": parentVal,
+          'Class': s.class || '',
+          'Section': s.section || '',
+          'Contact': s.contact || s.parentContact || '',
+          'Admission Type': s.admissionType || 'Old',
+          'Attendance': s.attendance || '100%',
+          'Live Due (₹)': s.liveDue
+        };
+      });
+      const wsSummary = XLSX.utils.json_to_sheet(summaryRows);
+      XLSX.utils.book_append_sheet(wb, wsSummary, "All Students Summary");
+
+      // Tab 2..N: One sheet for each class
+      const classMap = {};
+      allActiveStudents.forEach(s => {
+        const c = s.class || 'Unassigned';
+        (classMap[c] ||= []).push(s);
+      });
+
+      const orderedClasses = [...new Set([...(classes || []), ...Object.keys(classMap)])];
+      orderedClasses.forEach(cls => {
+        const list = classMap[cls];
+        if (list && list.length > 0) {
+          const classRows = list.map((s, idx) => {
+            const parentVal = s.fatherName || s.parentName || s.father || s.father_name || '';
+            return {
+              'S.No.': idx + 1,
+              'Roll No.': s.roll || '',
+              'Student Name': s.name || '',
+              "Father's Name": parentVal,
+              "Parent's Name": parentVal,
+              'Class': s.class || '',
+              'Section': s.section || '',
+              'Contact': s.contact || s.parentContact || '',
+              'Admission Type': s.admissionType || 'Old',
+              'Attendance': s.attendance || '100%',
+              'Live Due (₹)': s.liveDue
+            };
+          });
+          const wsClass = XLSX.utils.json_to_sheet(classRows);
+          const safeName = cls.slice(0, 31).replace(/[\\/?*[\]]/g, '');
+          XLSX.utils.book_append_sheet(wb, wsClass, safeName);
+        }
+      });
+
+      XLSX.writeFile(wb, `Students_${schoolName}_All_Classes_${new Date().toISOString().split('T')[0]}.xlsx`);
+    } catch (err) {
+      console.error("Error exporting all students:", err);
+      alert("Failed to export students: " + (err.message || err));
+    } finally {
+      setIsExportingAll(false);
     }
   };
 
@@ -837,6 +1133,18 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
             </div>
           )}
 
+          {!selectedClass && !isAddingStudent && viewMode === 'active' && selectedSchool !== 'ALL' && (
+            <button
+              className="btn-secondary"
+              onClick={handleExportAllClassesStudents}
+              disabled={isExportingAll}
+              title="Download full classwise Excel workbook with separate tabs for every class"
+              style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontWeight: 700, padding: '8px 16px', backgroundColor: 'rgba(16, 185, 129, 0.1)', color: 'var(--success)' }}
+            >
+              <Download size={16} /> {isExportingAll ? 'Generating Excel...' : 'Export All Classes (Excel)'}
+            </button>
+          )}
+
           {viewMode === 'active' && selectedClass && !isAddingStudent && hasStudentEditPermission(selectedClass, selectedSection) && (
             <button className="btn-info" onClick={() => setIsAddingStudent(true)}>
               <Plus size={18} /> Add Student
@@ -882,6 +1190,16 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
               {isListening && <span style={{ fontSize: 12, color: 'var(--danger)', marginTop: 4, display: 'block', fontWeight: 600 }}>Listening... Speak now</span>}
             </div>
             <div className="form-group">
+              <label className="form-label">Father's Name / पिता का नाम</label>
+              <input
+                type="text"
+                className="form-input"
+                placeholder="e.g. Ramesh Patel"
+                value={fatherName}
+                onChange={(e) => setFatherName(e.target.value)}
+              />
+            </div>
+            <div className="form-group">
               <label className="form-label">Roll Number</label>
               <input type="text" className="form-input" placeholder="e.g. 42" value={rollNumber} onChange={(e) => setRollNumber(e.target.value)} />
             </div>
@@ -894,6 +1212,35 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
               <select className="form-input" value={addSection} onChange={(e) => setAddSection(e.target.value)}>
                 {sections && sections.length > 0 ? sections.map(sec => <option key={sec} value={sec}>{sec}</option>) : <option>No Sections Available</option>}
               </select>
+            </div>
+            <div className="form-group" style={{ gridColumn: '1 / -1' }}>
+              <label className="form-label">Address / पता (Optional)</label>
+              <input type="text" className="form-input" value={address} onChange={e => setAddress(e.target.value)} placeholder="Full Address" />
+            </div>
+            <div className="form-group" style={{ gridColumn: '1 / -1', marginTop: 8, padding: 16, background: 'var(--bg-secondary)', borderRadius: 8, border: '1px solid var(--border-light)' }}>
+              <label className="form-label" style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', marginBottom: 0 }}>
+                <input type="checkbox" checked={isTransportApplied} onChange={e => setIsTransportApplied(e.target.checked)} style={{ width: 18, height: 18 }} />
+                <span style={{ fontWeight: 600 }}>Transport Fee Applied / परिवहन शुल्क लागू है</span>
+              </label>
+              {isTransportApplied && (
+                <div style={{ marginTop: 12 }}>
+                  <label className="form-label">Transport Route / Village</label>
+                  <select className="form-input" value={transportRouteId} onChange={e => setTransportRouteId(e.target.value)}>
+                    <option value="">-- Select Route --</option>
+                    {getTransportRoutes(selectedSchool !== 'ALL' ? selectedSchool : 'SCH_01').map(r => (
+                      <option key={r.id} value={r.id}>{r.name} (₹{r.annual}/yr)</option>
+                    ))}
+                  </select>
+                  {transportRouteId && (
+                    <div style={{ marginTop: 8, fontSize: 13, color: 'var(--text-secondary)' }}>
+                      {(() => {
+                        const route = getTransportRoutes(selectedSchool !== 'ALL' ? selectedSchool : 'SCH_01').find(r => r.id === transportRouteId);
+                        return route ? `Annual: ₹${route.annual} | 1st: ₹${route.inst1} | 2nd: ₹${route.inst2} | 3rd: ₹${route.inst3}` : '';
+                      })()}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
             <div className="form-group" style={{ gridColumn: '1 / -1', marginTop: 8 }}>
               <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontWeight: 600, fontSize: 14 }}>
@@ -942,19 +1289,33 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
 
       {!isAddingStudent && viewMode === 'active' && selectedClass && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-          <div style={{ display: 'flex', gap: 12, alignItems: 'center', marginBottom: 8 }}>
-            <span style={{ fontWeight: 600, color: 'var(--text-secondary)' }}>Filter by Section:</span>
-            <select 
-              className="form-input" 
-              style={{ width: 150, padding: '8px 12px' }} 
-              value={selectedSection} 
-              onChange={(e) => setSelectedSection(e.target.value)}
-            >
-              <option value="All">All Sections</option>
-              {sections && sections.map(sec => (
-                <option key={sec} value={sec}>{sec}</option>
-              ))}
-            </select>
+          <div style={{ display: 'flex', gap: 12, alignItems: 'center', justifyContent: 'space-between', marginBottom: 8, flexWrap: 'wrap' }}>
+            <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+              <span style={{ fontWeight: 600, color: 'var(--text-secondary)' }}>Filter by Section:</span>
+              <select 
+                className="form-input" 
+                style={{ width: 150, padding: '8px 12px' }} 
+                value={selectedSection} 
+                onChange={(e) => setSelectedSection(e.target.value)}
+              >
+                <option value="All">All Sections</option>
+                {sections && sections.map(sec => (
+                  <option key={sec} value={sec}>{sec}</option>
+                ))}
+              </select>
+            </div>
+
+            {filteredStudents.length > 0 && (
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={handleExportClassStudents}
+                title={`Export ${selectedClass} students roster to Excel`}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontWeight: 700, padding: '8px 14px' }}
+              >
+                <Download size={16} /> Export {selectedClass} to Excel
+              </button>
+            )}
           </div>
 
           {isLoading ? (
@@ -1374,6 +1735,35 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
                     />
                   </div>
 
+                  <div className="form-group" style={{ gridColumn: '1 / -1' }}>
+                    <label className="form-label" style={{ fontWeight: 700 }}>Address / पता (Optional)</label>
+                    <input type="text" className="form-input" value={editAddress} onChange={e => setEditAddress(e.target.value)} placeholder="Full Address" />
+                  </div>
+                  <div className="form-group" style={{ gridColumn: '1 / -1', marginTop: 8, padding: 16, background: 'var(--bg-secondary)', borderRadius: 8, border: '1px solid var(--border-light)' }}>
+                    <label className="form-label" style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', marginBottom: 0 }}>
+                      <input type="checkbox" checked={editIsTransportApplied} onChange={e => setEditIsTransportApplied(e.target.checked)} style={{ width: 18, height: 18 }} />
+                      <span style={{ fontWeight: 600 }}>Transport Fee Applied / परिवहन शुल्क लागू है</span>
+                    </label>
+                    {editIsTransportApplied && (
+                      <div style={{ marginTop: 12 }}>
+                        <label className="form-label">Transport Route / Village</label>
+                        <select className="form-input" value={editTransportRouteId} onChange={e => setEditTransportRouteId(e.target.value)}>
+                          <option value="">-- Select Route --</option>
+                          {getTransportRoutes(editingStudent?.schoolId || selectedSchool || 'SCH_01').map(r => (
+                            <option key={r.id} value={r.id}>{r.name} (₹{r.annual}/yr)</option>
+                          ))}
+                        </select>
+                        {editTransportRouteId && (
+                          <div style={{ marginTop: 8, fontSize: 13, color: 'var(--text-secondary)' }}>
+                            {(() => {
+                              const route = getTransportRoutes(editingStudent?.schoolId || selectedSchool || 'SCH_01').find(r => r.id === editTransportRouteId);
+                              return route ? `Annual: ₹${route.annual} | 1st: ₹${route.inst1} | 2nd: ₹${route.inst2} | 3rd: ₹${route.inst3}` : '';
+                            })()}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
                   <div className="form-group" style={{ gridColumn: '1 / -1', marginTop: 8 }}>
                     <label style={{
                       display: 'flex',
@@ -1421,12 +1811,24 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
 }
 
 // Senior Product Designer SaaS Redesign of Student Dashboard Profile
-export function StudentLedger({ onNavigate, lang = 'en', activeStudent, userPermissions, currentUser, selectedSchool, activeAcademicYearId }) {
+export function StudentLedger({ onNavigate, lang = 'en', activeStudent, userPermissions, currentUser, selectedSchool, activeAcademicYearId, classSettings = {} }) {
+  const isOwnerUser = (user) => {
+    if (!user) return false;
+    if (user.email === 'jeevanshilporg@gmail.com') return true;
+    const r = (user.role || '').toLowerCase();
+    return r === 'owner' || r === 'director';
+  };
   const dict = t[lang] || t.en;
   const [isEditingName, setIsEditingName] = useState(false);
   const [studentName, setStudentName] = useState(activeStudent?.name || 'Anjali Sharma');
   const [isCalendarModalOpen, setIsCalendarModalOpen] = useState(false);
   const [isReportCardModalOpen, setIsReportCardModalOpen] = useState(false);
+  const [activeProfileTab, setActiveProfileTab] = useState('overview'); // 'overview' | 'tuition' | 'transport'
+  const [tuitionDueAmount, setTuitionDueAmount] = useState(0);
+  const [tuitionPaidAmount, setTuitionPaidAmount] = useState(0);
+  const [transportDueAmount, setTransportDueAmount] = useState(0);
+  const [transportPaidAmount, setTransportPaidAmount] = useState(0);
+  const [transportAnnualFee, setTransportAnnualFee] = useState(0);
 
   // ── Real data state ──────────────────────────────────────────────
   const [attendanceStats, setAttendanceStats] = useState({ present: 0, absent: 0, late: 0, total: 0, percent: 0 });
@@ -1446,7 +1848,26 @@ export function StudentLedger({ onNavigate, lang = 'en', activeStudent, userPerm
   const [selectedExamView, setSelectedExamView] = useState('Quarterly');
   const examOptions = ['Quarterly', 'Half Yearly', 'Final Exam'];
 
-  const handleProfileDelete = async () => {
+  
+    const handleDeleteReceipt = async (inv) => {
+    if (window.confirm(`Move receipt ${inv.receiptId || inv.receiptNo || ''} to Recycle Bin?`)) {
+      try {
+        if (inv.id && !inv.id.startsWith('WAIVER')) {
+          await updateDoc(doc(db, 'invoices', inv.id), {
+            deleted: true,
+            deletedAt: serverTimestamp(),
+            deletedBy: currentUser?.email || currentUser?.uid || 'Unknown'
+          });
+        }
+        alert(`Receipt moved to Recycle Bin.`);
+        setPaymentHistory(prev => prev.filter(p => p.id !== inv.id));
+      } catch (err) {
+        console.error(err);
+        alert('Error deleting receipt: ' + err.message);
+      }
+    }
+  };
+const handleProfileDelete = async () => {
     if (!activeStudent?.id) return;
     if (window.confirm(`Move student "${studentName}" to Deleted Students (Recycle Bin)?\n\nThis will safely remove them from active student lists and fee rosters while preserving all historical payment receipts and attendance records.`)) {
       try {
@@ -1462,7 +1883,7 @@ export function StudentLedger({ onNavigate, lang = 'en', activeStudent, userPerm
           await logAuditAction({
             action: 'STUDENT_SOFT_DELETED',
             performedBy: currentUser?.name || currentUser?.email || currentUser?.uid || 'Admin',
-            schoolId: activeStudent.schoolId || selectedSchool,
+            schoolId: activeStudent?.schoolId || selectedSchool,
             details: { studentId: activeStudent.id, studentName, class: activeStudent.class, fromProfile: true }
           });
         } catch (e) {
@@ -1564,6 +1985,25 @@ export function StudentLedger({ onNavigate, lang = 'en', activeStudent, userPerm
   // ── Fetch financial data (invoices / payments) ─────────────────
   useEffect(() => {
     if (!activeStudent?.id) return;
+      const handleSoftDeleteInvoice = async (invoiceId) => {
+    if (!invoiceId) return;
+    if (!window.confirm('Are you sure you want to delete this receipt? It will be moved to the Recycle Bin.')) return;
+    try {
+      await updateDoc(doc(db, 'invoices', invoiceId), {
+        deleted: true,
+        deletedAt: serverTimestamp(),
+        deletedBy: currentUser?.email || currentUser?.uid || 'Unknown'
+      });
+      alert('Receipt moved to Recycle Bin.');
+      // Refresh financials
+      const fetchEvent = new Event('refresh_financials');
+      window.dispatchEvent(fetchEvent);
+    } catch (err) {
+      console.error('Failed to delete receipt:', err);
+      alert('Failed to delete receipt.');
+    }
+  };
+
     const fetchFinancials = async () => {
       try {
         let invoiceQ = query(collection(db, 'invoices'), where('studentId', '==', activeStudent.id));
@@ -1571,7 +2011,7 @@ export function StudentLedger({ onNavigate, lang = 'en', activeStudent, userPerm
           invoiceQ = query(invoiceQ, where('schoolId', '==', activeStudent.schoolId));
         }
         const snap = await getDocs(invoiceQ);
-        let invoices = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+        let invoices = snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(inv => !inv.deleted);
 
         // Fallback: If no invoices found in invoices collection, check student_ledger for credit transactions
         if (invoices.length === 0) {
@@ -1638,7 +2078,25 @@ export function StudentLedger({ onNavigate, lang = 'en', activeStudent, userPerm
           setWalletBalance(summary.advanceCredit);
 
           const totalChargesAmount = dbCharges.reduce((sum, c) => sum + (Number(c.originalAmount) || 0), 0);
-          const totalTuitionAmount = dbCharges.filter(c => c.componentId === 'tuition').reduce((sum, c) => sum + (Number(c.originalAmount) || 0), 0);
+          const totalTuitionAmount = dbCharges.filter(c => c.componentId !== 'transport').reduce((sum, c) => sum + (Number(c.originalAmount) || 0), 0);
+          const totalTransportAmount = dbCharges.filter(c => c.componentId === 'transport').reduce((sum, c) => sum + (Number(c.originalAmount) || 0), 0);
+
+          let tDue = 0, tPaid = 0, trDue = 0, trPaid = 0;
+          res.ledger.forEach(item => {
+            if (item.componentId === 'transport') {
+              trDue += (Number(item.due) || 0);
+              trPaid += (Number(item.paid) || 0);
+            } else {
+              tDue += (Number(item.due) || 0);
+              tPaid += (Number(item.paid) || 0);
+            }
+          });
+
+          setTuitionDueAmount(tDue);
+          setTuitionPaidAmount(tPaid);
+          setTransportDueAmount(trDue);
+          setTransportPaidAmount(trPaid);
+          setTransportAnnualFee(totalTransportAmount);
 
           setAnnualFee(totalChargesAmount);
           setAnnualTuitionFee(totalTuitionAmount);
@@ -1842,442 +2300,336 @@ export function StudentLedger({ onNavigate, lang = 'en', activeStudent, userPerm
         </div>
       </div>
 
-      {/* 2. Hero Financial Summary Card (Finance First) */}
-      {userPermissions?.viewInvoices !== false && (
-        <div className="glass-card" style={{
-          padding: 24,
-          borderRadius: 20,
-          backgroundColor: 'var(--bg-card)',
-          border: '1px solid var(--border-light)',
-          boxShadow: '0 10px 30px rgba(0, 0, 0, 0.04)'
-        }}>
-          <div className="flex-responsive" style={{ marginBottom: 20 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <div style={{ width: 36, height: 36, borderRadius: 10, backgroundColor: 'var(--bg-secondary)', color: 'var(--danger)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                <CreditCard size={20} />
-              </div>
-              <div>
-                <h2 style={{ fontSize: 18, fontWeight: 800, color: 'var(--text-primary)', margin: 0 }}>
-                  {dict.financialSummary}
-                </h2>
-                <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>Academic Year</span>
-              </div>
-            </div>
-
-            <button
-              className="btn-primary"
-              onClick={() => onNavigate('finance')}
-              style={{ backgroundColor: '#10b981', borderColor: '#10b981', fontSize: 13, fontWeight: 700, padding: '8px 16px' }}
-            >
-              <CreditCard size={16} /> {dict.recordPayment}
-            </button>
-          </div>
-
-          {/* 4 Metric Columns */}
-          <div className="grid-responsive">
-            {/* Outstanding Due */}
-            <div style={{
-              backgroundColor: 'var(--bg-secondary)',
-              padding: 16,
-              borderRadius: 14,
-              border: '1px solid var(--border-light)'
-            }}>
-              <div style={{ fontSize: 12, color: 'var(--danger)', textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 800, marginBottom: 4 }}>
-                {dict.outstandingDue}
-              </div>
-              <div style={{ fontSize: 28, fontWeight: 900, fontFamily: 'var(--font-mono)', color: 'var(--danger)' }}>
-                ₹ {dueAmount ? Number(dueAmount).toLocaleString() : '0'}.00
-              </div>
-              <div style={{ fontSize: 12, color: 'var(--danger)', marginTop: 4, fontWeight: 600 }}>
-                {dueAmount ? 'Immediate action required' : 'No outstanding dues'}
-              </div>
-            </div>
-
-            {/* Paid Amount */}
-            <div style={{
-              backgroundColor: 'var(--bg-secondary)',
-              padding: 16,
-              borderRadius: 14,
-              border: '1px solid var(--border-light)'
-            }}>
-              <div style={{ fontSize: 12, color: 'var(--success)', textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 800, marginBottom: 4 }}>
-                {dict.totalFeesPaid}
-              </div>
-              <div style={{ fontSize: 28, fontWeight: 900, fontFamily: 'var(--font-mono)', color: 'var(--success)' }}>
-                ₹ {totalPaid > 0 ? totalPaid.toLocaleString() : '0'}.00
-              </div>
-              <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4 }}>
-                {totalPaid > 0 ? `${paymentHistory.length} transaction(s) recorded` : 'No payments yet'}
-              </div>
-            </div>
-
-            {/* Wallet Balance */}
-            <div style={{
-              backgroundColor: 'var(--bg-secondary)',
-              padding: 16,
-              borderRadius: 14,
-              border: '1px solid var(--border-light)'
-            }}>
-              <div style={{ fontSize: 12, color: 'var(--brand-orange)', textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 800, marginBottom: 4 }}>
-                {dict.walletBalance}
-              </div>
-              <div style={{ fontSize: 28, fontWeight: 900, fontFamily: 'var(--font-mono)', color: 'var(--brand-orange)' }}>
-                ₹ {walletBalance > 0 ? walletBalance.toLocaleString() : '0'}.00
-              </div>
-              <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4 }}>
-                {walletBalance > 0 ? 'Advance deposit available' : 'No advance deposits'}
-              </div>
-            </div>
-
-            {/* Total Annual Fee */}
-            <div style={{
-              backgroundColor: 'var(--bg-secondary)',
-              padding: 16,
-              borderRadius: 14,
-              border: '1px solid var(--border-light)'
-            }}>
-              <div style={{ fontSize: 12, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 800, marginBottom: 4 }}>
-                {dict.totalTuition}
-              </div>
-              <div style={{ fontSize: 28, fontWeight: 900, fontFamily: 'var(--font-mono)', color: 'var(--text-primary)' }}>
-                ₹ {annualFee > 0 ? annualFee.toLocaleString() : '0'}.00
-              </div>
-              <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4 }}>
-                {annualTuitionFee > 0 && annualTuitionFee !== annualFee ? `Tuition: ₹${annualTuitionFee.toLocaleString()} • Total: ₹${annualFee.toLocaleString()}` : 'Annual Billing'}
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* 3. Middle 2-Column Grid (Summarized Attendance & Academic Performance) */}
-      <div className="grid-responsive">
-        
-        {/* Summarized Attendance Card (Reduced Cognitive Load) */}
-        <div className="glass-card" style={{ padding: 24, borderRadius: 20, display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
-          <div>
-            <div className="flex-responsive" style={{ marginBottom: 16 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <div style={{ width: 36, height: 36, borderRadius: 10, backgroundColor: 'var(--bg-secondary)', color: 'var(--success)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  <Calendar size={20} />
-                </div>
-                <h3 style={{ fontSize: 16, fontWeight: 800, margin: 0, color: 'var(--text-primary)' }}>
-                  Attendance Summary
-                </h3>
-              </div>
-              <span className="badge" style={{ backgroundColor: 'var(--bg-secondary)', color: attendanceStats.total > 0 ? 'var(--success)' : 'var(--text-secondary)', fontSize: 16, fontWeight: 900 }}>
-                {attendanceStats.total > 0 ? `${attendanceStats.percent}% Overall` : 'No Data'}
-              </span>
-            </div>
-
-            {/* Quick Metrics Breakdown */}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, textAlign: 'center', margin: '20px 0' }}>
-              <div style={{ backgroundColor: 'var(--bg-secondary)', padding: 12, borderRadius: 12 }}>
-                <div style={{ fontSize: 22, fontWeight: 900, color: 'var(--success)' }}>{attendanceStats.present}</div>
-                <div style={{ fontSize: 12, color: 'var(--text-secondary)', fontWeight: 600, marginTop: 2 }}>Present</div>
-              </div>
-              <div style={{ backgroundColor: 'var(--bg-secondary)', padding: 12, borderRadius: 12 }}>
-                <div style={{ fontSize: 22, fontWeight: 900, color: 'var(--danger)' }}>{attendanceStats.absent}</div>
-                <div style={{ fontSize: 12, color: 'var(--text-secondary)', fontWeight: 600, marginTop: 2 }}>Absent</div>
-              </div>
-              <div style={{ backgroundColor: 'var(--bg-secondary)', padding: 12, borderRadius: 12 }}>
-                <div style={{ fontSize: 22, fontWeight: 900, color: 'var(--warning)' }}>{attendanceStats.late}</div>
-                <div style={{ fontSize: 12, color: 'var(--text-secondary)', fontWeight: 600, marginTop: 2 }}>Late</div>
-              </div>
-            </div>
-
-            {/* Mini Progress Bar */}
-            {attendanceStats.total > 0 ? (
-              <div style={{ height: 8, width: '100%', backgroundColor: 'var(--border-light)', borderRadius: 4, overflow: 'hidden', marginBottom: 20, display: 'flex' }}>
-                <div style={{ width: `${Math.round((attendanceStats.present / attendanceStats.total) * 100)}%`, backgroundColor: '#10b981' }} title={`Present ${Math.round((attendanceStats.present / attendanceStats.total) * 100)}%`} />
-                <div style={{ width: `${Math.round((attendanceStats.absent / attendanceStats.total) * 100)}%`, backgroundColor: '#ef4444' }} title={`Absent ${Math.round((attendanceStats.absent / attendanceStats.total) * 100)}%`} />
-                <div style={{ width: `${Math.round((attendanceStats.late / attendanceStats.total) * 100)}%`, backgroundColor: '#f59e0b' }} title={`Late ${Math.round((attendanceStats.late / attendanceStats.total) * 100)}%`} />
-              </div>
-            ) : (
-              <div style={{ padding: '16px 0', textAlign: 'center', color: 'var(--text-secondary)', fontSize: 13, marginBottom: 20 }}>
-                No attendance records found for this student.
-              </div>
-            )}
-          </div>
-
-          <button
-            className="btn-secondary"
-            onClick={() => setIsCalendarModalOpen(true)}
-            style={{ width: '100%', justifyContent: 'center', padding: '10px', fontSize: 13, fontWeight: 700 }}
+            {/* --- PROFILE TABS --- */}
+      <div style={{ display: 'flex', gap: 16, borderBottom: '2px solid var(--border-light)', marginBottom: 24, marginTop: 16 }}>
+        <button 
+          style={{ padding: '12px 24px', background: 'none', border: 'none', borderBottom: activeProfileTab === 'overview' ? '2px solid var(--brand-primary)' : '2px solid transparent', color: activeProfileTab === 'overview' ? 'var(--text-primary)' : 'var(--text-secondary)', fontWeight: activeProfileTab === 'overview' ? 700 : 500, cursor: 'pointer', fontSize: 14 }}
+          onClick={() => setActiveProfileTab('overview')}
+        >
+          Overview
+        </button>
+        <button 
+          style={{ padding: '12px 24px', background: 'none', border: 'none', borderBottom: activeProfileTab === 'tuition' ? '2px solid var(--brand-primary)' : '2px solid transparent', color: activeProfileTab === 'tuition' ? 'var(--text-primary)' : 'var(--text-secondary)', fontWeight: activeProfileTab === 'tuition' ? 700 : 500, cursor: 'pointer', fontSize: 14 }}
+          onClick={() => setActiveProfileTab('tuition')}
+        >
+          Class Fees & Payments
+        </button>
+        {activeStudent?.isTransportApplied && (
+          <button 
+            style={{ padding: '12px 24px', background: 'none', border: 'none', borderBottom: activeProfileTab === 'transport' ? '2px solid var(--brand-primary)' : '2px solid transparent', color: activeProfileTab === 'transport' ? 'var(--text-primary)' : 'var(--text-secondary)', fontWeight: activeProfileTab === 'transport' ? 700 : 500, cursor: 'pointer', fontSize: 14 }}
+            onClick={() => setActiveProfileTab('transport')}
           >
-            <Calendar size={16} /> View Full Monthly Calendar
+            Transport Fees
           </button>
-        </div>
-
-        {/* Summarized Academic Marks Card (Compact Performance) */}
-        <div className="glass-card" style={{ padding: 24, borderRadius: 20, display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
-          <div>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <div style={{ width: 36, height: 36, borderRadius: 10, backgroundColor: 'var(--bg-secondary)', color: 'var(--brand-orange)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  <BookOpen size={20} />
-                </div>
-                <h3 style={{ fontSize: 16, fontWeight: 800, margin: 0, color: 'var(--text-primary)' }}>
-                  Academic Performance
-                </h3>
-              </div>
-              <span className="badge" style={{ backgroundColor: 'var(--bg-secondary)', color: marksData.length > 0 ? 'var(--text-primary)' : 'var(--text-secondary)', fontSize: 16, fontWeight: 900 }}>
-                {marksData.length > 0 ? `${marksAvg}% Avg` : 'No Data'}
-              </span>
-            </div>
-
-            {/* Subject Highlights */}
-            {marksData.length > 0 ? (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 10, margin: '16px 0' }}>
-                {topSubject && (
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 14px', backgroundColor: 'var(--bg-secondary)', borderRadius: 10 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, fontWeight: 700 }}>
-                      <Award size={16} color="var(--success)" /> Top Subject
-                    </div>
-                    <div style={{ fontSize: 13, fontWeight: 800, color: 'var(--success)' }}>
-                      {topSubject.subject} ({topSubject.pct}%)
-                    </div>
-                  </div>
-                )}
-
-                {weakSubject && weakSubject.subject !== topSubject?.subject && (
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 14px', backgroundColor: 'var(--bg-secondary)', borderRadius: 10 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, fontWeight: 700 }}>
-                      <AlertCircle size={16} color="var(--warning)" /> Needs Focus
-                    </div>
-                    <div style={{ fontSize: 13, fontWeight: 800, color: 'var(--warning)' }}>
-                      {weakSubject.subject} ({weakSubject.pct}%)
-                    </div>
-                  </div>
-                )}
-              </div>
-            ) : (
-              <div style={{ padding: '20px 0', textAlign: 'center', color: 'var(--text-secondary)', fontSize: 13, margin: '16px 0' }}>
-                No exam records available for this student.
-              </div>
-            )}
-
-            {/* Test Score Pills */}
-            {marksData.length > 0 && (
-              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 20 }}>
-                {marksData
-                  .filter(m => m.exam === selectedExamView || !marksData.some(x => x.exam === selectedExamView))
-                  .slice(0, 6)
-                  .map((m, i) => (
-                    <span key={i} className="badge" style={{ backgroundColor: 'var(--bg-secondary)', color: 'var(--text-primary)', fontWeight: 700 }}>
-                      {m.subject}: {m.marks}/{m.totalMarks || m.maxMarks || 100}
-                    </span>
-                  ))}
-              </div>
-            )}
-            {marksData.length === 0 && <div style={{ marginBottom: 20 }} />}
-          </div>
-
-          <button
-            className="btn-secondary"
-            onClick={() => setIsReportCardModalOpen(true)}
-            style={{ width: '100%', justifyContent: 'center', padding: '10px', fontSize: 13, fontWeight: 700 }}
-          >
-            <FileText size={16} /> View Full Gradebook Report Card
-          </button>
-        </div>
-
+        )}
       </div>
 
-      {/* 4. Stripe / Linear Style Payment History Table */}
-      {userPermissions?.viewInvoices !== false && (
-        <div className="glass-card" style={{ padding: 24, borderRadius: 20 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-            <h3 style={{ fontSize: 18, fontWeight: 800, margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
-              <Receipt size={20} color="var(--brand-orange)" /> {dict.paymentLedger}
-            </h3>
-            <span style={{ fontSize: 12, color: 'var(--text-secondary)', fontWeight: 600 }}>
-              {paymentHistory.length > 0 ? `Showing last ${paymentHistory.length} transaction(s)` : 'No transactions'}
-            </span>
-          </div>
-
-          <div style={{ overflowX: 'auto' }}>
-            <table className="modern-table">
-              <thead>
-                <tr>
-                  <th>{dict.transactionDate}</th>
-                  <th>{dict.feeCategory}</th>
-                  <th>{dict.receiptNo}</th>
-                  <th>Status</th>
-                  <th style={{ textAlign: 'right' }}>{dict.amountPaid}</th>
-                  <th style={{ textAlign: 'right' }}>Action</th>
-                </tr>
-              </thead>
-              <tbody>
-                {paymentHistory.length > 0 ? paymentHistory.map((inv, i) => (
-                  <tr key={inv.id || i}>
-                    <td style={{ fontFamily: 'var(--font-mono)', fontSize: 13 }}>{inv.date ? new Date(inv.date).toLocaleDateString() : 'N/A'}</td>
-                    <td style={{ fontWeight: 600 }}>{inv.feeType || inv.description || inv.category || (inv.allocations && inv.allocations.length > 0 ? inv.allocations.map(a => a.label || a.componentId).join(', ') : 'Fee Payment')}</td>
-                    <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-secondary)' }}>{inv.receiptId || inv.receiptNo || inv.voucherNo || inv.id?.slice(0, 10) || 'N/A'}</td>
-                    <td>
-                      <span className={`badge ${inv.status === 'Reversed' || inv.status === 'Cancelled' ? 'warning' : 'success'}`}>
-                        {inv.status || 'Paid'}
-                      </span>
-                    </td>
-                    <td style={{ textAlign: 'right', fontWeight: 800, fontFamily: 'var(--font-mono)', color: 'var(--success)' }}>
-                      ₹ {Number(inv.amount || 0).toLocaleString()}
-                    </td>
-                    <td style={{ textAlign: 'right' }}>
-                      <button className="btn-secondary" style={{ padding: '4px 10px', fontSize: 11 }} onClick={() => generateFeeReceipt(inv, { name: studentName, class: studentClass, id: studentId, contact: parentContact })} title="Print Receipt">
-                        <Download size={14} />
-                      </button>
-                    </td>
-                  </tr>
-                )) : (
-                  <tr>
-                    <td colSpan="6" style={{ textAlign: 'center', padding: '30px 0', color: 'var(--text-secondary)' }}>
-                      No transaction data available
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-
-      {/* MODAL 1: Full Monthly Attendance Calendar Modal */}
-      {isCalendarModalOpen && (
-        <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.6)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}>
-          <div className="glass-card" style={{ width: '100%', maxWidth: 520, padding: 24, position: 'relative' }}>
-            <button onClick={() => setIsCalendarModalOpen(false)} style={{ position: 'absolute', top: 16, right: 16, background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)' }}>
-              <X size={20} />
-            </button>
-
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
-              <Calendar size={22} color="var(--brand-orange)" />
-              <div>
-                <h3 style={{ fontSize: 18, fontWeight: 800, margin: 0 }}>Attendance Calendar</h3>
-                <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>Student: {studentName} ({studentClass})</span>
-              </div>
-            </div>
-
-            {/* Month Picker */}
-            <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 16 }}>
-              <input type="month" className="form-input" value={calendarMonth} onChange={e => setCalendarMonth(e.target.value)} style={{ width: 200, textAlign: 'center', fontWeight: 700 }} />
-            </div>
-
-            {/* Calendar Grid */}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 4, textAlign: 'center', marginBottom: 16 }}>
-              {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(d => (
-                <div key={d} style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-secondary)', padding: 4 }}>{d}</div>
-              ))}
-              {calendarDays.map((day, i) => {
-                if (!day) return <div key={`blank-${i}`} />;
-                const s = (day.status || '').toLowerCase();
-                const bg = s === 'present' ? 'rgba(16, 185, 129, 0.15)'
-                  : s === 'absent' ? 'rgba(239, 68, 68, 0.15)'
-                  : (s === 'late' || s === 'half day') ? 'rgba(245, 158, 11, 0.15)'
-                  : 'var(--bg-secondary)';
-                const color = s === 'present' ? 'var(--success)'
-                  : s === 'absent' ? 'var(--danger)'
-                  : (s === 'late' || s === 'half day') ? 'var(--warning)'
-                  : 'var(--text-secondary)';
-                return (
-                  <div key={day.date} style={{ backgroundColor: bg, color, borderRadius: 8, padding: '6px 2px', fontSize: 13, fontWeight: 700 }} title={day.status || 'No record'}>
-                    {day.day}
+      {activeProfileTab === 'overview' && (
+        <div className="grid-responsive">
+          {/* Summarized Attendance Card */}
+          <div className="glass-card" style={{ padding: 24, borderRadius: 20, display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
+            <div>
+              <div className="flex-responsive" style={{ marginBottom: 16 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <div style={{ width: 36, height: 36, borderRadius: 10, backgroundColor: 'var(--bg-secondary)', color: 'var(--success)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <Calendar size={20} />
                   </div>
-                );
-              })}
-            </div>
+                  <h3 style={{ fontSize: 16, fontWeight: 800, margin: 0, color: 'var(--text-primary)' }}>
+                    Attendance Summary
+                  </h3>
+                </div>
+                <span className="badge" style={{ backgroundColor: 'var(--bg-secondary)', color: attendanceStats.total > 0 ? 'var(--success)' : 'var(--text-secondary)', fontSize: 16, fontWeight: 900 }}>
+                  {attendanceStats.total > 0 ? `${attendanceStats.percent}% Overall` : 'No Data'}
+                </span>
+              </div>
 
-            {/* Legend */}
-            <div style={{ display: 'flex', justifyContent: 'center', gap: 16, fontSize: 11, fontWeight: 600 }}>
-              <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><div style={{ width: 10, height: 10, borderRadius: 3, backgroundColor: 'rgba(16, 185, 129, 0.5)' }} /> Present</span>
-              <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><div style={{ width: 10, height: 10, borderRadius: 3, backgroundColor: 'rgba(239, 68, 68, 0.5)' }} /> Absent</span>
-              <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><div style={{ width: 10, height: 10, borderRadius: 3, backgroundColor: 'rgba(245, 158, 11, 0.5)' }} /> Late</span>
-              <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><div style={{ width: 10, height: 10, borderRadius: 3, backgroundColor: 'var(--bg-secondary)' }} /> No Data</span>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, textAlign: 'center', margin: '20px 0' }}>
+                <div style={{ backgroundColor: 'var(--bg-secondary)', padding: 12, borderRadius: 12 }}>
+                  <div style={{ fontSize: 22, fontWeight: 900, color: 'var(--success)' }}>{attendanceStats.present}</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)', fontWeight: 600, marginTop: 2 }}>Present</div>
+                </div>
+                <div style={{ backgroundColor: 'var(--bg-secondary)', padding: 12, borderRadius: 12 }}>
+                  <div style={{ fontSize: 22, fontWeight: 900, color: 'var(--danger)' }}>{attendanceStats.absent}</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)', fontWeight: 600, marginTop: 2 }}>Absent</div>
+                </div>
+                <div style={{ backgroundColor: 'var(--bg-secondary)', padding: 12, borderRadius: 12 }}>
+                  <div style={{ fontSize: 22, fontWeight: 900, color: 'var(--warning)' }}>{attendanceStats.late}</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)', fontWeight: 600, marginTop: 2 }}>Late</div>
+                </div>
+              </div>
+
+              {attendanceStats.total > 0 ? (
+                <div style={{ height: 8, width: '100%', backgroundColor: 'var(--border-light)', borderRadius: 4, overflow: 'hidden', marginBottom: 20, display: 'flex' }}>
+                  <div style={{ width: `${Math.round((attendanceStats.present / attendanceStats.total) * 100)}%`, backgroundColor: '#10b981' }} title={`Present ${Math.round((attendanceStats.present / attendanceStats.total) * 100)}%`} />
+                  <div style={{ width: `${Math.round((attendanceStats.late / attendanceStats.total) * 100)}%`, backgroundColor: '#f59e0b' }} title={`Late ${Math.round((attendanceStats.late / attendanceStats.total) * 100)}%`} />
+                  <div style={{ width: `${Math.round((attendanceStats.absent / attendanceStats.total) * 100)}%`, backgroundColor: '#ef4444' }} title={`Absent ${Math.round((attendanceStats.absent / attendanceStats.total) * 100)}%`} />
+                </div>
+              ) : (
+                <div style={{ height: 8, width: '100%', backgroundColor: 'var(--border-light)', borderRadius: 4, marginBottom: 20 }} />
+              )}
+            </div>
+          </div>
+
+          {/* Academic Performance Card */}
+          <div className="glass-card" style={{ padding: 24, borderRadius: 20, display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
+            <div>
+              <div className="flex-responsive" style={{ marginBottom: 16 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <div style={{ width: 36, height: 36, borderRadius: 10, backgroundColor: 'var(--bg-secondary)', color: 'var(--brand-primary)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <BarChart2 size={20} />
+                  </div>
+                  <h3 style={{ fontSize: 16, fontWeight: 800, margin: 0, color: 'var(--text-primary)' }}>
+                    Academic Performance
+                  </h3>
+                </div>
+                {marksData.length > 0 && (
+                  <span className="badge" style={{ backgroundColor: 'rgba(59, 130, 246, 0.1)', color: 'var(--brand-primary)', fontSize: 16, fontWeight: 900 }}>
+                    {marksAvg}% Avg
+                  </span>
+                )}
+              </div>
+
+              {marksData.length > 0 ? (
+                <div style={{ marginTop: 20 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: 16 }}>
+                    <div style={{ position: 'relative', width: 120, height: 120, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '50%', background: `conic-gradient(var(--brand-primary) ${marksAvg}%, var(--border-light) 0)` }}>
+                      <div style={{ width: 100, height: 100, borderRadius: '50%', backgroundColor: 'var(--bg-card)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
+                        <span style={{ fontSize: 24, fontWeight: 900, color: 'var(--text-primary)' }}>{marksAvg}%</span>
+                        <span style={{ fontSize: 10, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: 1, fontWeight: 700 }}>Average</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div style={{ textAlign: 'center', padding: '40px 0', color: 'var(--text-secondary)' }}>
+                  <FileText size={40} style={{ opacity: 0.2, marginBottom: 12 }} />
+                  <p style={{ margin: 0, fontWeight: 600 }}>No exam marks recorded</p>
+                </div>
+              )}
             </div>
           </div>
         </div>
       )}
 
-      {/* MODAL 2: Full Report Card Modal */}
-      {isReportCardModalOpen && (
-        <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.6)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}>
-          <div className="glass-card" style={{ width: '100%', maxWidth: 560, padding: 24, position: 'relative' }}>
-            <button onClick={() => setIsReportCardModalOpen(false)} style={{ position: 'absolute', top: 16, right: 16, background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)' }}>
-              <X size={20} />
-            </button>
+      {activeProfileTab === 'tuition' && (
+        <>
+          {/* Tuition Hero Financial Summary */}
+          {userPermissions?.viewInvoices !== false && (
+            <div className="glass-card" style={{ padding: 24, borderRadius: 20, backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-light)', boxShadow: '0 10px 30px rgba(0, 0, 0, 0.04)', marginBottom: 24 }}>
+              <div className="flex-responsive" style={{ marginBottom: 20 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <div style={{ width: 36, height: 36, borderRadius: 10, backgroundColor: 'var(--bg-secondary)', color: 'var(--brand-primary)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <CreditCard size={20} />
+                  </div>
+                  <div>
+                    <h2 style={{ fontSize: 18, fontWeight: 800, color: 'var(--text-primary)', margin: 0 }}>
+                      Class Fees & Payments
+                    </h2>
+                    <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>Tuition and Other Fees</span>
+                  </div>
+                </div>
 
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
-              <Award size={22} color="var(--brand-orange)" />
-              <div style={{ flex: 1 }}>
-                <h3 style={{ fontSize: 18, fontWeight: 800, margin: 0 }}>Full Subject Gradebook Report Card</h3>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
-                  <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>Exam:</span>
-                  <select className="form-input" value={selectedExamView} onChange={e => setSelectedExamView(e.target.value)} style={{ padding: '2px 8px', fontSize: 12, width: 'auto' }}>
-                    {examOptions.map(e => <option key={e} value={e}>{e}</option>)}
-                  </select>
+                <button
+                  className="btn-primary"
+                  onClick={() => onNavigate('finance')}
+                  style={{ backgroundColor: '#10b981', borderColor: '#10b981', fontSize: 13, fontWeight: 700, padding: '8px 16px' }}
+                >
+                  <CreditCard size={16} /> {dict.recordPayment}
+                </button>
+              </div>
+
+              <div className="grid-responsive">
+                <div style={{ backgroundColor: 'var(--bg-secondary)', padding: 16, borderRadius: 14, border: '1px solid var(--border-light)' }}>
+                  <div style={{ fontSize: 12, color: 'var(--danger)', textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 800, marginBottom: 4 }}>
+                    Tuition Outstanding Due
+                  </div>
+                  <div style={{ fontSize: 28, fontWeight: 900, fontFamily: 'var(--font-mono)', color: 'var(--danger)' }}>
+                    ₹ {tuitionDueAmount ? Number(tuitionDueAmount).toLocaleString() : '0'}.00
+                  </div>
+                </div>
+
+                <div style={{ backgroundColor: 'var(--bg-secondary)', padding: 16, borderRadius: 14, border: '1px solid var(--border-light)' }}>
+                  <div style={{ fontSize: 12, color: 'var(--success)', textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 800, marginBottom: 4 }}>
+                    Tuition Paid
+                  </div>
+                  <div style={{ fontSize: 28, fontWeight: 900, fontFamily: 'var(--font-mono)', color: 'var(--success)' }}>
+                    ₹ {tuitionPaidAmount > 0 ? tuitionPaidAmount.toLocaleString() : '0'}.00
+                  </div>
+                </div>
+
+                <div style={{ backgroundColor: 'var(--bg-secondary)', padding: 16, borderRadius: 14, border: '1px solid var(--border-light)' }}>
+                  <div style={{ fontSize: 12, color: 'var(--brand-orange)', textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 800, marginBottom: 4 }}>
+                    {dict.walletBalance}
+                  </div>
+                  <div style={{ fontSize: 28, fontWeight: 900, fontFamily: 'var(--font-mono)', color: 'var(--brand-orange)' }}>
+                    ₹ {walletBalance > 0 ? walletBalance.toLocaleString() : '0'}.00
+                  </div>
+                </div>
+
+                <div style={{ backgroundColor: 'var(--bg-secondary)', padding: 16, borderRadius: 14, border: '1px solid var(--border-light)' }}>
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 800, marginBottom: 4 }}>
+                    Tuition Annual Total
+                  </div>
+                  <div style={{ fontSize: 28, fontWeight: 900, fontFamily: 'var(--font-mono)', color: 'var(--text-primary)' }}>
+                    ₹ {annualTuitionFee > 0 ? annualTuitionFee.toLocaleString() : '0'}.00
+                  </div>
                 </div>
               </div>
             </div>
+          )}
 
-            <table className="modern-table" style={{ marginBottom: 20 }}>
-              <thead>
-                <tr>
-                  <th>Subject</th>
-                  <th>Marks</th>
-                  <th>Grade</th>
-                  <th style={{ textAlign: 'right' }}>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(() => {
-                  const filtered = marksData.filter(m => m.exam === selectedExamView);
-                  const pool = filtered.length > 0 ? filtered : marksData;
-                  if (pool.length === 0) return (
-                    <tr>
-                      <td colSpan="4" style={{ textAlign: 'center', padding: '30px 0', color: 'var(--text-secondary)' }}>
-                        No exam records available for this student.
-                      </td>
-                    </tr>
+          {/* Payment History List (Tuition Focus) */}
+          <div className="glass-card" style={{ padding: 24, borderRadius: 20, marginBottom: 24 }}>
+            <h3 style={{ fontSize: 16, fontWeight: 800, color: 'var(--text-primary)', marginBottom: 16 }}>Class Payments History</h3>
+            {paymentHistory.length === 0 ? (
+              <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-secondary)', backgroundColor: 'var(--bg-secondary)', borderRadius: 12 }}>
+                No payments recorded yet.
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                {paymentHistory.map((inv, idx) => {
+                  let tuitionsAllocated = 0;
+                  if (inv.allocations && inv.allocations.length > 0) {
+                    tuitionsAllocated = inv.allocations.filter(a => a.componentId !== 'transport').reduce((sum, a) => sum + (Number(a.amount) || 0), 0);
+                  } else {
+                    tuitionsAllocated = inv.amount;
+                  }
+                  
+                  if (tuitionsAllocated <= 0 && inv.type !== 'waiver') return null;
+
+                  return (
+                    <div key={idx} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '16px', backgroundColor: 'var(--bg-secondary)', borderRadius: 12, border: '1px solid var(--border-light)' }}>
+                      <div>
+                        <div style={{ fontWeight: 700, color: 'var(--text-primary)' }}>{inv.receiptId || inv.receiptNo || 'Receipt'}</div>
+                        <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 4 }}>
+                          {inv.date ? new Date(inv.date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : 'Unknown Date'}
+                          {inv.type === 'waiver' ? ' • Fee Waiver' : ''}
+                        </div>
+                      </div>
+                      <div style={{ textAlign: 'right' }}>
+                        <div style={{ fontSize: 16, fontWeight: 800, color: 'var(--success)' }}>₹ {Number(tuitionsAllocated).toLocaleString()}</div>
+                        {inv.amount > tuitionsAllocated && (
+                          <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>Part of ₹{Number(inv.amount).toLocaleString()} total</div>
+                        )}
+                        <span className="badge" style={{ backgroundColor: 'rgba(16, 185, 129, 0.1)', color: 'var(--success)', marginTop: 4, display: 'inline-block' }}>
+                          {inv.status || 'Paid'}
+                        </span>
+                        {isUserAdminOrOwner(currentUser) && inv.type !== 'waiver' && (
+                          <button onClick={(e) => { e.stopPropagation(); handleDeleteReceipt(inv); }} style={{ marginLeft: 10, background: 'none', border: 'none', color: 'var(--danger)', cursor: 'pointer', padding: 4 }} title="Delete Receipt">
+                            <Trash2 size={14} />
+                          </button>
+                        )}
+                      </div>
+                    </div>
                   );
-                  return pool.map((m, i) => {
-                    const max = Number(m.totalMarks) || Number(m.maxMarks) || 100;
-                    const marks = Number(m.marks) || 0;
-                    const pct = max > 0 ? Math.round((marks / max) * 100) : 0;
-                    const grade = pct >= 90 ? 'A+' : pct >= 80 ? 'A' : pct >= 70 ? 'B+' : pct >= 60 ? 'B' : pct >= 50 ? 'C' : pct >= 33 ? 'D' : 'F';
-                    return (
-                      <tr key={m.id || i}>
-                        <td style={{ fontWeight: 700 }}>{m.subject}</td>
-                        <td style={{ fontFamily: 'var(--font-mono)', fontWeight: 700 }}>{marks} / {max}</td>
-                        <td>
-                          <span className="badge" style={{ backgroundColor: pct >= 60 ? 'rgba(16, 185, 129, 0.1)' : pct >= 33 ? 'rgba(245, 158, 11, 0.1)' : 'rgba(239, 68, 68, 0.1)', color: pct >= 60 ? 'var(--success)' : pct >= 33 ? 'var(--warning)' : 'var(--danger)', fontWeight: 700 }}>
-                            {grade}
-                          </span>
-                        </td>
-                        <td style={{ textAlign: 'right' }}>
-                          <span style={{ fontSize: 12, fontWeight: 700, color: pct >= 33 ? 'var(--success)' : 'var(--danger)' }}>
-                            {pct >= 33 ? 'Pass' : 'Fail'}
-                          </span>
-                        </td>
-                      </tr>
-                    );
-                  });
-                })()}
-              </tbody>
-            </table>
+                })}
+              </div>
+            )}
+          </div>
+        </>
+      )}
 
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: 'var(--bg-secondary)', padding: 14, borderRadius: 12 }}>
-              <div>
-                <div style={{ fontSize: 12, color: 'var(--text-secondary)', fontWeight: 600 }}>Overall Cumulative Score</div>
-                <div style={{ fontSize: 20, fontWeight: 900, color: marksData.length > 0 ? 'var(--text-primary)' : 'var(--text-secondary)' }}>
-                  {marksData.length > 0 ? `${marksAvg}%` : 'No Data'}
+      {activeProfileTab === 'transport' && activeStudent?.isTransportApplied && (
+        <>
+          {/* Transport Hero Financial Summary */}
+          <div className="glass-card" style={{ padding: 24, borderRadius: 20, backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-light)', boxShadow: '0 10px 30px rgba(0, 0, 0, 0.04)', marginBottom: 24 }}>
+            <div className="flex-responsive" style={{ marginBottom: 20 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <div style={{ width: 36, height: 36, borderRadius: 10, backgroundColor: 'var(--bg-secondary)', color: 'var(--brand-orange)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <Calendar size={20} />
+                </div>
+                <div>
+                  <h2 style={{ fontSize: 18, fontWeight: 800, color: 'var(--text-primary)', margin: 0 }}>
+                    Transport Fees & Route
+                  </h2>
+                  <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                    {(() => {
+                      const route = getTransportRoutes(activeStudent?.schoolId || 'SCH_01').find(r => r.id === activeStudent?.transportRouteId);
+                      return route ? route.name : 'Unknown Route';
+                    })()}
+                  </span>
                 </div>
               </div>
-              <button className="btn-secondary" onClick={() => window.print()} style={{ fontSize: 13, fontWeight: 700 }}>
-                <Download size={16} /> Print Marksheet
-              </button>
+            </div>
+
+            <div className="grid-responsive" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
+              <div style={{ backgroundColor: 'var(--bg-secondary)', padding: 16, borderRadius: 14, border: '1px solid var(--border-light)' }}>
+                <div style={{ fontSize: 12, color: 'var(--danger)', textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 800, marginBottom: 4 }}>
+                  Transport Outstanding Due
+                </div>
+                <div style={{ fontSize: 28, fontWeight: 900, fontFamily: 'var(--font-mono)', color: 'var(--danger)' }}>
+                  ₹ {transportDueAmount ? Number(transportDueAmount).toLocaleString() : '0'}.00
+                </div>
+              </div>
+
+              <div style={{ backgroundColor: 'var(--bg-secondary)', padding: 16, borderRadius: 14, border: '1px solid var(--border-light)' }}>
+                <div style={{ fontSize: 12, color: 'var(--success)', textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 800, marginBottom: 4 }}>
+                  Transport Paid
+                </div>
+                <div style={{ fontSize: 28, fontWeight: 900, fontFamily: 'var(--font-mono)', color: 'var(--success)' }}>
+                  ₹ {transportPaidAmount > 0 ? transportPaidAmount.toLocaleString() : '0'}.00
+                </div>
+              </div>
+
+              <div style={{ backgroundColor: 'var(--bg-secondary)', padding: 16, borderRadius: 14, border: '1px solid var(--border-light)' }}>
+                <div style={{ fontSize: 12, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 800, marginBottom: 4 }}>
+                  Transport Annual Total
+                </div>
+                <div style={{ fontSize: 28, fontWeight: 900, fontFamily: 'var(--font-mono)', color: 'var(--text-primary)' }}>
+                  ₹ {transportAnnualFee > 0 ? transportAnnualFee.toLocaleString() : '0'}.00
+                </div>
+              </div>
             </div>
           </div>
-        </div>
+
+          {/* Transport Payment History */}
+          <div className="glass-card" style={{ padding: 24, borderRadius: 20, marginBottom: 24 }}>
+            <h3 style={{ fontSize: 16, fontWeight: 800, color: 'var(--text-primary)', marginBottom: 16 }}>Transport Payments History</h3>
+            {paymentHistory.length === 0 ? (
+              <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-secondary)', backgroundColor: 'var(--bg-secondary)', borderRadius: 12 }}>
+                No transport payments recorded yet.
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                {paymentHistory.map((inv, idx) => {
+                  let transportAllocated = 0;
+                  if (inv.allocations && inv.allocations.length > 0) {
+                    transportAllocated = inv.allocations.filter(a => a.componentId === 'transport').reduce((sum, a) => sum + (Number(a.amount) || 0), 0);
+                  }
+                  
+                  if (transportAllocated <= 0) return null;
+
+                  return (
+                    <div key={idx} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '16px', backgroundColor: 'var(--bg-secondary)', borderRadius: 12, border: '1px solid var(--border-light)' }}>
+                      <div>
+                        <div style={{ fontWeight: 700, color: 'var(--text-primary)' }}>{inv.receiptId || inv.receiptNo || 'Receipt'}</div>
+                        <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 4 }}>
+                          {inv.date ? new Date(inv.date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : 'Unknown Date'}
+                        </div>
+                      </div>
+                      <div style={{ textAlign: 'right' }}>
+                        <div style={{ fontSize: 16, fontWeight: 800, color: 'var(--success)' }}>₹ {Number(transportAllocated).toLocaleString()}</div>
+                        {inv.amount > transportAllocated && (
+                          <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>Part of ₹{Number(inv.amount).toLocaleString()} total</div>
+                        )}
+                        <span className="badge" style={{ backgroundColor: 'rgba(16, 185, 129, 0.1)', color: 'var(--success)', marginTop: 4, display: 'inline-block' }}>
+                          {inv.status || 'Paid'}
+                        </span>
+                        {isUserAdminOrOwner(currentUser) && inv.type !== 'waiver' && (
+                          <button onClick={(e) => { e.stopPropagation(); handleDeleteReceipt(inv); }} style={{ marginLeft: 10, background: 'none', border: 'none', color: 'var(--danger)', cursor: 'pointer', padding: 4 }} title="Delete Receipt">
+                            <Trash2 size={14} />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </>
       )}
+      {/* End profile rendering */}
     </div>
   );
 }

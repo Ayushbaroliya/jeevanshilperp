@@ -258,5 +258,5 @@ export function getText(key, lang = 'en') {
 export const SCHOOLS = [
   { id: 'SCH_01', name: 'Jeevan Shilp Public School', city: 'Main Branch', code: 'JSPS' },
   { id: 'SCH_02', name: 'Jeevan Shilp Inter College', city: 'College Wing', code: 'JSIC' },
-  { id: 'SCH_03', name: 'Jeevan Shilp Adarsh Shala', city: 'Branch 2', code: 'JSB2' }
+  { id: 'SCH_03', name: 'Jeevan Shilp Sanskarshala', city: 'Branch 2', code: 'JSB2' }
 ];

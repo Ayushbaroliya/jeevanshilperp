@@ -13,20 +13,36 @@ export default function TeacherDashboard({ onNavigate, currentUser, lang = 'en' 
 
   useEffect(() => {
     const fetchMyClasses = async () => {
-      if (!currentUser?.id) return;
+      // Use uid (Firebase Auth UID) as canonical teacher identity; fall back to id
+      const teacherUid = currentUser?.uid || currentUser?.id;
+      if (!teacherUid) {
+        setIsLoading(false);
+        return;
+      }
       try {
-        let q = query(
-          collection(db, "class_assignments"),
-          where("teacherId", "==", currentUser.id)
-        );
-        if (currentUser?.schoolId) {
-          q = query(collection(db, "class_assignments"), where("teacherId", "==", currentUser.id), where("schoolId", "==", currentUser.schoolId));
-        }
+        // Query by uid (canonical field stored in assignments)
+        const schoolId = currentUser?.schoolId;
+        let q = schoolId
+          ? query(collection(db, "class_assignments"), where("teacherId", "==", teacherUid), where("schoolId", "==", schoolId))
+          : query(collection(db, "class_assignments"), where("teacherId", "==", teacherUid));
+
         const querySnapshot = await getDocs(q);
         const classes = [];
         querySnapshot.forEach((doc) => {
           classes.push({ id: doc.id, ...doc.data() });
         });
+
+        // If nothing found by uid, try by Firestore doc id as legacy fallback
+        if (classes.length === 0 && currentUser?.id && currentUser.id !== teacherUid) {
+          const legacyQ = schoolId
+            ? query(collection(db, "class_assignments"), where("teacherId", "==", currentUser.id), where("schoolId", "==", schoolId))
+            : query(collection(db, "class_assignments"), where("teacherId", "==", currentUser.id));
+          const legacySnap = await getDocs(legacyQ);
+          legacySnap.forEach((doc) => {
+            classes.push({ id: doc.id, ...doc.data() });
+          });
+        }
+
         setAssignedClasses(classes);
       } catch (err) {
         console.error("Error fetching assigned classes:", err);

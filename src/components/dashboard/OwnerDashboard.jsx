@@ -22,6 +22,9 @@ export default function OwnerDashboard({ onNavigate, lang, selectedSchool, setSe
   const [pendingPayoutsCount, setPendingPayoutsCount] = useState(null);
   const [duesPaid, setDuesPaid] = useState(0);
   const [duesUnpaid, setDuesUnpaid] = useState(0);
+  const [todayIncome, setTodayIncome] = useState(0);
+  const [todayExpenses, setTodayExpenses] = useState(0);
+  const [todayNetPosition, setTodayNetPosition] = useState(0);
 
   useEffect(() => {
     const fetchDashboardData = async () => {
@@ -101,6 +104,25 @@ export default function OwnerDashboard({ onNavigate, lang, selectedSchool, setSe
           }
         });
         
+
+        try {
+          const schoolExpensesSnap = await getDocs(collection(db, 'school_expenses'));
+          schoolExpensesSnap.forEach(doc => {
+            const data = doc.data();
+            const amt = Number(data.amount) || 0;
+            if (amt <= 0) return;
+            const d = new Date(data.expenseDate || data.createdAt);
+            const m = monthNames[d.getMonth()];
+            if (!m) return;
+            
+            if (selectedSchool === 'ALL' || selectedSchool === data.schoolId) {
+              if (!singleMap[m]) singleMap[m] = { month: m, Revenue: 0, Expenses: 0 };
+              singleMap[m].Expenses += amt;
+            }
+          });
+        } catch (err) {
+          console.warn('Could not fetch school_expenses. Have you deployed firestore.rules?', err);
+        }
         setMultiSchoolComparisonData(Object.values(multiMap));
         setSingleSchoolFinancialData(Object.values(singleMap));
 
@@ -113,6 +135,52 @@ export default function OwnerDashboard({ onNavigate, lang, selectedSchool, setSe
       }
     };
     fetchDashboardData();
+  }, [selectedSchool]);
+
+  useEffect(() => {
+    const fetchTodayFinancials = async () => {
+      try {
+        const now = new Date();
+        const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        const endOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+        
+        let income = 0;
+        let expenses = 0;
+        
+        // Fetch today's invoices
+        const invoicesSnap = await getDocs(collection(db, 'invoices'));
+        invoicesSnap.forEach(doc => {
+          const data = doc.data();
+          if (selectedSchool !== 'ALL' && data.schoolId !== selectedSchool) return;
+          const d = new Date(data.date || data.createdAt);
+          if (d >= startOfDay && d <= endOfDay) {
+            income += (Number(data.amount) || 0);
+          }
+        });
+        
+        // Fetch today's school expenses
+        try {
+          const expensesSnap = await getDocs(collection(db, 'school_expenses'));
+          expensesSnap.forEach(doc => {
+            const data = doc.data();
+            if (selectedSchool !== 'ALL' && data.schoolId !== selectedSchool) return;
+            const d = new Date(data.expenseDate || data.createdAt);
+            if (d >= startOfDay && d <= endOfDay) {
+              expenses += (Number(data.amount) || 0);
+            }
+          });
+        } catch (err) {
+          console.warn('Could not fetch school_expenses for today financials. Deploy firestore.rules?', err);
+        }
+        
+        setTodayIncome(income);
+        setTodayExpenses(expenses);
+        setTodayNetPosition(income - expenses);
+      } catch (err) {
+        console.error('Error fetching today financials:', err);
+      }
+    };
+    fetchTodayFinancials();
   }, [selectedSchool]);
 
   useEffect(() => {
@@ -314,7 +382,7 @@ export default function OwnerDashboard({ onNavigate, lang, selectedSchool, setSe
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 <Bar dataKey="PublicSchool" name="Jeevan Shilp Public School" fill="#3b82f6" radius={[4, 4, 0, 0]} />
                 <Bar dataKey="InterCollege" name="Jeevan Shilp Inter College" fill="#10b981" radius={[4, 4, 0, 0]} />
-                <Bar dataKey="Branch2" name="Jeevan Shilp Adarsh Shala" fill="#f97316" radius={[4, 4, 0, 0]} />
+                <Bar dataKey="Branch2" name="Jeevan Shilp Sanskarshala" fill="#f97316" radius={[4, 4, 0, 0]} />
               </BarChart>
             ) : (
               <BarChart data={singleSchoolFinancialData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>

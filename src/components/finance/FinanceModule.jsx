@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { ArrowLeft, CreditCard, Briefcase, Plus, Download, Filter, AlertCircle, Phone, MessageSquare, Printer, CheckCircle, Search, Layers, FileText, RotateCcw } from 'lucide-react';
-import { collection, getDocs, doc, runTransaction, query, where, orderBy, addDoc, getDoc, updateDoc , writeBatch} from 'firebase/firestore';
+import { ArrowLeft, CreditCard, Briefcase, BarChart2, Plus, Download, Filter, AlertCircle, Phone, MessageSquare, Printer, Trash2, CheckCircle, Search, Layers, FileText, RotateCcw, Calendar, RefreshCcw } from 'lucide-react';
+import { collection, getDocs, doc, runTransaction, query, where, orderBy, addDoc, getDoc, updateDoc, deleteDoc, writeBatch, serverTimestamp } from 'firebase/firestore';
+import SchoolExpensesReport from './SchoolExpensesReport';
+import ProfitAndLossReport from './ProfitAndLossReport';
 import * as XLSX from 'xlsx';
 import { auth, db } from '../../firebase';
 import { t, SCHOOLS } from '../../utils/translations';
@@ -18,13 +20,27 @@ import {
 } from '../../utils/feeEngine';
 import { generateFeeReceipt } from '../../utils/pdfGenerator';
 
+const isUserAdminOrOwner = (user) => {
+  if (!user) return true;
+  if (user.email === 'jeevanshilporg@gmail.com') return true;
+  const r = (user.role || '').toLowerCase();
+  return r === 'owner' || r === 'director' || r === 'admin' || r === 'administrator' || r.includes('admin');
+};
+
+const isOwnerOnly = (user) => {
+  if (!user) return false;
+  if (user.email === 'jeevanshilporg@gmail.com') return true;
+  const r = (user.role || '').toLowerCase();
+  return r === 'owner' || r === 'director';
+};
+
 function getAcademicYear() {
   return "2026-2027";
 }
 
 const SCHOOL_OPTIONS = SCHOOLS.map(s => ({ id: s.id, name: s.name }));
 
-export default function FinanceModule({ onNavigate, userPermissions, lang = 'en', selectedSchool, setSelectedSchool, classes = [], activeAcademicYearId = 'AY_2026_27' }) {
+export default function FinanceModule({ onNavigate, userPermissions, lang = 'en', selectedSchool, setSelectedSchool, classes = [], activeAcademicYearId = 'AY_2026_27', currentUser }) {
   const [activeTab, setActiveTab] = useState('classwise');
   const [prefilledStudentId, setPrefilledStudentId] = useState('');
   const dict = t[lang] || t.en;
@@ -62,6 +78,12 @@ export default function FinanceModule({ onNavigate, userPermissions, lang = 'en'
         <button className={activeTab === 'classwise' ? 'btn-primary' : 'btn-secondary'} onClick={() => setActiveTab('classwise')} style={{ padding: '10px 18px', fontSize: 13, fontWeight: 800 }}>
           <Filter size={16} /> Classwise Fee Dues
         </button>
+        <button className={activeTab === 'expenses' ? 'btn-primary' : 'btn-secondary'} onClick={() => setActiveTab('expenses')} style={{ padding: '10px 18px', fontSize: 13, fontWeight: 700 }}>
+          <Briefcase size={16} /> School Expenses
+        </button>
+        <button className={activeTab === 'pnl' ? 'btn-primary' : 'btn-secondary'} onClick={() => setActiveTab('pnl')} style={{ padding: '10px 18px', fontSize: 13, fontWeight: 700 }}>
+          <BarChart2 size={16} /> Profit & Loss
+        </button>
         {canRecord && (
           <button className={activeTab === 'record' ? 'btn-primary' : 'btn-secondary'} onClick={() => setActiveTab('record')} style={{ padding: '10px 18px', fontSize: 13, fontWeight: 700 }}>
             <CreditCard size={16} /> Record Payment
@@ -77,6 +99,21 @@ export default function FinanceModule({ onNavigate, userPermissions, lang = 'en'
         )}
       </div>
 
+      {activeTab === 'expenses' && (
+        <SchoolExpensesReport
+          selectedSchool={selectedSchool}
+          classes={classes}
+          activeAcademicYearId={activeAcademicYearId}
+          dict={dict}
+          currentUser={currentUser}
+        />
+      )}
+      {activeTab === 'pnl' && (
+        <ProfitAndLossReport
+          selectedSchool={selectedSchool}
+          dict={dict}
+        />
+      )}
       {activeTab === 'classwise' && (
         <ClasswiseDueFeesReport
           onCollectFee={handleSelectStudentForPayment}
@@ -114,6 +151,7 @@ export default function FinanceModule({ onNavigate, userPermissions, lang = 'en'
           userPermissions={userPermissions}
           dict={dict}
           selectedSchool={selectedSchool}
+          currentUser={currentUser}
         />
       )}
     </div>
@@ -1172,22 +1210,87 @@ function FeeAdjustmentModule({ selectedSchool, setSelectedSchool, userPermission
 // ────────────────────────────────────────────────────────────────────────────
 // RECEIPT HISTORY (INVOICES)
 // ────────────────────────────────────────────────────────────────────────────
-function InvoicesModule({ subOnNavigate, userPermissions, dict, selectedSchool }) {
+function InvoicesModule({ subOnNavigate, userPermissions, dict, selectedSchool, currentUser }) {
   const [invoices, setInvoices] = useState([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
 
+  // 'active' = Normal receipts, 'recycle_bin' = Small place for deleted receipts directly on this tab
+  const [viewMode, setViewMode] = useState('active');
+
+  // Date filtering state: 'today' | 'yesterday' | 'custom' | 'range' | 'all'
+  const [dateFilterMode, setDateFilterMode] = useState('today');
+
+  const toLocalDateStr = (dateVal) => {
+    if (!dateVal) return '';
+    try {
+      const dateObj = (dateVal.toDate && typeof dateVal.toDate === 'function')
+        ? dateVal.toDate()
+        : (dateVal.seconds ? new Date(dateVal.seconds * 1000) : new Date(dateVal));
+      if (isNaN(dateObj.getTime())) return '';
+      const year = dateObj.getFullYear();
+      const month = String(dateObj.getMonth() + 1).padStart(2, '0');
+      const day = String(dateObj.getDate()).padStart(2, '0');
+      return `${year}-${month}-${day}`;
+    } catch {
+      return '';
+    }
+  };
+
+  const todayStr = useMemo(() => toLocalDateStr(new Date()), []);
+  const yesterdayStr = useMemo(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 1);
+    return toLocalDateStr(d);
+  }, []);
+
+  const [customDate, setCustomDate] = useState(todayStr);
+  const [startDate, setStartDate] = useState(todayStr);
+  const [endDate, setEndDate] = useState(todayStr);
+
   useEffect(() => {
-    const fetchInvoices = async () => {
+    const fetchInvoicesAndStudents = async () => {
       setLoading(true);
       try {
         let q = collection(db, "invoices");
         if (selectedSchool && selectedSchool !== 'ALL') {
           q = query(q, where("schoolId", "==", selectedSchool));
         }
-        const qs = await getDocs(q);
-        const list = qs.docs.map(d => ({ id: d.id, ...d.data() }));
-        list.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+
+        let studentQ = collection(db, "students");
+        if (selectedSchool && selectedSchool !== 'ALL') {
+          studentQ = query(studentQ, where("schoolId", "==", selectedSchool));
+        }
+
+        const [qs, studentSnap] = await Promise.all([
+          getDocs(q),
+          getDocs(studentQ)
+        ]);
+
+        const studentMap = {};
+        studentSnap.docs.forEach(d => {
+          studentMap[d.id] = d.data();
+        });
+
+        const list = qs.docs.map(d => {
+          const data = d.data();
+          const st = studentMap[data.studentId] || {};
+          const fatherVal = data.fatherName || data.parentName || data.father || st.fatherName || st.parentName || st.father || st.father_name || '';
+          return {
+            id: d.id,
+            ...data,
+            fatherName: fatherVal,
+            parentName: fatherVal,
+            section: data.section || st.section || '',
+            class: data.class || st.class || '',
+            roll: data.roll || st.roll || '',
+            student: data.student || st.name || 'Unknown Student',
+            contact: data.contact || st.contact || st.parentContact || '',
+            paymentMethod: data.paymentMethod || data.paymentMode || data.method || 'Cash'
+          };
+        });
+
+        list.sort((a, b) => new Date(b.date || b.createdAt || 0) - new Date(a.date || a.createdAt || 0));
         setInvoices(list);
       } catch (err) {
         console.error("Error fetching invoices:", err);
@@ -1195,98 +1298,555 @@ function InvoicesModule({ subOnNavigate, userPermissions, dict, selectedSchool }
         setLoading(false);
       }
     };
-    fetchInvoices();
+    fetchInvoicesAndStudents();
   }, [selectedSchool]);
 
-  const filteredInvoices = invoices.filter(inv => {
-    if (!search.trim()) return true;
-    const s = search.toLowerCase();
-    return (
-      (inv.student || '').toLowerCase().includes(s) ||
-      (inv.receiptId || '').toLowerCase().includes(s) ||
-      (inv.receiptNo || '').toLowerCase().includes(s) ||
-      (inv.class || '').toLowerCase().includes(s)
-    );
-  });
+  const activeCount = useMemo(() => invoices.filter(i => !i.deleted).length, [invoices]);
+  const deletedCount = useMemo(() => invoices.filter(i => i.deleted).length, [invoices]);
+
+  const handleSoftDeleteInvoice = async (invoiceId) => {
+    if (!window.confirm('Move this receipt to Recycle Bin?')) return;
+    try {
+      await updateDoc(doc(db, 'invoices', invoiceId), {
+        deleted: true,
+        deletedAt: serverTimestamp(),
+        deletedBy: currentUser?.email || currentUser?.uid || 'Admin'
+      });
+      setInvoices(prev => prev.map(inv => inv.id === invoiceId ? { ...inv, deleted: true } : inv));
+      alert('Receipt moved to Recycle Bin.');
+    } catch (err) {
+      console.error('Failed to delete receipt:', err);
+      alert('Failed to delete receipt: ' + err.message);
+    }
+  };
+
+  const handleRestoreInvoice = async (invoiceId) => {
+    if (!window.confirm('Restore this receipt back to active records?')) return;
+    try {
+      await updateDoc(doc(db, 'invoices', invoiceId), {
+        deleted: false,
+        restoredAt: serverTimestamp(),
+        restoredBy: currentUser?.email || currentUser?.uid || 'Admin'
+      });
+      setInvoices(prev => prev.map(inv => inv.id === invoiceId ? { ...inv, deleted: false } : inv));
+      alert('Receipt restored successfully.');
+    } catch (err) {
+      console.error('Failed to restore receipt:', err);
+      alert('Failed to restore receipt: ' + err.message);
+    }
+  };
+
+  const handlePermanentDeleteInvoice = async (invoiceId) => {
+    if (!isOwnerOnly(currentUser)) {
+      alert('Only Owners/Directors can permanently delete records from Recycle Bin.');
+      return;
+    }
+    if (!window.confirm('WARNING: This action is PERMANENT and CANNOT be undone.\nAre you sure you want to permanently delete this receipt?')) return;
+    try {
+      await deleteDoc(doc(db, 'invoices', invoiceId));
+      setInvoices(prev => prev.filter(inv => inv.id !== invoiceId));
+      alert('Receipt permanently deleted.');
+    } catch (err) {
+      console.error('Failed to permanently delete receipt:', err);
+      alert('Failed to delete receipt: ' + err.message);
+    }
+  };
+
+  const filteredInvoices = useMemo(() => {
+    return invoices.filter(inv => {
+      // 1. Separate Active vs Recycle Bin
+      if (viewMode === 'recycle_bin') {
+        if (!inv.deleted) return false;
+      } else {
+        if (inv.deleted) return false;
+      }
+
+      // 2. School branch isolation
+      if (selectedSchool && selectedSchool !== 'ALL' && inv.schoolId !== selectedSchool) {
+        return false;
+      }
+
+      // 3. Date filtering (applies to active view; recycle bin can view all or search)
+      if (viewMode === 'active') {
+        const invDateStr = toLocalDateStr(inv.date || inv.createdAt || inv.timestamp);
+        if (dateFilterMode === 'today') {
+          if (invDateStr !== todayStr) return false;
+        } else if (dateFilterMode === 'yesterday') {
+          if (invDateStr !== yesterdayStr) return false;
+        } else if (dateFilterMode === 'custom') {
+          if (invDateStr !== customDate) return false;
+        } else if (dateFilterMode === 'range') {
+          if (startDate && invDateStr < startDate) return false;
+          if (endDate && invDateStr > endDate) return false;
+        }
+      }
+
+      // 4. Search query
+      if (search.trim()) {
+        const s = search.toLowerCase();
+        const matchStudent = (inv.student || '').toLowerCase().includes(s);
+        const matchReceipt = (inv.receiptId || inv.receiptNo || inv.id || '').toLowerCase().includes(s);
+        const matchClass = (inv.class || '').toLowerCase().includes(s);
+        const matchSection = (inv.section || '').toLowerCase().includes(s);
+        const matchFather = (inv.fatherName || '').toLowerCase().includes(s);
+        const matchMethod = (inv.paymentMethod || '').toLowerCase().includes(s);
+        if (!matchStudent && !matchReceipt && !matchClass && !matchSection && !matchFather && !matchMethod) {
+          return false;
+        }
+      }
+
+      return true;
+    });
+  }, [invoices, viewMode, selectedSchool, dateFilterMode, customDate, startDate, endDate, search, todayStr, yesterdayStr]);
+
+  // Active Daily & Range Totals
+  const totals = useMemo(() => {
+    let count = filteredInvoices.length;
+    let totalAmount = 0;
+    let cash = 0;
+    let onlineUPI = 0;
+    let other = 0;
+
+    filteredInvoices.forEach(inv => {
+      const amt = Number(inv.amount || 0);
+      totalAmount += amt;
+      const m = (inv.paymentMethod || 'cash').toLowerCase().trim();
+      if (m === 'cash') {
+        cash += amt;
+      } else if (
+        m.includes('online') ||
+        m.includes('upi') ||
+        m.includes('gpay') ||
+        m.includes('phonepe') ||
+        m.includes('paytm') ||
+        m.includes('netbanking') ||
+        m.includes('neft') ||
+        m.includes('rtgs') ||
+        m.includes('card') ||
+        m.includes('qr') ||
+        m.includes('bank')
+      ) {
+        onlineUPI += amt;
+      } else {
+        other += amt;
+      }
+    });
+
+    return { count, totalAmount, cash, onlineUPI, other };
+  }, [filteredInvoices]);
+
+  const schoolName = SCHOOLS.find(s => s.id === selectedSchool)?.name || (selectedSchool === 'ALL' ? 'All Campuses' : selectedSchool);
+
+  const handleExportReceiptsExcel = () => {
+    if (filteredInvoices.length === 0) {
+      alert("No receipts found for the selected filter to export.");
+      return;
+    }
+    const wb = XLSX.utils.book_new();
+    const rows = filteredInvoices.map((inv, idx) => {
+      const parentVal = inv.fatherName || inv.parentName || inv.father || inv.father_name || '';
+      const dateObj = inv.date ? new Date(inv.date) : null;
+      const dateDisplay = dateObj && !isNaN(dateObj.getTime())
+        ? dateObj.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })
+        : 'N/A';
+
+      const breakdown = inv.allocations && inv.allocations.length > 0
+        ? inv.allocations.map(a => `${a.label || a.componentId || 'Item'}: ₹${Number(a.amount || 0)}`).join(', ')
+        : 'Total Receipt';
+
+      const invSchoolName = SCHOOLS.find(s => s.id === inv.schoolId)?.name || inv.schoolId || schoolName;
+
+      return {
+        'S.No.': idx + 1,
+        'Receipt No': inv.receiptId || inv.receiptNo || inv.id || '',
+        'Payment Date': dateDisplay,
+        'Student Name': inv.student || '',
+        "Father's Name": parentVal,
+        "Parent's Name": parentVal,
+        'Class': inv.class || '',
+        'Section': inv.section || '',
+        'Contact': inv.contact || '',
+        'Payment Amount (₹)': Number(inv.amount || 0),
+        'Payment Method': inv.paymentMethod || 'Cash',
+        'Fee Breakdown': breakdown,
+        'School': invSchoolName
+      };
+    });
+
+    const ws = XLSX.utils.json_to_sheet(rows);
+    XLSX.utils.book_append_sheet(wb, ws, "Receipts");
+    XLSX.writeFile(wb, `Receipts_${schoolName}_${viewMode === 'recycle_bin' ? 'RecycleBin' : dateFilterMode}_${new Date().toISOString().split('T')[0]}.xlsx`);
+  };
 
   return (
     <div className="glass-card" style={{ padding: 24 }}>
+      {/* HEADER */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20, flexWrap: 'wrap', gap: 12 }}>
         <div>
           <h2 style={{ margin: 0, fontSize: 20, fontWeight: 800 }}>{dict?.invoicesAndReceipts || 'Issued Receipts & History'}</h2>
           <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>
-            {filteredInvoices.length} receipt(s) found
+            Branch: <strong>{schoolName}</strong> • {filteredInvoices.length} receipt{filteredInvoices.length === 1 ? '' : 's'} {viewMode === 'recycle_bin' ? 'in recycle bin' : 'matching filter'}
           </span>
         </div>
-        <div style={{ position: 'relative', minWidth: 260 }}>
-          <input
-            type="text"
-            className="form-input"
-            placeholder="Search by student, receipt no, class..."
-            value={search}
-            onChange={e => setSearch(e.target.value)}
-            style={{ paddingLeft: 36, width: '100%' }}
-          />
-          <Search size={16} style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-secondary)' }} />
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          {/* SEARCH BAR */}
+          <div style={{ position: 'relative', minWidth: 220 }}>
+            <input
+              type="text"
+              className="form-input"
+              placeholder="Search student, receipt, class, father..."
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              style={{ paddingLeft: 36, width: '100%' }}
+            />
+            <Search size={16} style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-secondary)' }} />
+          </div>
+
+          {/* EXCEL EXPORT */}
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={handleExportReceiptsExcel}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontWeight: 700, padding: '8px 14px' }}
+            title="Export filtered receipts to Excel"
+          >
+            <Download size={16} /> Export Excel
+          </button>
+
+          {/* SMALL PLACE ON RECEIPT HISTORY TAB FOR RECYCLE BIN */}
+          {isUserAdminOrOwner(currentUser) && (
+            <div style={{ display: 'inline-flex', gap: 4, backgroundColor: 'var(--bg-secondary)', padding: 3, borderRadius: 8, border: '1px solid var(--border-light)' }}>
+              <button
+                type="button"
+                className={viewMode === 'active' ? 'btn-primary' : 'btn-secondary'}
+                onClick={() => setViewMode('active')}
+                style={{ padding: '6px 12px', fontSize: 12, fontWeight: 700, borderRadius: 6 }}
+              >
+                Active ({activeCount})
+              </button>
+              <button
+                type="button"
+                className={viewMode === 'recycle_bin' ? 'btn-primary' : 'btn-secondary'}
+                onClick={() => setViewMode('recycle_bin')}
+                style={{
+                  padding: '6px 12px',
+                  fontSize: 12,
+                  fontWeight: 700,
+                  borderRadius: 6,
+                  color: viewMode === 'recycle_bin' ? '#fff' : (deletedCount > 0 ? 'var(--danger, #ef4444)' : 'var(--text-secondary)'),
+                  backgroundColor: viewMode === 'recycle_bin' ? 'var(--danger, #ef4444)' : 'transparent',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 4
+                }}
+                title="View Deleted Receipts in Recycle Bin"
+              >
+                <Trash2 size={13} /> Recycle Bin {deletedCount > 0 ? `(${deletedCount})` : ''}
+              </button>
+            </div>
+          )}
         </div>
       </div>
 
+      {/* RECYCLE BIN BANNER WHEN ACTIVE */}
+      {viewMode === 'recycle_bin' && (
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 16px', backgroundColor: 'rgba(239, 68, 68, 0.08)', border: '1px solid rgba(239, 68, 68, 0.3)', borderRadius: 10, marginBottom: 16, flexWrap: 'wrap', gap: 10 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Trash2 size={18} style={{ color: 'var(--danger, #ef4444)' }} />
+            <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)' }}>
+              <strong>Receipt Recycle Bin:</strong> Showing {filteredInvoices.length} deleted receipt{filteredInvoices.length === 1 ? '' : 's'}. Soft-deleted receipts are excluded from fee reports and cash totals.
+            </span>
+          </div>
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={() => setViewMode('active')}
+            style={{ padding: '4px 10px', fontSize: 12, fontWeight: 700 }}
+          >
+            ← Back to Active Receipts
+          </button>
+        </div>
+      )}
+
+      {/* DATE FILTER CONTROL BAR (Visible in active view) */}
+      {viewMode === 'active' && (
+        <div style={{ display: 'flex', gap: 12, marginBottom: 20, flexWrap: 'wrap', alignItems: 'center', padding: 14, backgroundColor: 'var(--bg-secondary)', borderRadius: 10, border: '1px solid var(--border-light)' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 700, fontSize: 13, color: 'var(--text-secondary)' }}>
+            <Calendar size={16} /> Filter by Date:
+          </div>
+
+          <div style={{ display: 'inline-flex', gap: 6, flexWrap: 'wrap' }}>
+            {[
+              { id: 'today', label: 'Today' },
+              { id: 'yesterday', label: 'Yesterday' },
+              { id: 'custom', label: 'Custom Date' },
+              { id: 'range', label: 'Date Range' },
+              { id: 'all', label: 'All Dates' }
+            ].map(btn => (
+              <button
+                key={btn.id}
+                type="button"
+                className={dateFilterMode === btn.id ? 'btn-primary' : 'btn-secondary'}
+                onClick={() => setDateFilterMode(btn.id)}
+                style={{ padding: '6px 14px', fontSize: 13, fontWeight: 700, borderRadius: 8 }}
+              >
+                {btn.label}
+              </button>
+            ))}
+          </div>
+
+          {dateFilterMode === 'custom' && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <input
+                type="date"
+                className="form-input"
+                value={customDate}
+                onChange={e => setCustomDate(e.target.value)}
+                style={{ padding: '6px 12px', fontSize: 13 }}
+              />
+            </div>
+          )}
+
+          {dateFilterMode === 'range' && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+              <input
+                type="date"
+                className="form-input"
+                value={startDate}
+                onChange={e => setStartDate(e.target.value)}
+                style={{ padding: '6px 12px', fontSize: 13 }}
+              />
+              <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>to</span>
+              <input
+                type="date"
+                className="form-input"
+                value={endDate}
+                onChange={e => setEndDate(e.target.value)}
+                style={{ padding: '6px 12px', fontSize: 13 }}
+              />
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* SUMMARY STATS CARDS */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 14, marginBottom: 20 }}>
+        <div style={{ padding: '14px 18px', borderRadius: 10, backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-light)' }}>
+          <div style={{ fontSize: 12, color: 'var(--text-secondary)', fontWeight: 600 }}>
+            {viewMode === 'recycle_bin' ? 'Deleted Receipts' : 'Total Receipts'}
+          </div>
+          <div style={{ fontSize: 24, fontWeight: 800, color: 'var(--text-primary)', marginTop: 4 }}>
+            {filteredInvoices.length}
+          </div>
+        </div>
+
+        <div style={{ padding: '14px 18px', borderRadius: 10, backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-light)' }}>
+          <div style={{ fontSize: 12, color: 'var(--text-secondary)', fontWeight: 600 }}>
+            {viewMode === 'recycle_bin' ? 'Deleted Total Value' : 'Total Collected'}
+          </div>
+          <div style={{ fontSize: 24, fontWeight: 800, color: viewMode === 'recycle_bin' ? 'var(--danger, #ef4444)' : 'var(--brand-primary)', marginTop: 4 }}>
+            ₹{totals.totalAmount.toLocaleString()}
+          </div>
+        </div>
+
+        {viewMode === 'active' && (
+          <>
+            <div style={{ padding: '14px 18px', borderRadius: 10, backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-light)' }}>
+              <div style={{ fontSize: 12, color: 'var(--text-secondary)', fontWeight: 600 }}>Cash Collection</div>
+              <div style={{ fontSize: 24, fontWeight: 800, color: '#10b981', marginTop: 4 }}>₹{totals.cash.toLocaleString()}</div>
+            </div>
+
+            <div style={{ padding: '14px 18px', borderRadius: 10, backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-light)' }}>
+              <div style={{ fontSize: 12, color: 'var(--text-secondary)', fontWeight: 600 }}>Online / UPI</div>
+              <div style={{ fontSize: 24, fontWeight: 800, color: '#8b5cf6', marginTop: 4 }}>₹{totals.onlineUPI.toLocaleString()}</div>
+            </div>
+
+            {totals.other > 0 && (
+              <div style={{ padding: '14px 18px', borderRadius: 10, backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-light)' }}>
+                <div style={{ fontSize: 12, color: 'var(--text-secondary)', fontWeight: 600 }}>Other Methods</div>
+                <div style={{ fontSize: 24, fontWeight: 800, color: '#ec4899', marginTop: 4 }}>₹{totals.other.toLocaleString()}</div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* TABLE */}
       {loading ? (
         <div style={{ textAlign: 'center', padding: '40px 0', color: 'var(--text-secondary)' }}>
-          Loading receipts...
+          Loading receipts from database...
         </div>
       ) : filteredInvoices.length === 0 ? (
         <div style={{ textAlign: 'center', padding: '40px 0', color: 'var(--text-secondary)' }}>
-          No issued receipts found.
+          {viewMode === 'recycle_bin'
+            ? 'No deleted receipts in Recycle Bin.'
+            : 'No issued receipts found for the selected filter.'}
+          {viewMode === 'active' && dateFilterMode !== 'all' && (
+            <div style={{ marginTop: 8 }}>
+              <button className="btn-secondary" onClick={() => setDateFilterMode('all')} style={{ fontSize: 12, padding: '4px 10px' }}>
+                View All Dates
+              </button>
+            </div>
+          )}
         </div>
       ) : (
         <div style={{ overflowX: 'auto' }}>
           <table className="modern-table">
             <thead>
               <tr>
-                <th>{dict?.receiptNo || 'Receipt No'}</th>
-                <th>Student</th>
-                <th>Class</th>
+                <th>Receipt No</th>
+                <th>Payment Date</th>
+                <th>Student Name</th>
+                <th>Class / Sec</th>
+                <th>Father's Name</th>
+                <th>Payment Amount</th>
+                <th>Payment Method</th>
                 <th>Fee Breakdown</th>
-                <th>Amount</th>
-                <th>Date</th>
+                <th>School</th>
+                {viewMode === 'recycle_bin' && <th>Deleted By</th>}
                 <th style={{ textAlign: 'right' }}>Action</th>
               </tr>
             </thead>
             <tbody>
-              {filteredInvoices.map(inv => (
-                <tr key={inv.id}>
-                  <td style={{ fontFamily: 'var(--font-mono)', fontWeight: 700 }}>
-                    {inv.receiptId || inv.receiptNo || inv.id?.slice(0, 10)}
+              {filteredInvoices.map(inv => {
+                const isOnline = (inv.paymentMethod || '').toLowerCase().match(/online|upi|gpay|phonepe|paytm|netbanking|neft|rtgs|card|qr/);
+                const isCash = (inv.paymentMethod || '').toLowerCase() === 'cash' || !inv.paymentMethod;
+                const methodBadgeColor = isCash ? '#10b981' : isOnline ? '#8b5cf6' : '#f59e0b';
+                const methodBadgeBg = isCash ? 'rgba(16, 185, 129, 0.1)' : isOnline ? 'rgba(139, 92, 246, 0.1)' : 'rgba(245, 158, 11, 0.1)';
+
+                const dateObj = inv.date ? new Date(inv.date) : null;
+                const dateDisplay = dateObj && !isNaN(dateObj.getTime())
+                  ? dateObj.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })
+                  : 'N/A';
+                const timeDisplay = dateObj && !isNaN(dateObj.getTime())
+                  ? dateObj.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                  : '';
+
+                const invSchoolName = SCHOOLS.find(s => s.id === inv.schoolId)?.name || inv.schoolId || 'Branch';
+
+                return (
+                  <tr key={inv.id}>
+                    <td style={{ fontFamily: 'var(--font-mono)', fontWeight: 700 }}>
+                      {inv.receiptId || inv.receiptNo || inv.id?.slice(0, 10)}
+                    </td>
+                    <td>
+                      <div style={{ fontWeight: 600 }}>{dateDisplay}</div>
+                      {timeDisplay && <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{timeDisplay}</div>}
+                    </td>
+                    <td style={{ fontWeight: 700 }}>{inv.student || 'N/A'}</td>
+                    <td>
+                      <span className="badge" style={{ backgroundColor: 'var(--bg-secondary)', fontWeight: 600 }}>
+                        {inv.class || 'N/A'}{inv.section ? ` (${inv.section})` : ''}
+                      </span>
+                    </td>
+                    <td style={{ color: inv.fatherName ? 'var(--text-primary)' : 'var(--text-secondary)', fontSize: 13 }}>
+                      {inv.fatherName || '—'}
+                    </td>
+                    <td style={{ fontWeight: 800, fontFamily: 'var(--font-mono)', color: viewMode === 'recycle_bin' ? 'var(--danger, #ef4444)' : 'var(--success)', fontSize: 15 }}>
+                      ₹{Number(inv.amount || 0).toLocaleString()}
+                    </td>
+                    <td>
+                      <span className="badge" style={{ backgroundColor: methodBadgeBg, color: methodBadgeColor, fontWeight: 700, padding: '3px 8px' }}>
+                        {inv.paymentMethod || 'Cash'}
+                      </span>
+                    </td>
+                    <td style={{ fontSize: 12 }}>
+                      {inv.allocations && inv.allocations.length > 0 ? (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                          {inv.allocations.map((a, i) => (
+                            <span key={i} style={{ color: 'var(--text-secondary)' }}>
+                              <strong style={{ color: 'var(--text-primary)' }}>{a.label || a.componentId || 'Item'}:</strong> ₹{Number(a.amount || 0).toLocaleString()}
+                            </span>
+                          ))}
+                        </div>
+                      ) : (
+                        <span style={{ color: 'var(--text-secondary)' }}>{inv.feeType || inv.description || 'Fee Payment'}</span>
+                      )}
+                    </td>
+                    <td style={{ fontSize: 12, color: 'var(--text-secondary)', fontWeight: 600 }}>
+                      {invSchoolName}
+                    </td>
+                    {viewMode === 'recycle_bin' && (
+                      <td style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                        {inv.deletedBy || 'Admin'}
+                      </td>
+                    )}
+                    <td style={{ textAlign: 'right', display: 'flex', justifyContent: 'flex-end', gap: 8, alignItems: 'center' }}>
+                      {viewMode === 'recycle_bin' ? (
+                        <>
+                          <button
+                            type="button"
+                            className="btn-secondary"
+                            style={{ padding: '6px 12px', fontSize: 12, display: 'inline-flex', alignItems: 'center', gap: 6, color: 'var(--success, #10b981)', borderColor: 'rgba(16, 185, 129, 0.4)' }}
+                            onClick={() => handleRestoreInvoice(inv.id)}
+                            title="Restore Receipt back to active records"
+                          >
+                            <RefreshCcw size={14} /> Restore
+                          </button>
+                          {isOwnerOnly(currentUser) && (
+                            <button
+                              type="button"
+                              className="btn-secondary"
+                              style={{ padding: '6px 12px', fontSize: 12, display: 'inline-flex', alignItems: 'center', gap: 6, color: 'var(--danger, #ef4444)', borderColor: 'rgba(239, 68, 68, 0.4)' }}
+                              onClick={() => handlePermanentDeleteInvoice(inv.id)}
+                              title="Permanently Delete (Owner only)"
+                            >
+                              <Trash2 size={14} /> Delete Forever
+                            </button>
+                          )}
+                        </>
+                      ) : (
+                        <>
+                          <button
+                            className="btn-secondary"
+                            style={{ padding: '6px 12px', fontSize: 12, display: 'inline-flex', alignItems: 'center', gap: 6 }}
+                            onClick={() => generateFeeReceipt(inv, { name: inv.student, class: inv.class, section: inv.section, id: inv.studentId, contact: inv.contact }, invSchoolName)}
+                            title="Print / Download Receipt"
+                          >
+                            <Printer size={14} /> Print
+                          </button>
+                          {isUserAdminOrOwner(currentUser) && (
+                            <button
+                              style={{ background: 'none', border: 'none', color: 'var(--danger)', cursor: 'pointer', padding: 6, display: 'inline-flex', alignItems: 'center' }}
+                              onClick={() => handleSoftDeleteInvoice(inv.id)}
+                              title="Move Receipt to Recycle Bin"
+                            >
+                              <Trash2 size={16} />
+                            </button>
+                          )}
+                        </>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+            {viewMode === 'active' && (
+              <tfoot style={{ backgroundColor: 'var(--bg-secondary)', fontWeight: 800, borderTop: '2px solid var(--border-light)' }}>
+                <tr>
+                  <td colSpan={5} style={{ padding: '14px 16px' }}>
+                    {dateFilterMode === 'range' ? (
+                      <span>Date Range Total ({startDate} to {endDate}): <strong>{totals.count} receipt(s)</strong></span>
+                    ) : dateFilterMode === 'today' ? (
+                      <span>Today's Total: <strong>{totals.count} receipt(s)</strong></span>
+                    ) : dateFilterMode === 'yesterday' ? (
+                      <span>Yesterday's Total: <strong>{totals.count} receipt(s)</strong></span>
+                    ) : dateFilterMode === 'custom' ? (
+                      <span>Date Total ({customDate}): <strong>{totals.count} receipt(s)</strong></span>
+                    ) : (
+                      <span>All Dates Total: <strong>{totals.count} receipt(s)</strong></span>
+                    )}
                   </td>
-                  <td style={{ fontWeight: 600 }}>{inv.student || 'N/A'}</td>
-                  <td>
-                    <span className="badge" style={{ backgroundColor: 'var(--bg-secondary)' }}>{inv.class || 'N/A'}</span>
+                  <td style={{ padding: '14px 16px', color: 'var(--brand-primary)', fontFamily: 'var(--font-mono)', fontSize: 16 }}>
+                    ₹{totals.totalAmount.toLocaleString()}
                   </td>
-                  <td style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-                    {inv.allocations && inv.allocations.length > 0
-                      ? inv.allocations.map(a => `${a.label || a.componentId}: ₹${a.amount}`).join(', ')
-                      : 'Fee Payment'}
-                  </td>
-                  <td style={{ fontWeight: 800, fontFamily: 'var(--font-mono)', color: 'var(--success)' }}>
-                    ₹{Number(inv.amount || 0).toLocaleString()}
-                  </td>
-                  <td style={{ fontSize: 13 }}>
-                    {inv.date ? new Date(inv.date).toLocaleDateString() : 'N/A'}
-                  </td>
-                  <td style={{ textAlign: 'right' }}>
-                    <button
-                      className="btn-secondary"
-                      style={{ padding: '6px 12px', fontSize: 12, display: 'inline-flex', alignItems: 'center', gap: 6 }}
-                      onClick={() => generateFeeReceipt(inv, { name: inv.student, class: inv.class, id: inv.studentId })}
-                      title="Print / Download Receipt"
-                    >
-                      <Printer size={14} /> Print Receipt
-                    </button>
+                  <td colSpan={4} style={{ padding: '14px 16px', color: 'var(--text-secondary)', fontSize: 12 }}>
+                    Cash: ₹{totals.cash.toLocaleString()} | Online/UPI: ₹{totals.onlineUPI.toLocaleString()}
                   </td>
                 </tr>
-              ))}
-            </tbody>
+              </tfoot>
+            )}
           </table>
         </div>
       )}

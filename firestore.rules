@@ -135,11 +135,20 @@ service cloud.firestore {
     }
 
     // ── Fee receipts / invoices ───────────────────────────────────────────────
+    
+    // ── School Expenses ───────────────────────────────────────────────────────
+    match /school_expenses/{id} {
+      allow read:           if signedIn() && (isAdmin() || isAccountant() || isPrincipal()) && sameSchool(resource.data.schoolId);
+      allow create:         if signedIn() && (isAdmin() || isAccountant() || isOwner()) && sameSchool(request.resource.data.schoolId);
+      allow update:         if signedIn() && (isAdmin() || isAccountant() || isOwner()) && sameSchool(resource.data.schoolId);
+      allow delete:         if signedIn() && isOwner();
+    }
+
     match /invoices/{id} {
       allow read:           if signedIn() && (isAdmin() || isAccountant() || isPrincipal()) && sameSchool(resource.data.schoolId);
-      allow create:         if signedIn() && (isAdmin() || isAccountant()) && sameSchool(request.resource.data.schoolId);
-      allow update:         if signedIn() && (isAdmin() || isAccountant()) && sameSchool(resource.data.schoolId) && sameSchool(request.resource.data.schoolId);
-      allow delete:         if signedIn() && isAdmin() && sameSchool(resource.data.schoolId);
+      allow create:         if signedIn() && (isAdmin() || isAccountant() || isOwner()) && sameSchool(request.resource.data.schoolId);
+      allow update:         if signedIn() && (isAdmin() || isAccountant() || isOwner()) && sameSchool(resource.data.schoolId);
+      allow delete:         if signedIn() && isOwner();
     }
 
     // ── Fee adjustments ───────────────────────────────────────────────────────
@@ -153,7 +162,7 @@ service cloud.firestore {
     // ── Student ledger (credits, debits, reversals) ───────────────────────────
     match /student_ledger/{id} {
       allow read:           if signedIn() && (isAdmin() || isAccountant() || isPrincipal()) && sameSchool(resource.data.schoolId);
-      allow create:         if signedIn() && (isAdmin() || isAccountant()) && sameSchool(request.resource.data.schoolId);
+      allow create:         if signedIn() && (isAdmin() || isAccountant() || isOwner()) && sameSchool(request.resource.data.schoolId);
       allow update:         if signedIn() && (isAdmin() || isAccountant()) && sameSchool(resource.data.schoolId) && sameSchool(request.resource.data.schoolId);
       allow delete:         if signedIn() && (isAdmin() || isAccountant()) && sameSchool(resource.data.schoolId);
     }
@@ -161,7 +170,7 @@ service cloud.firestore {
     // ── Fee charges ───────────────────────────────────────────────────────────
     match /fee_charges/{id} {
       allow read:   if signedIn() && (isAdmin() || isAccountant() || isPrincipal()) && sameSchool(resource.data.schoolId);
-      allow create: if signedIn() && (isAdmin() || isAccountant()) && sameSchool(request.resource.data.schoolId);
+      allow create:         if signedIn() && (isAdmin() || isAccountant() || isOwner()) && sameSchool(request.resource.data.schoolId);
       allow update: if false;
       allow delete: if signedIn() && isAdmin() && sameSchool(resource.data.schoolId);
     }

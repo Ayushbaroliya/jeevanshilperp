@@ -11,6 +11,7 @@ import SettingsModule from './components/settings/SettingsModule';
 import StaffSalaryModule from './components/staff/StaffSalaryModule';
 import RestrictedAccessView from './components/common/RestrictedAccessView';
 import TourGuide from './components/common/TourGuide';
+import ErrorBoundary from './components/common/ErrorBoundary';
 import { getUserPermissions } from './utils/permissions';
 import { auth, db, signOut } from './firebase';
 import { onAuthStateChanged } from 'firebase/auth';
@@ -381,6 +382,7 @@ export default function App() {
 
         {/* Dedicated Accounts / Finance Main Workspace Content */}
         <main className="main-content page-container">
+          <ErrorBoundary onReset={() => setCurrentView('dashboard')}>
           {currentView === 'dashboard' && (
             <AdminDashboard
               onNavigate={setCurrentView}
@@ -427,11 +429,13 @@ export default function App() {
               userPermissions={userPermissions}
               currentUser={currentUser}
               selectedSchool={selectedSchool}
+              classSettings={schoolClassSettings[selectedSchool] || {}}
               activeAcademicYearId={activeAcademicYearId[selectedSchool] || 'AY_2026_27'}
             />
           )}
           {currentView === 'finance' && (
             <FinanceModule
+              currentUser={currentUser}
               onNavigate={setCurrentView}
               userPermissions={userPermissions}
               lang={lang}
@@ -480,6 +484,7 @@ export default function App() {
               onNavigate={setCurrentView}
             />
           )}
+        </ErrorBoundary>
         </main>
       </div>
     </div>

@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { X, Plus, Key, Shield, Trash2, Briefcase, Save, Sparkles, Edit, BookOpen, Check } from 'lucide-react';
-import { collection, addDoc, getDocs, query, orderBy, updateDoc, doc, deleteDoc, serverTimestamp, setDoc, where , writeBatch} from 'firebase/firestore';
+import { X, Plus, Key, Shield, Trash2, Briefcase, Save, Sparkles, Edit, BookOpen, Check, RotateCcw } from 'lucide-react';
+import { collection, addDoc, getDocs, query, orderBy, updateDoc, doc, deleteDoc, serverTimestamp, setDoc, where, writeBatch, getDoc } from 'firebase/firestore';
 import { httpsCallable } from 'firebase/functions';
 import { createStaffAuthAccount, normalizeLoginId, db, functions } from '../../firebase';
 import { SCHOOLS } from '../../utils/translations';
@@ -44,6 +44,239 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
   const [newClass, setNewClass] = useState('');
   const [newSection, setNewSection] = useState('');
   const [saveStatus, setSaveStatus] = useState('');
+  const [dirtyClasses, setDirtyClasses] = useState(new Set());
+  const [dirtyClassDetails, setDirtyClassDetails] = useState({}); // { [cls]: { components: Set([id]), policy: boolean } }
+  const [savingClass, setSavingClass] = useState(null);
+  const [selectedFeeClassFilter, setSelectedFeeClassFilter] = useState('ALL');
+  const [initialSavedClassSettings, setInitialSavedClassSettings] = useState({});
+
+  // Cache initial loaded class settings when school changes
+  useEffect(() => {
+    if (classSettings && Object.keys(classSettings).length > 0 && dirtyClasses.size === 0) {
+      try {
+        setInitialSavedClassSettings(JSON.parse(JSON.stringify(classSettings)));
+      } catch {
+        setInitialSavedClassSettings({ ...classSettings });
+      }
+    }
+  }, [selectedSchool, classSettings, dirtyClasses.size]);
+
+  const updateClassPolicy = (cls, policyUpdates) => {
+    setDirtyClasses(prev => new Set(prev).add(cls));
+    setDirtyClassDetails(prev => {
+      const existing = prev[cls] || { components: new Set(), policy: false };
+      return {
+        ...prev,
+        [cls]: { ...existing, policy: true }
+      };
+    });
+    const currentClassSettings = normalizeClassFeeSettings(classSettings[cls] || {});
+    setClassSettings(prev => ({
+      ...prev,
+      [cls]: {
+        ...currentClassSettings,
+        duePolicy: {
+          ...(currentClassSettings.duePolicy || {}),
+          ...policyUpdates
+        }
+      }
+    }));
+  };
+
+  const handleRevertClass = (cls) => {
+    const details = dirtyClassDetails[cls];
+    if (!details || (details.components?.size === 0 && !details.policy)) return;
+    if (!window.confirm(`Discard unsaved changes for ${cls} and revert to saved settings?`)) return;
+
+    const originalClass = initialSavedClassSettings[cls];
+    if (originalClass) {
+      setClassSettings(prev => ({
+        ...prev,
+        [cls]: JSON.parse(JSON.stringify(originalClass))
+      }));
+    }
+
+    setDirtyClasses(prev => {
+      const next = new Set(prev);
+      next.delete(cls);
+      return next;
+    });
+    setDirtyClassDetails(prev => {
+      const next = { ...prev };
+      delete next[cls];
+      return next;
+    });
+  };
+
+  const handleSaveSingleClass = async (cls) => {
+    setSavingClass(cls);
+    try {
+      const docRef = doc(db, "school_settings", "settings");
+      const snap = await getDoc(docRef);
+      const serverSchoolSettings = snap.exists() ? (snap.data()?.schoolClassSettings?.[selectedSchool] || {}) : {};
+      const baseSavedClass = serverSchoolSettings[cls] || initialSavedClassSettings[cls] || classSettings[cls] || {};
+
+      const details = dirtyClassDetails[cls] || { components: new Set(), policy: false };
+      const modifiedCompIds = details.components || new Set();
+      const isPolicyModified = !!details.policy;
+
+      const currentUIClass = normalizeClassFeeSettings(classSettings[cls] || {}, activeAcademicYearId);
+      const currentUIComponents = currentUIClass.components?.length
+        ? currentUIClass.components
+        : getSchoolDefaultFeeComponents(selectedSchool, cls, activeAcademicYearId);
+
+      const baseNormalized = normalizeClassFeeSettings(baseSavedClass, activeAcademicYearId);
+      const baseComponents = baseNormalized.components?.length
+        ? baseNormalized.components
+        : getSchoolDefaultFeeComponents(selectedSchool, cls, activeAcademicYearId);
+
+      // Granular component merge: Only update modified components, preserve untouched base components exactly
+      const mergedComponents = baseComponents.map(baseComp => {
+        if (modifiedCompIds.has(baseComp.id)) {
+          const modifiedInUI = currentUIComponents.find(c => c.id === baseComp.id);
+          return modifiedInUI ? { ...baseComp, ...modifiedInUI } : baseComp;
+        }
+        return baseComp;
+      });
+
+      for (const uiComp of currentUIComponents) {
+        if (modifiedCompIds.has(uiComp.id) && !mergedComponents.some(c => c.id === uiComp.id)) {
+          mergedComponents.push(uiComp);
+        }
+      }
+
+      const finalClassSettings = {
+        academicYear: activeAcademicYearId || baseNormalized.academicYear || '2026-2027',
+        duePolicy: isPolicyModified ? (currentUIClass.duePolicy || baseNormalized.duePolicy) : (baseNormalized.duePolicy || currentUIClass.duePolicy),
+        components: mergedComponents
+      };
+
+      // Atomically update ONLY this class under selectedSchool in Firestore
+      await setDoc(docRef, {
+        schoolClassSettings: {
+          [selectedSchool]: {
+            [cls]: finalClassSettings
+          }
+        }
+      }, { merge: true });
+
+      setClassSettings(prev => ({
+        ...prev,
+        [cls]: finalClassSettings
+      }));
+      setInitialSavedClassSettings(prev => ({
+        ...prev,
+        [cls]: JSON.parse(JSON.stringify(finalClassSettings))
+      }));
+
+      setDirtyClasses(prev => {
+        const next = new Set(prev);
+        next.delete(cls);
+        return next;
+      });
+      setDirtyClassDetails(prev => {
+        const next = { ...prev };
+        delete next[cls];
+        return next;
+      });
+
+      const compNames = Array.from(modifiedCompIds).map(id => {
+        const found = currentUIComponents.find(c => c.id === id);
+        return found?.name || id;
+      });
+
+      const summary = [
+        compNames.length > 0 ? `Component(s): ${compNames.join(', ')}` : null,
+        isPolicyModified ? 'Due & Late Fee Policy' : null
+      ].filter(Boolean).join(' and ');
+
+      alert(`Saved ${cls} successfully!\nOnly changed settings (${summary || 'All current settings'}) were updated. Other classes remain untouched.`);
+    } catch (err) {
+      console.error(`Failed to save ${cls}:`, err);
+      alert(`Failed to save ${cls}: ` + err.message);
+    } finally {
+      setSavingClass(null);
+    }
+  };
+
+  const handleSaveDirtyClasses = async () => {
+    if (dirtyClasses.size === 0) {
+      alert("No changes detected in any class. Everything is up to date.");
+      return;
+    }
+
+    const changedList = Array.from(dirtyClasses);
+    if (!window.confirm(`Save changes for: ${changedList.join(', ')}?\nOnly these ${changedList.length} modified class(es) will be updated in Firestore.`)) {
+      return;
+    }
+
+    try {
+      const docRef = doc(db, "school_settings", "settings");
+      const snap = await getDoc(docRef);
+      const serverSchoolSettings = snap.exists() ? (snap.data()?.schoolClassSettings?.[selectedSchool] || {}) : {};
+
+      const updatePayload = {};
+
+      for (const cls of changedList) {
+        const baseSavedClass = serverSchoolSettings[cls] || initialSavedClassSettings[cls] || classSettings[cls] || {};
+        const details = dirtyClassDetails[cls] || { components: new Set(), policy: false };
+        const modifiedCompIds = details.components || new Set();
+        const isPolicyModified = !!details.policy;
+
+        const currentUIClass = normalizeClassFeeSettings(classSettings[cls] || {}, activeAcademicYearId);
+        const currentUIComponents = currentUIClass.components?.length
+          ? currentUIClass.components
+          : getSchoolDefaultFeeComponents(selectedSchool, cls, activeAcademicYearId);
+
+        const baseNormalized = normalizeClassFeeSettings(baseSavedClass, activeAcademicYearId);
+        const baseComponents = baseNormalized.components?.length
+          ? baseNormalized.components
+          : getSchoolDefaultFeeComponents(selectedSchool, cls, activeAcademicYearId);
+
+        const mergedComponents = baseComponents.map(baseComp => {
+          if (modifiedCompIds.has(baseComp.id)) {
+            const modifiedInUI = currentUIComponents.find(c => c.id === baseComp.id);
+            return modifiedInUI ? { ...baseComp, ...modifiedInUI } : baseComp;
+          }
+          return baseComp;
+        });
+
+        for (const uiComp of currentUIComponents) {
+          if (modifiedCompIds.has(uiComp.id) && !mergedComponents.some(c => c.id === uiComp.id)) {
+            mergedComponents.push(uiComp);
+          }
+        }
+
+        updatePayload[cls] = {
+          academicYear: activeAcademicYearId || baseNormalized.academicYear || '2026-2027',
+          duePolicy: isPolicyModified ? (currentUIClass.duePolicy || baseNormalized.duePolicy) : (baseNormalized.duePolicy || currentUIClass.duePolicy),
+          components: mergedComponents
+        };
+      }
+
+      await setDoc(docRef, {
+        schoolClassSettings: {
+          [selectedSchool]: updatePayload
+        }
+      }, { merge: true });
+
+      setClassSettings(prev => ({
+        ...prev,
+        ...updatePayload
+      }));
+      setInitialSavedClassSettings(prev => ({
+        ...prev,
+        ...JSON.parse(JSON.stringify(updatePayload))
+      }));
+
+      setDirtyClasses(new Set());
+      setDirtyClassDetails({});
+      alert(`Successfully saved: ${changedList.join(', ')}! Only modified classes and components were updated.`);
+    } catch (e) {
+      alert("Error saving settings: " + e.message);
+      console.error(e);
+    }
+  };
   
   // Academic Years state
   const [academicYearsList, setAcademicYearsList] = useState([]);
@@ -731,12 +964,15 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
         }
       }
 
-      // 4. Clean up any class assignments pointing to this teacher
+      // 4. Clean up any class assignments pointing to this teacher (by staffId and/or uid)
       try {
-        const qAssignments = query(collection(db, 'class_assignments'), where('teacherId', '==', staffId));
-        const assignSnap = await getDocs(qAssignments);
-        for (const aDoc of assignSnap.docs) {
-          await deleteDoc(aDoc.ref);
+        const idsToClean = [staffId, uid].filter(Boolean);
+        for (const tid of idsToClean) {
+          const qAssignments = query(collection(db, 'class_assignments'), where('teacherId', '==', tid));
+          const assignSnap = await getDocs(qAssignments);
+          for (const aDoc of assignSnap.docs) {
+            await deleteDoc(aDoc.ref);
+          }
         }
       } catch (assignErr) {
         console.warn("Could not clean up class assignments:", assignErr?.message);
@@ -1028,52 +1264,100 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
                 </p>
               </div>
                 <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 8 }}>
-                  <span style={{ fontSize: 13, color: 'var(--danger)', fontWeight: 600 }}>
-                    ⚠️ Warning: Saving will instantly update student dues across the entire system based on the configuration below.
+                  <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                    Only modified classes will be updated in Firestore.
                   </span>
                   <button 
-                    className="btn-primary" 
-                    onClick={async () => {
-                      if (!window.confirm("Are you sure you want to save this configuration? This will instantly affect all due fees.")) return;
-                      try {
-                        const normalizedMap = {};
-                        for (const cls of effectiveClasses) {
-                          let cfg = classSettings[cls] || {};
-                          let settings = normalizeClassFeeSettings(cfg, activeAcademicYearId);
-                          if (!settings.components || settings.components.length === 0) {
-                              settings.components = getSchoolDefaultFeeComponents(selectedSchool, cls, activeAcademicYearId);
-                          }
-                          normalizedMap[cls] = settings;
-                        }
-                        await setDoc(doc(db, "school_settings", "settings"), {
-                          schoolClassSettings: {
-                            [selectedSchool]: normalizedMap
-                          },
-                          schoolClasses: {
-                            [selectedSchool]: effectiveClasses
-                          },
-                          schoolSections: {
-                            [selectedSchool]: effectiveSections
-                          }
-                        }, { merge: true });
-                        alert("Settings saved to Cloud successfully!");
-                      } catch (e) {
-                        alert("Error saving settings: " + e.message);
-                        console.error(e);
-                      }
+                    type="button"
+                    className={dirtyClasses.size > 0 ? "btn-primary" : "btn-secondary"} 
+                    onClick={handleSaveDirtyClasses}
+                    style={{
+                      padding: '10px 20px',
+                      fontSize: 14,
+                      fontWeight: 700,
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      backgroundColor: dirtyClasses.size > 0 ? 'var(--brand-primary)' : undefined,
+                      color: dirtyClasses.size > 0 ? '#fff' : undefined
                     }}
-                    style={{ backgroundColor: 'var(--danger)', borderColor: 'var(--danger)', padding: '10px 20px', fontSize: 14, fontWeight: 700 }}
                   >
-                    <Save size={18} /> Save Configuration
+                    <Save size={18} />
+                    {dirtyClasses.size > 0 ? `Save ${dirtyClasses.size} Changed Class(es) *` : 'Save All Changes'}
                   </button>
                 </div>
             </div>
 
-            {effectiveClasses.map(cls => {
+            {/* CLASS FILTER PILLS */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 20, overflowX: 'auto', paddingBottom: 6 }}>
+              <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>
+                Select Class:
+              </span>
+              <button
+                type="button"
+                className={selectedFeeClassFilter === 'ALL' ? 'btn-primary' : 'btn-secondary'}
+                onClick={() => setSelectedFeeClassFilter('ALL')}
+                style={{ padding: '6px 14px', fontSize: 12, fontWeight: 700, borderRadius: 6, whiteSpace: 'nowrap' }}
+              >
+                All Classes ({effectiveClasses.length})
+              </button>
+              {effectiveClasses.map(c => {
+                const isDirty = dirtyClasses.has(c);
+                const details = dirtyClassDetails[c];
+                const changedCount = (details?.components?.size || 0) + (details?.policy ? 1 : 0);
+                return (
+                  <button
+                    key={c}
+                    type="button"
+                    className={selectedFeeClassFilter === c ? 'btn-primary' : 'btn-secondary'}
+                    onClick={() => setSelectedFeeClassFilter(c)}
+                    style={{
+                      padding: '6px 14px',
+                      fontSize: 12,
+                      fontWeight: 700,
+                      borderRadius: 6,
+                      whiteSpace: 'nowrap',
+                      position: 'relative',
+                      borderColor: isDirty ? 'var(--danger, #ef4444)' : undefined
+                    }}
+                  >
+                    {c}
+                    {isDirty && (
+                      <span style={{
+                        marginLeft: 6,
+                        padding: '1px 6px',
+                        fontSize: 10,
+                        borderRadius: 8,
+                        backgroundColor: 'var(--danger, #ef4444)',
+                        color: '#fff',
+                        fontWeight: 800
+                      }}>
+                        {changedCount > 0 ? changedCount : '•'}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+
+            {effectiveClasses.filter(cls => selectedFeeClassFilter === 'ALL' || selectedFeeClassFilter === cls).map(cls => {
               const settings = normalizeClassFeeSettings(classSettings[cls] || {});
               const defaultComps = getSchoolDefaultFeeComponents(selectedSchool, cls, activeAcademicYearId);
               const components = settings.components?.length ? settings.components : defaultComps;
+              const classDetails = dirtyClassDetails[cls] || { components: new Set(), policy: false };
+              const dirtyCompSet = classDetails.components || new Set();
+
               const updateComponent = (id, updates) => {
+                setDirtyClasses(prev => new Set(prev).add(cls));
+                setDirtyClassDetails(prev => {
+                  const existing = prev[cls] || { components: new Set(), policy: false };
+                  const nextComps = new Set(existing.components);
+                  nextComps.add(id);
+                  return {
+                    ...prev,
+                    [cls]: { ...existing, components: nextComps }
+                  };
+                });
                 setClassSettings(prev => ({
                   ...prev,
                   [cls]: {
@@ -1082,36 +1366,96 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
                   }
                 }));
               };
+
               const toggleInstallment = (id, inst) => {
                 const c = components.find(x => x.id === id);
                 const current = c?.installments || [];
                 const next = current.includes(inst) ? current.filter(x => x !== inst) : [...current, inst];
                 updateComponent(id, { installments: next });
               };
+
+              const isDirty = dirtyClasses.has(cls);
+              const modifiedCompCount = dirtyCompSet.size;
+
               return (
-                <div key={cls} style={{ marginBottom: 24, border: '1px solid var(--border-light)', borderRadius: 12, overflow: 'hidden', backgroundColor: 'var(--bg-card)' }}>
-                  <div style={{ padding: '14px 18px', background: 'var(--bg-secondary)', display: 'flex', flexDirection: 'column', gap: 12, borderBottom: '1px solid var(--border-light)' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
-                      <strong style={{ fontSize: 16, color: 'var(--text-primary)' }}>{cls}</strong>
-                      <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>Class Policy & Late Fee Rules</span>
+                <div key={cls} style={{ marginBottom: 24, border: isDirty ? '1px solid var(--border-medium, #cbd5e1)' : '1px solid var(--border-light)', borderRadius: 12, overflow: 'hidden', backgroundColor: 'var(--bg-card)' }}>
+                  <div style={{ padding: '14px 18px', background: isDirty ? 'rgba(245, 158, 11, 0.04)' : 'var(--bg-secondary)', display: 'flex', flexDirection: 'column', gap: 12, borderBottom: '1px solid var(--border-light)' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                        <strong style={{ fontSize: 16, color: 'var(--text-primary)' }}>{cls}</strong>
+                        {isDirty ? (
+                          <span className="badge" style={{ backgroundColor: 'rgba(239, 68, 68, 0.1)', color: 'var(--danger, #ef4444)', fontSize: 11, fontWeight: 700 }}>
+                            ● {modifiedCompCount} component{modifiedCompCount === 1 ? '' : 's'} modified{classDetails.policy ? ' + Policy' : ''} (Unsaved)
+                          </span>
+                        ) : (
+                          <span className="badge" style={{ backgroundColor: 'rgba(16, 185, 129, 0.1)', color: '#10b981', fontSize: 11 }}>
+                            Synced
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        {isDirty && (
+                          <button
+                            type="button"
+                            className="btn-secondary"
+                            onClick={() => handleRevertClass(cls)}
+                            style={{
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: 5,
+                              padding: '6px 12px',
+                              fontSize: 12,
+                              borderRadius: 6
+                            }}
+                            title={`Discard unsaved edits for ${cls}`}
+                          >
+                            <RotateCcw size={13} />
+                            Revert
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className={isDirty ? "btn-primary" : "btn-secondary"}
+                          onClick={() => handleSaveSingleClass(cls)}
+                          disabled={savingClass === cls}
+                          style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: 6,
+                            padding: '6px 14px',
+                            fontSize: 12,
+                            fontWeight: 700,
+                            borderRadius: 6
+                          }}
+                          title={`Save only the modified component(s) for ${cls}`}
+                        >
+                          <Save size={14} />
+                          {savingClass === cls ? `Saving ${cls}...` : isDirty ? `Save ${cls} (${modifiedCompCount > 0 ? `${modifiedCompCount} changed` : 'modified'}) *` : `Save ${cls} Only`}
+                        </button>
+                      </div>
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap', fontSize: 12, color: 'var(--text-secondary)' }}>
+                      {classDetails.policy && (
+                        <span className="badge" style={{ fontSize: 10, padding: '2px 6px', backgroundColor: 'rgba(245, 158, 11, 0.15)', color: '#b45309', border: '1px solid rgba(245, 158, 11, 0.3)', fontWeight: 700 }}>
+                          ● Policy Modified
+                        </span>
+                      )}
                       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                         <span>Due Day of Month:</span>
-                        <input type="number" min="1" max="28" className="form-input" style={{ width: 62, padding: '4px 8px' }} value={settings.duePolicy?.defaultDueDay ?? 10} onChange={e => setClassSettings(prev => ({ ...prev, [cls]: { ...settings, duePolicy: { ...(settings.duePolicy || {}), defaultDueDay: Number(e.target.value) || 10 } } }))} />
+                        <input type="number" min="1" max="28" className="form-input" style={{ width: 62, padding: '4px 8px' }} value={settings.duePolicy?.defaultDueDay ?? 10} onChange={e => updateClassPolicy(cls, { defaultDueDay: Number(e.target.value) || 10 })} />
                       </div>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                         <span>October Late Fee / अक्टूबर की लेट फीस:</span>
                         <span style={{ fontSize: 11 }}>₹</span>
-                        <input type="number" min="0" className="form-input" style={{ width: 70, padding: '4px 8px' }} value={settings.duePolicy?.septemberPenalty ?? 100} onChange={e => setClassSettings(prev => ({ ...prev, [cls]: { ...settings, duePolicy: { ...(settings.duePolicy || {}), septemberPenalty: Number(e.target.value) || 0 } } }))} />
+                        <input type="number" min="0" className="form-input" style={{ width: 70, padding: '4px 8px' }} value={settings.duePolicy?.septemberPenalty ?? 100} onChange={e => updateClassPolicy(cls, { septemberPenalty: Number(e.target.value) || 0 })} />
                       </div>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                         <span>December Late Fee / दिसंबर की लेट फीस:</span>
                         <span style={{ fontSize: 11 }}>₹</span>
-                        <input type="number" min="0" className="form-input" style={{ width: 70, padding: '4px 8px' }} value={settings.duePolicy?.decemberPenalty ?? 500} onChange={e => setClassSettings(prev => ({ ...prev, [cls]: { ...settings, duePolicy: { ...(settings.duePolicy || {}), decemberPenalty: Number(e.target.value) || 0 } } }))} />
+                        <input type="number" min="0" className="form-input" style={{ width: 70, padding: '4px 8px' }} value={settings.duePolicy?.decemberPenalty ?? 500} onChange={e => updateClassPolicy(cls, { decemberPenalty: Number(e.target.value) || 0 })} />
                       </div>
                       <label style={{ fontSize: 11, display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
-                        <input type="checkbox" checked={settings.duePolicy?.decemberClearWaivesPenalty !== false} onChange={e => setClassSettings(prev => ({ ...prev, [cls]: { ...settings, duePolicy: { ...(settings.duePolicy || {}), decemberClearWaivesPenalty: e.target.checked } } }))} />
+                        <input type="checkbox" checked={settings.duePolicy?.decemberClearWaivesPenalty !== false} onChange={e => updateClassPolicy(cls, { decemberClearWaivesPenalty: e.target.checked })} />
                         <span>Clear all in Dec removes late fee / दिसंबर में सब जमा होने पर लेट फीस हटेगी</span>
                       </label>
                     </div>
@@ -1130,10 +1474,21 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
                         </tr>
                       </thead>
                       <tbody>
-                        {components.map(c => (
-                          <tr key={c.id}>
+                        {components.map(c => {
+                          const isCompModified = dirtyCompSet.has(c.id);
+                          return (
+                          <tr key={c.id} style={{ backgroundColor: isCompModified ? 'rgba(245, 158, 11, 0.05)' : undefined }}>
                             <td><input type="checkbox" checked={!!c.enabled} onChange={e => updateComponent(c.id, { enabled: e.target.checked })} /></td>
-                            <td style={{ fontWeight: 700, minWidth: 120 }}>{c.name}</td>
+                            <td style={{ fontWeight: 700, minWidth: 120 }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                <span>{c.name}</span>
+                                {isCompModified && (
+                                  <span className="badge" style={{ fontSize: 10, padding: '1px 6px', backgroundColor: 'rgba(245, 158, 11, 0.15)', color: '#b45309', border: '1px solid rgba(245, 158, 11, 0.3)', fontWeight: 700 }}>
+                                    ● Modified
+                                  </span>
+                                )}
+                              </div>
+                            </td>
                             <td>
                               <input 
                                 type="number" 
@@ -1236,7 +1591,7 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
                             <td><input type="number" min="0" className="form-input" style={{ width: 95, padding: '6px 8px' }} value={c.penalty ?? 0} onChange={e => updateComponent(c.id, { penalty: Number(e.target.value) || 0 })} /></td>
                             <td><input type="number" min="0" className="form-input" style={{ width: 80, padding: '6px 8px' }} value={c.graceDays ?? 5} onChange={e => updateComponent(c.id, { graceDays: Number(e.target.value) || 0 })} /></td>
                           </tr>
-                        ))}
+                        );})}
                       </tbody>
                     </table>
                   </div>
@@ -1436,6 +1791,118 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
         </div>
       )}
 
+      {/* Subject Management Tab */}
+      {activeTab === 'subjects' && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+          <div className="glass-card">
+            <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 16 }}>➕ Add Subject</h2>
+            <form onSubmit={handleAddSubject} style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16, alignItems: 'end' }}>
+              <div>
+                <label className="form-label" style={{ fontWeight: 700 }}>Subject Name *</label>
+                <input
+                  type="text"
+                  className="form-input"
+                  placeholder="e.g. Mathematics"
+                  value={newSubject.name}
+                  onChange={e => setNewSubject({ ...newSubject, name: e.target.value })}
+                  required
+                />
+              </div>
+              <div>
+                <label className="form-label" style={{ fontWeight: 700 }}>Subject Code</label>
+                <input
+                  type="text"
+                  className="form-input"
+                  placeholder="e.g. MATH (auto if empty)"
+                  value={newSubject.code}
+                  onChange={e => setNewSubject({ ...newSubject, code: e.target.value })}
+                />
+              </div>
+              <div>
+                <label className="form-label" style={{ fontWeight: 700 }}>Applicable Class</label>
+                <select className="form-input" value={newSubject.class} onChange={e => setNewSubject({ ...newSubject, class: e.target.value })}>
+                  <option value="ALL">ALL Classes</option>
+                  {effectiveClasses.map(c => <option key={c} value={c}>{c}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="form-label" style={{ fontWeight: 700 }}>Category</label>
+                <select className="form-input" value={newSubject.category} onChange={e => setNewSubject({ ...newSubject, category: e.target.value })}>
+                  <option value="Core">Core (Compulsory)</option>
+                  <option value="Elective">Elective (Optional)</option>
+                  <option value="Language">Language</option>
+                  <option value="Vocational">Vocational</option>
+                  <option value="Physical">Physical Education</option>
+                </select>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'flex-end' }}>
+                <button type="submit" className="btn-primary" style={{ width: '100%' }}>
+                  <Plus size={16} /> Add Subject
+                </button>
+              </div>
+            </form>
+          </div>
+
+          <div className="glass-card">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+              <h2 style={{ fontSize: 18, fontWeight: 700, margin: 0 }}>📚 Subject Directory</h2>
+              <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>
+                {subjectsList.length} subject(s) for {selectedSchool}
+              </span>
+            </div>
+            {isLoadingSubjects ? (
+              <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-secondary)' }}>Loading subjects...</div>
+            ) : subjectsList.length === 0 ? (
+              <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-secondary)' }}>
+                No custom subjects added yet. Academics will use the default subject list.
+              </div>
+            ) : (
+              <div style={{ overflowX: 'auto' }}>
+                <table className="modern-table">
+                  <thead>
+                    <tr>
+                      <th>Subject Name</th>
+                      <th>Code</th>
+                      <th>Class</th>
+                      <th>Category</th>
+                      <th>Academic Year</th>
+                      <th style={{ textAlign: 'right' }}>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {subjectsList.map(sub => (
+                      <tr key={sub.id}>
+                        <td style={{ fontWeight: 700 }}>{sub.name}</td>
+                        <td style={{ fontFamily: 'var(--font-mono)' }}>{sub.code}</td>
+                        <td>
+                          <span className="badge">{sub.class || 'ALL'}</span>
+                        </td>
+                        <td>
+                          <span className="badge" style={{ backgroundColor: 'rgba(191, 87, 0, 0.1)', color: 'var(--brand-orange)' }}>
+                            {sub.category || 'Core'}
+                          </span>
+                        </td>
+                        <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{sub.academicYearId}</td>
+                        <td style={{ textAlign: 'right' }}>
+                          <button
+                            className="icon-btn"
+                            style={{ color: 'var(--danger)', padding: 6 }}
+                            title="Remove Subject"
+                            onClick={() => handleDeleteSubject(sub.id, sub.name)}
+                          >
+                            <Trash2 size={16} />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Class Teacher Assignments Tab */}
       {activeTab === 'assignments' && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
@@ -1446,7 +1913,7 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
                 <label className="form-label" style={{ fontWeight: 700 }}>Select Class</label>
                 <select className="form-input" value={newAssignment.class} onChange={e => setNewAssignment({ ...newAssignment, class: e.target.value })}>
                   <option value="">Select Class</option>
-                  {classes.map(c => <option key={c} value={c}>{c}</option>)}
+                  {effectiveClasses.map(c => <option key={c} value={c}>{c}</option>)}
                 </select>
               </div>
               <div>
@@ -1458,7 +1925,7 @@ export default function SettingsModule({ lang, classes, setClasses, classSetting
                 >
                   <option value="">Select Section</option>
                   <option value="ALL">ALL Sections</option>
-                  {sections.map(s => <option key={s} value={s}>{s}</option>)}
+                  {effectiveSections.map(s => <option key={s} value={s}>{s}</option>)}
                 </select>
               </div>
               <div>

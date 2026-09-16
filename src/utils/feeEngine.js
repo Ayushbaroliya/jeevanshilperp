@@ -417,18 +417,11 @@ export function calculateStudentDue({ student, charges, classSettings, payments,
   const withArrears = [...baseCharges];
 
   // Late Fee rules derived from class policy (or built-in defaults)
+  // Per requirement: No late fee for July/October installments. Only final/December obligation gets late fee.
   const rules = [
     {
-      id: 'sept_late',
-      label: 'October Late Fee / अक्टूबर की लेट फीस',
-      deadline: `${academicYear.split('-')[0]}-10-10`,
-      graceDays: policy.septemberGraceDays ?? 5,
-      amount: policy.septemberPenalty ?? 100,
-      waiveIfCleared: false
-    },
-    {
       id: 'dec_late',
-      label: 'Late Fee – December',
+      label: 'Late Fee / विलंब शुल्क',
       deadline: `${academicYear.split('-')[0]}-12-10`,
       graceDays: policy.decemberGraceDays ?? 5,
       amount: policy.decemberPenalty ?? 500,
@@ -553,6 +546,60 @@ export function normalizeClassFeeSettings(settings, academicYear) {
     });
   }
   return { components };
+}
+
+
+// ─── 7.5. Transport Route Configuration ───────────────────────────────────────
+
+/**
+ * Returns the configurable transport routes based on the school ID.
+ * Transport is completely STUDENT-WISE. Each student can independently have a route assigned.
+ */
+export const TRANSPORT_ROUTES = {
+  SCH_01: [
+    { id: 't_shared_1', name: 'Banpur', nameEn: 'Banpur', nameHi: 'बानपुर', annual: 3600, annualFee: 3600, inst1: 1600, installment1: 1600, inst2: 1000, installment2: 1000, inst3: 1000, installment3: 1000 },
+    { id: 't_shared_2', name: 'Ganeshpura, Khiriya (Kailguwan Road), Hasraiyan', nameEn: 'Ganeshpura, Khiriya (Kailguwan Road), Hasraiyan', nameHi: 'गणेशपुरा, खिरिया (कैलगुवां रोड), हसरैयन', annual: 4800, annualFee: 4800, inst1: 2800, installment1: 2800, inst2: 1000, installment2: 1000, inst3: 1000, installment3: 1000 },
+    { id: 't_shared_3', name: 'Chakaura, Kuagaon, Udaya / Tapran', nameEn: 'Chakaura, Kuagaon, Udaya / Tapran', nameHi: 'चकौरा, कुआगाँव, उदया / टपरन', annual: 5300, annualFee: 5300, inst1: 2300, installment1: 2300, inst2: 1500, installment2: 1500, inst3: 1500, installment3: 1500 },
+    { id: 't_shared_4', name: 'Chhilla', nameEn: 'Chhilla', nameHi: 'छिल्ला', annual: 5500, annualFee: 5500, inst1: 2500, installment1: 2500, inst2: 1500, installment2: 1500, inst3: 1500, installment3: 1500 },
+    { id: 't_shared_5', name: 'Ajnaora, Umri', nameEn: 'Ajnaora, Umri', nameHi: 'अजनौरा, ऊमरी', annual: 5800, annualFee: 5800, inst1: 2800, installment1: 2800, inst2: 1500, installment2: 1500, inst3: 1500, installment3: 1500 },
+    { id: 't_shared_6', name: 'Khiriya Mishra', nameEn: 'Khiriya Mishra', nameHi: 'खिरिया मिश्र', annual: 6000, annualFee: 6000, inst1: 3000, installment1: 3000, inst2: 1500, installment2: 1500, inst3: 1500, installment3: 1500 },
+    { id: 't_shared_7', name: 'Sunwaha', nameEn: 'Sunwaha', nameHi: 'सुनवाहा', annual: 6500, annualFee: 6500, inst1: 3500, installment1: 3500, inst2: 1500, installment2: 1500, inst3: 1500, installment3: 1500 },
+    { id: 't_shared_8', name: 'Gangasagar, Pah', nameEn: 'Gangasagar, Pah', nameHi: 'गंगासागर, पाह', annual: 6800, annualFee: 6800, inst1: 3800, installment1: 3800, inst2: 1500, installment2: 1500, inst3: 1500, installment3: 1500 },
+    { id: 't_shared_9', name: 'Dagrana, Daulatpura, Husanga, Didaura', nameEn: 'Dagrana, Daulatpura, Husanga, Didaura', nameHi: 'डगराना, दौलतपुरा, हुसंगा, दिदौरा', annual: 7500, annualFee: 7500, inst1: 3500, installment1: 3500, inst2: 2000, installment2: 2000, inst3: 2000, installment3: 2000 },
+    { id: 't_shared_10', name: 'Billa, Bilata', nameEn: 'Billa, Bilata', nameHi: 'बिल्ला, बिलाटा', annual: 7800, annualFee: 7800, inst1: 3800, installment1: 3800, inst2: 2000, installment2: 2000, inst3: 2000, installment3: 2000 },
+    { id: 't_shared_11', name: 'Khakron, Banoni, Naiguwa, Surikala', nameEn: 'Khakron, Banoni, Naiguwa, Surikala', nameHi: 'खाकरौन, बानौनी, नैर्गुवा, सूरीकलाँ', annual: 8000, annualFee: 8000, inst1: 3000, installment1: 3000, inst2: 2500, installment2: 2500, inst3: 2500, installment3: 2500 },
+    { id: 't_shared_12', name: 'Gangchari / Dailwara', nameEn: 'Gangchari / Dailwara', nameHi: 'गंगचारी / दैलवारा', annual: 8100, annualFee: 8100, inst1: 3100, installment1: 3100, inst2: 2500, installment2: 2500, inst3: 2500, installment3: 2500 },
+    { id: 't_shared_13', name: 'Gugarwara, Udaypura, Puradhan, Kua, Mirchwara', nameEn: 'Gugarwara, Udaypura, Puradhan, Kua, Mirchwara', nameHi: 'गुगरवारा, उदयपुरा, पुराधन, कुआँ, मिर्चवारा', annual: 8500, annualFee: 8500, inst1: 3500, installment1: 3500, inst2: 2500, installment2: 2500, inst3: 2500, installment3: 2500 },
+    { id: 't_shared_14', name: 'Simiriya, Khanjaura, Maugan', nameEn: 'Simiriya, Khanjaura, Maugan', nameHi: 'सिमिरिया, खंजौरा, मौगान', annual: 9000, annualFee: 9000, inst1: 4000, installment1: 4000, inst2: 2500, installment2: 2500, inst3: 2500, installment3: 2500 },
+    { id: 't_shared_15', name: 'Kailguwan, Kakdari', nameEn: 'Kailguwan, Kakdari', nameHi: 'कैलगुवां, ककडारी', annual: 9500, annualFee: 9500, inst1: 4500, installment1: 4500, inst2: 2500, installment2: 2500, inst3: 2500, installment3: 2500 }
+  ],
+  SCH_02: null,
+  SCH_03: [
+    { id: 't_jsb2_1', name: 'Badan / Dixitpura / Sordo Mohalla', nameEn: 'Badan / Dixitpura / Sordo Mohalla', nameHi: 'बदान / दीक्षितपुरा / सौरदो मुहल्ला', annual: 3500, annualFee: 3500, inst1: 1500, installment1: 1500, inst2: 1000, installment2: 1000, inst3: 1000, installment3: 1000 },
+    { id: 't_jsb2_2', name: 'Chhirwan / Prajapati Mohalla', nameEn: 'Chhirwan / Prajapati Mohalla', nameHi: 'छिरवां / प्रजापति मुहल्ला', annual: 3500, annualFee: 3500, inst1: 1500, installment1: 1500, inst2: 1000, installment2: 1000, inst3: 1000, installment3: 1000 },
+    { id: 't_jsb2_3', name: 'Kachhiyakhera', nameEn: 'Kachhiyakhera', nameHi: 'कछियाखेरा', annual: 3500, annualFee: 3500, inst1: 1500, installment1: 1500, inst2: 1000, installment2: 1000, inst3: 1000, installment3: 1000 },
+    { id: 't_jsb2_4', name: 'Ladwari / Syag', nameEn: 'Ladwari / Syag', nameHi: 'लड़वारी / स्याग', annual: 5000, annualFee: 5000, inst1: 2000, installment1: 2000, inst2: 1500, installment2: 1500, inst3: 1500, installment3: 1500 },
+    { id: 't_jsb2_5', name: 'Ladwari / Syag (Harijan Basti)', nameEn: 'Ladwari / Syag (Harijan Basti)', nameHi: 'लड़वारी / स्याग (हरिजन बस्ती)', annual: 5500, annualFee: 5500, inst1: 2500, installment1: 2500, inst2: 1500, installment2: 1500, inst3: 1500, installment3: 1500 },
+    { id: 't_jsb2_6', name: 'Babakhera / Doodakhera', nameEn: 'Babakhera / Doodakhera', nameHi: 'बाबाखेरा / डूडाखेरा', annual: 5500, annualFee: 5500, inst1: 2500, installment1: 2500, inst2: 1500, installment2: 1500, inst3: 1500, installment3: 1500 },
+    { id: 't_jsb2_7', name: 'Narayanpur / Prempura', nameEn: 'Narayanpur / Prempura', nameHi: 'नारायणपुर / प्रेमपुरा', annual: 6000, annualFee: 6000, inst1: 3000, installment1: 3000, inst2: 1500, installment2: 1500, inst3: 1500, installment3: 1500 },
+    { id: 't_jsb2_8', name: 'Lakhaura', nameEn: 'Lakhaura', nameHi: 'लखौरा', annual: 8000, annualFee: 8000, inst1: 4000, installment1: 4000, inst2: 2000, installment2: 2000, inst3: 2000, installment3: 2000 }
+  ]
+};
+TRANSPORT_ROUTES.SCH_02 = TRANSPORT_ROUTES.SCH_01;
+
+export function getTransportRoutes(schoolId) {
+  if (schoolId === 'SCH_03') {
+    return TRANSPORT_ROUTES.SCH_03;
+  }
+  return TRANSPORT_ROUTES.SCH_01;
+}
+
+export function getTransportRouteLabel(route, language = 'en') {
+  if (!route) return '';
+  if (language === 'hi') {
+    return route.nameHi || route.name || route.nameEn || '';
+  }
+  return route.nameEn || route.name || '';
 }
 
 
@@ -833,7 +880,7 @@ export function getSchoolDefaultFeeComponents(schoolId, className, academicYear)
   if (schoolId === 'SCH_02') {
     return getJSICFeeComponents(className, academicYear);
   }
-  // SCH_03 (Jeevan Shilp Adarsh Shala) or generic branch fallback:
+  // SCH_03 (Jeevan Shilp Sanskarshala) or generic branch fallback:
   // If high school / intermediate classes, use secondary schedule; otherwise primary schedule
   if (['Class 9', 'Class 10', 'Class 11', 'Class 12', 'Class 11 Art', 'Class 11 Science', 'Class 12 Art', 'Class 12 Science'].includes(className)) {
     return getJSICFeeComponents(className, academicYear);
