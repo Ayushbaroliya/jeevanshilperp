@@ -3,6 +3,7 @@ import { ArrowLeft, CreditCard, Briefcase, BarChart2, Plus, Download, Filter, Al
 import { collection, getDocs, doc, runTransaction, query, where, orderBy, addDoc, getDoc, updateDoc, deleteDoc, writeBatch, serverTimestamp } from 'firebase/firestore';
 import SchoolExpensesReport from './SchoolExpensesReport';
 import ProfitAndLossReport from './ProfitAndLossReport';
+import RecycleBin from './RecycleBin';
 import * as XLSX from 'xlsx';
 import { auth, db } from '../../firebase';
 import { t, SCHOOLS } from '../../utils/translations';
@@ -98,8 +99,34 @@ export default function FinanceModule({ onNavigate, userPermissions, lang = 'en'
             <Briefcase size={16} /> Adjust Fees
           </button>
         )}
+        {isUserAdminOrOwner(currentUser) && (
+          <button
+            type="button"
+            className={activeTab === 'recycle' ? 'btn-primary' : 'btn-secondary'}
+            onClick={() => setActiveTab('recycle')}
+            style={{
+              padding: '10px 18px',
+              fontSize: 13,
+              fontWeight: 700,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+              color: activeTab === 'recycle' ? '#fff' : 'var(--danger, #ef4444)'
+            }}
+            title="Recycle Bin for Deleted Receipts & Expenses"
+          >
+            <Trash2 size={16} /> Recycle Bin
+          </button>
+        )}
       </div>
 
+      {activeTab === 'recycle' && (
+        <RecycleBin
+          currentUser={currentUser}
+          selectedSchool={selectedSchool}
+          onBackToInvoices={() => setActiveTab('invoices')}
+        />
+      )}
       {activeTab === 'expenses' && (
         <SchoolExpensesReport
           selectedSchool={selectedSchool}

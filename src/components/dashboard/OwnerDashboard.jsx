@@ -109,6 +109,7 @@ export default function OwnerDashboard({ onNavigate, lang, selectedSchool, setSe
           const schoolExpensesSnap = await getDocs(collection(db, 'school_expenses'));
           schoolExpensesSnap.forEach(doc => {
             const data = doc.data();
+            if (data.deleted || data.isDeleted || data.status === 'deleted') return;
             const amt = Number(data.amount) || 0;
             if (amt <= 0) return;
             const d = new Date(data.expenseDate || data.createdAt);
@@ -163,6 +164,7 @@ export default function OwnerDashboard({ onNavigate, lang, selectedSchool, setSe
           const expensesSnap = await getDocs(collection(db, 'school_expenses'));
           expensesSnap.forEach(doc => {
             const data = doc.data();
+            if (data.deleted || data.isDeleted || data.status === 'deleted') return;
             if (selectedSchool !== 'ALL' && data.schoolId !== selectedSchool) return;
             const d = new Date(data.expenseDate || data.createdAt);
             if (d >= startOfDay && d <= endOfDay) {
