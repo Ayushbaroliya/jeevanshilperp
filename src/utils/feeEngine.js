@@ -1066,6 +1066,112 @@ export function getJSPSFeeComponents(className, academicYear) {
 }
 
 /**
+ * Authoritative default fee components for Jeevan Shilp Sanskar Shala, Ahar Ji (E.M.) - SCH_03
+ * Academic Session: 2026-27
+ *
+ * Rules:
+ * - Admission Fee is ONE-TIME for new admissions and separate from the 3 recurring installments.
+ * - The 3 installments represent recurring academic fees (Tuition + Exam).
+ * - 1st Installment combines Tuition (portion 1) + Exam Fee.
+ * - 2nd Installment = ₹2,000 (Tuition).
+ * - 3rd Installment = ₹2,000 (Tuition).
+ * - Transport fees are completely independent (enabled: false, amount: 0).
+ */
+export function getSCH03FeeComponents(className, academicYear) {
+  const defaults = getDefaultFeeComponents(academicYear);
+  const yr = (academicYear || '2026-2027').split('-')[0];
+  const yrNext = parseInt(yr) + 1;
+
+  let admission = 0;
+  let tuition = 0;
+  let exam = 0;
+  let inst1_total = 0, inst2_total = 0, inst3_total = 0;
+
+  switch (className) {
+    case 'Nursery':
+    case 'LKG':
+      admission = 1000;
+      tuition = 6000;
+      exam = 500;
+      inst1_total = 2500;
+      inst2_total = 2000;
+      inst3_total = 2000;
+      break;
+
+    case 'UKG':
+      admission = 1000;
+      tuition = 6500;
+      exam = 500;
+      inst1_total = 3000;
+      inst2_total = 2000;
+      inst3_total = 2000;
+      break;
+
+    case 'Class 1':
+    case 'Class 2':
+    case 'Class 3':
+    case 'Class 4':
+    case 'Class 5':
+      admission = 1200;
+      tuition = 7000;
+      exam = 500;
+      inst1_total = 3500;
+      inst2_total = 2000;
+      inst3_total = 2000;
+      break;
+
+    case 'Class 6':
+    case 'Class 7':
+    case 'Class 8':
+      admission = 1500;
+      tuition = 7500;
+      exam = 600;
+      inst1_total = 4100;
+      inst2_total = 2000;
+      inst3_total = 2000;
+      break;
+
+    default:
+      // If secondary classes exist in branch 2, fallback to secondary schedule
+      if (['Class 9', 'Class 10', 'Class 11', 'Class 12', 'Class 11 Art', 'Class 11 Science', 'Class 12 Art', 'Class 12 Science'].includes(className)) {
+        return getJSICFeeComponents(className, academicYear);
+      }
+      admission = 1000;
+      tuition = 6000;
+      exam = 500;
+      inst1_total = 2500;
+      inst2_total = 2000;
+      inst3_total = 2000;
+      break;
+  }
+
+  // The fee sheet combines Exam Fee into the 1st Installment payment amount.
+  // We separate it for accounting but ensure the due dates align so the parent pays the expected total.
+  const t1 = inst1_total - exam;
+  const t2 = inst2_total;
+  const t3 = inst3_total;
+
+  const tuitionSchedule = [
+    { dueDate: `${yr}-07-10`, label: '1st Installment (July)', amount: t1 },
+    { dueDate: `${yr}-10-10`, label: '2nd Installment (October)', amount: t2 },
+    { dueDate: `${yrNext}-01-10`, label: '3rd Installment (December/January)', amount: t3 }
+  ];
+
+  return defaults.map(comp => {
+    if (comp.id === 'admission') {
+      return { ...comp, amount: admission, enabled: true, isOneTime: true, condition: 'isNewAdmission' };
+    }
+    if (comp.id === 'tuition') {
+      return { ...comp, amount: tuition, enabled: true, frequency: 'custom', schedule: tuitionSchedule, penalty: 100, graceDays: 10 };
+    }
+    if (comp.id === 'exam') {
+      return { ...comp, amount: exam, enabled: true, frequency: 'custom', schedule: [{ dueDate: `${yr}-07-10`, label: 'Examination Fee', amount: exam }] };
+    }
+    return { ...comp, amount: 0, enabled: false };
+  });
+}
+
+/**
  * Universal helper returning default fee components for any school branch (SCH_01, SCH_02, SCH_03, etc.)
  */
 export function getSchoolDefaultFeeComponents(schoolId, className, academicYear) {
@@ -1075,7 +1181,10 @@ export function getSchoolDefaultFeeComponents(schoolId, className, academicYear)
   if (schoolId === 'SCH_02') {
     return getJSICFeeComponents(className, academicYear);
   }
-  // SCH_03 (Jeevan Shilp Sanskarshala) or generic branch fallback:
+  if (schoolId === 'SCH_03') {
+    return getSCH03FeeComponents(className, academicYear);
+  }
+  // Generic branch fallback:
   // If high school / intermediate classes, use secondary schedule; otherwise primary schedule
   if (['Class 9', 'Class 10', 'Class 11', 'Class 12', 'Class 11 Art', 'Class 11 Science', 'Class 12 Art', 'Class 12 Science'].includes(className)) {
     return getJSICFeeComponents(className, academicYear);
