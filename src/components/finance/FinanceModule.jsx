@@ -14,6 +14,7 @@ import {
   applyPaymentsAndAdjustments, 
   summarizeDues,
   sortLedgerCharges,
+  getCleanFeeLabel,
   getJSPSFeeComponents,
   getJSICFeeComponents,
   getSchoolDefaultFeeComponents
@@ -128,6 +129,7 @@ export default function FinanceModule({ onNavigate, userPermissions, lang = 'en'
         <RecordPayment
           subOnNavigate={onNavigate}
           dict={dict}
+          lang={lang}
           prefilledStudentId={prefilledStudentId}
           selectedSchool={selectedSchool}
           setSelectedSchool={setSelectedSchool}
@@ -390,7 +392,219 @@ function ClasswiseDueFeesReport({ onCollectFee, onNavigate, dict, selectedSchool
 // ────────────────────────────────────────────────────────────────────────────
 // RECORD PAYMENT (School → Class → Student → Fee Record Workflow)
 // ────────────────────────────────────────────────────────────────────────────
-function RecordPayment({ subOnNavigate, dict, prefilledStudentId, selectedSchool, setSelectedSchool, userPermissions, classes = [], activeAcademicYearId = 'AY_2026_27' }) {
+
+function ReceiptModal({ receiptData, lang, onClose, onPrintPDF }) {
+  if (!receiptData) return null;
+  const { invoice, student, schoolName } = receiptData;
+  const isHi = lang === 'hi';
+  const receiptNo = invoice.receiptId || invoice.receiptNo || invoice.id || 'N/A';
+  const date = invoice.date ? new Date(invoice.date).toLocaleDateString(isHi ? 'hi-IN' : 'en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : new Date().toLocaleDateString();
+  const amount = Number(invoice.amount || 0);
+
+  return (
+    <div style={{
+      position: 'fixed',
+      inset: 0,
+      backgroundColor: 'rgba(15, 23, 42, 0.65)',
+      backdropFilter: 'blur(5px)',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      zIndex: 9999,
+      padding: 16
+    }}>
+      <div style={{
+        backgroundColor: '#ffffff',
+        color: '#1e293b',
+        borderRadius: 16,
+        width: '100%',
+        maxWidth: 620,
+        boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)',
+        border: '1px solid #e2e8f0',
+        overflow: 'hidden',
+        animation: 'fadeIn 0.2s ease-out'
+      }}>
+        {/* Header Banner */}
+        <div style={{
+          background: 'linear-gradient(135deg, #1e3a8a 0%, #0f172a 100%)',
+          color: '#ffffff',
+          padding: '24px 28px',
+          textAlign: 'center',
+          position: 'relative'
+        }}>
+          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 900, letterSpacing: '0.5px' }}>{schoolName}</h2>
+          <div style={{
+            display: 'inline-block',
+            marginTop: 8,
+            padding: '4px 14px',
+            borderRadius: 20,
+            background: 'rgba(255, 255, 255, 0.15)',
+            fontSize: 12,
+            fontWeight: 800,
+            letterSpacing: '1px',
+            textTransform: 'uppercase'
+          }}>
+            {isHi ? 'अधिकृत फीस रसीद' : 'Official Fee Receipt'}
+          </div>
+          <button
+            onClick={onClose}
+            style={{
+              position: 'absolute',
+              top: 16,
+              right: 16,
+              background: 'rgba(255, 255, 255, 0.2)',
+              border: 'none',
+              borderRadius: '50%',
+              width: 32,
+              height: 32,
+              color: '#ffffff',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              fontSize: 16
+            }}
+          >
+            ✕
+          </button>
+        </div>
+
+        {/* Receipt Content */}
+        <div style={{ padding: '24px 28px', maxHeight: '70vh', overflowY: 'auto' }}>
+          {/* Metadata Grid */}
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: '1fr 1fr',
+            gap: 12,
+            background: '#f8fafc',
+            border: '1px solid #e2e8f0',
+            borderRadius: 10,
+            padding: '14px 18px',
+            marginBottom: 20,
+            fontSize: 13
+          }}>
+            <div>
+              <div style={{ color: '#64748b', fontSize: 11, fontWeight: 700, textTransform: 'uppercase' }}>
+                {isHi ? 'रसीद क्र.' : 'Receipt No.'}
+              </div>
+              <div style={{ fontWeight: 800, color: '#0f172a', fontSize: 14 }}>{receiptNo}</div>
+            </div>
+            <div>
+              <div style={{ color: '#64748b', fontSize: 11, fontWeight: 700, textTransform: 'uppercase' }}>
+                {isHi ? 'दिनांक' : 'Date'}
+              </div>
+              <div style={{ fontWeight: 700, color: '#0f172a' }}>{date}</div>
+            </div>
+            <div>
+              <div style={{ color: '#64748b', fontSize: 11, fontWeight: 700, textTransform: 'uppercase' }}>
+                {isHi ? 'विद्यार्थी का नाम' : 'Student Name'}
+              </div>
+              <div style={{ fontWeight: 800, color: '#0f172a', fontSize: 14 }}>{student?.name || 'N/A'}</div>
+            </div>
+            <div>
+              <div style={{ color: '#64748b', fontSize: 11, fontWeight: 700, textTransform: 'uppercase' }}>
+                {isHi ? 'कक्षा एवं सेक्शन' : 'Class & Section'}
+              </div>
+              <div style={{ fontWeight: 700, color: '#0f172a' }}>
+                {student?.class || 'N/A'} {student?.section ? `(${student.section})` : ''} {student?.roll ? `| Roll: ${student.roll}` : ''}
+              </div>
+            </div>
+          </div>
+
+          {/* Allocations Breakdown Table */}
+          <table style={{ width: '100%', borderCollapse: 'collapse', marginBottom: 20, fontSize: 13 }}>
+            <thead>
+              <tr style={{ background: '#f1f5f9', borderBottom: '2px solid #cbd5e1' }}>
+                <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 800, color: '#334155' }}>
+                  {isHi ? 'विवरण' : 'Fee Description'}
+                </th>
+                <th style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 800, color: '#334155', width: 130 }}>
+                  {isHi ? 'राशि (₹)' : 'Amount (₹)'}
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {Array.isArray(invoice.allocations) && invoice.allocations.length > 0 ? (
+                invoice.allocations.map((alloc, i) => (
+                  <tr key={i} style={{ borderBottom: '1px solid #e2e8f0', background: i % 2 === 1 ? '#fafafa' : '#ffffff' }}>
+                    <td style={{ padding: '10px 12px', color: '#1e293b', fontWeight: 600 }}>
+                      {getCleanFeeLabel(alloc.label, lang, alloc.componentId)}
+                    </td>
+                    <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 700, color: '#0f172a' }}>
+                      ₹{Number(alloc.amount).toLocaleString('en-IN')}
+                    </td>
+                  </tr>
+                ))
+              ) : (
+                <tr style={{ borderBottom: '1px solid #e2e8f0' }}>
+                  <td style={{ padding: '10px 12px', color: '#1e293b', fontWeight: 600 }}>
+                    {getCleanFeeLabel(invoice.feeType || invoice.category || 'Fee Payment', lang)}
+                  </td>
+                  <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 700, color: '#0f172a' }}>
+                    ₹{amount.toLocaleString('en-IN')}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+            <tfoot>
+              <tr style={{ background: '#f8fafc', borderTop: '2px solid #0f172a' }}>
+                <td style={{ padding: '12px 14px', fontSize: 15, fontWeight: 900, color: '#0f172a' }}>
+                  {isHi ? 'कुल प्राप्त राशि' : 'Total Amount Paid'}
+                </td>
+                <td style={{ padding: '12px 14px', textAlign: 'right', fontSize: 17, fontWeight: 900, color: '#059669' }}>
+                  ₹{amount.toLocaleString('en-IN')}
+                </td>
+              </tr>
+            </tfoot>
+          </table>
+
+          {/* Stamp & Footer */}
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', marginTop: 20, paddingTop: 14, borderTop: '1px dashed #cbd5e1' }}>
+            <div style={{ fontSize: 11, color: '#64748b' }}>
+              ✓ {isHi ? 'कंप्यूटर जनरेटेड आधिकारिक रसीद' : 'Computer-generated verified receipt'}<br/>
+              {schoolName} • Fee Management
+            </div>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ width: 140, borderBottom: '1px solid #94a3b8', marginBottom: 4 }}></div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#475569' }}>
+                {isHi ? 'अधिकृत हस्ताक्षर' : 'Authorized Signatory'}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Action Buttons */}
+        <div style={{
+          display: 'flex',
+          justifyContent: 'flex-end',
+          gap: 12,
+          padding: '16px 28px',
+          background: '#f8fafc',
+          borderTop: '1px solid #e2e8f0'
+        }}>
+          <button
+            type="button"
+            className="btn-secondary"
+            style={{ padding: '8px 18px', fontSize: 13 }}
+            onClick={onClose}
+          >
+            {isHi ? 'बंद करें' : 'Close'}
+          </button>
+          <button
+            type="button"
+            className="btn-primary"
+            style={{ padding: '8px 20px', fontSize: 13, display: 'inline-flex', alignItems: 'center', gap: 8 }}
+            onClick={() => onPrintPDF(receiptData)}
+          >
+            <Printer size={16} /> {isHi ? 'रसीद प्रिंट / डाउनलोड करें' : 'Print / Download PDF'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RecordPayment({ subOnNavigate, dict, lang = 'en', prefilledStudentId, selectedSchool, setSelectedSchool, userPermissions, classes = [], activeAcademicYearId = 'AY_2026_27' }) {
   const [currentSchool, setCurrentSchool] = useState(selectedSchool === 'ALL' ? 'SCH_02' : selectedSchool);
   const [selectedClass, setSelectedClass] = useState('');
   const [allSchoolStudents, setAllSchoolStudents] = useState([]);
@@ -400,6 +614,7 @@ function RecordPayment({ subOnNavigate, dict, prefilledStudentId, selectedSchool
   const paymentAmount = Object.values(manualAllocations).reduce((sum, val) => sum + (Number(val) || 0), 0);
   const [isProcessing, setIsProcessing] = useState(false);
   const [refreshTrigger, setRefreshTrigger] = useState(0);
+  const [receiptModalData, setReceiptModalData] = useState(null);
 
   // Sync if prop selectedSchool changes
   useEffect(() => {
@@ -523,49 +738,122 @@ function RecordPayment({ subOnNavigate, dict, prefilledStudentId, selectedSchool
 
   const previewAllocation = useMemo(() => {
     if (!currentLedger || !paymentAmount || isNaN(paymentAmount) || Number(paymentAmount) <= 0) return null;
-    const virtualPayment = { id: 'preview', date: new Date().toISOString(), amount: Number(paymentAmount) };
+    const activeAllocs = [];
+    for (const [k, v] of Object.entries(manualAllocations || {})) {
+      const amt = Number(v);
+      if (!isNaN(amt) && amt > 0) {
+        activeAllocs.push({ chargeId: k, amount: amt });
+      }
+    }
+    const virtualPayment = {
+      id: 'preview',
+      date: new Date().toISOString(),
+      amount: Number(paymentAmount),
+      allocations: activeAllocs
+    };
     const res = applyPaymentsAndAdjustments(currentLedger, [virtualPayment], []);
     return res;
-  }, [currentLedger, paymentAmount]);
+  }, [currentLedger, paymentAmount, manualAllocations]);
 
   const handleRecordPayment = async () => {
     const val = Number(paymentAmount);
     if (!val || val <= 0) return alert("Enter a valid payment amount");
     if (!receiptNumber.trim()) return alert("Enter physical receipt number");
-    if (!previewAllocation) return alert("Invalid state");
+
+    // ── STRICT PAYMENT ALLOCATION SAFETY VALIDATION ──
+    const validationErrors = [];
+    const myAllocations = [];
+    const seenChargeIds = new Set();
+    let calculatedSum = 0;
+
+    for (const [key, rawVal] of Object.entries(manualAllocations || {})) {
+      const amt = Number(rawVal);
+      if (isNaN(amt) || amt <= 0) continue;
+
+      // 4. Duplicate or conflicting charge allocations must be rejected
+      if (seenChargeIds.has(key)) {
+        validationErrors.push(`Duplicate allocation detected for charge: ${key}`);
+        continue;
+      }
+      seenChargeIds.add(key);
+
+      if (key === 'advance') {
+        calculatedSum += amt;
+        myAllocations.push({
+          chargeId: 'advance',
+          componentId: 'advance',
+          amount: amt,
+          label: 'Advance Payment / अग्रिम भुगतान'
+        });
+        continue;
+      }
+
+      // 1. Every chargeId must exist and belong to the selected student
+      const charge = currentLedger.find(c => c.id === key);
+      if (!charge) {
+        validationErrors.push(`Charge ID ${key} does not exist in active student ledger.`);
+        continue;
+      }
+      if (charge.studentId && charge.studentId !== selectedStudentId) {
+        validationErrors.push(`Charge "${charge.label || key}" belongs to student ${charge.studentId}, not ${selectedStudentId}.`);
+        continue;
+      }
+
+      // 2. Every allocation must belong to the selected school
+      if (charge.schoolId && charge.schoolId !== currentSchool) {
+        validationErrors.push(`Charge "${charge.label || key}" belongs to school ${charge.schoolId}, not ${currentSchool}.`);
+        continue;
+      }
+
+      // 3. Allocation amounts must be valid positive numbers
+      if (!isFinite(amt) || amt <= 0) {
+        validationErrors.push(`Allocation amount for "${charge.label || key}" must be a positive number.`);
+        continue;
+      }
+
+      // 6. No allocation may exceed the outstanding amount of its target charge
+      if (amt > charge.netDue) {
+        validationErrors.push(`Allocation ₹${amt} exceeds outstanding due ₹${charge.netDue} for "${charge.label}".`);
+        continue;
+      }
+
+      calculatedSum += amt;
+      let label = charge.label || charge.componentId;
+      if (label === 'September' || label.toLowerCase().includes('september')) {
+        label = label.toLowerCase().includes('late fee') ? 'Late Fee - October / अक्टूबर लेट फीस' : 'October Installment / अक्टूबर की किस्त';
+      }
+      myAllocations.push({
+        chargeId: charge.id,
+        componentId: charge.componentId,
+        amount: amt,
+        label: label
+      });
+    }
+
+    if (myAllocations.length === 0) {
+      validationErrors.push("No charges selected for payment.");
+    }
+
+    // 5. The sum of all allocations must exactly match the payment amount
+    if (Math.abs(calculatedSum - val) > 0.01) {
+      validationErrors.push(`Allocations sum (₹${calculatedSum}) does not match total payment amount (₹${val}).`);
+    }
+
+    // 7. If any validation fails, reject the entire payment and do NOT write anything to Firestore
+    if (validationErrors.length > 0) {
+      setIsProcessing(false);
+      return alert(
+        "Payment allocation could not be verified. No payment was recorded.\n\n" +
+        "Validation Failures:\n• " + validationErrors.join("\n• ")
+      );
+    }
 
     setIsProcessing(true);
     try {
       const ledgerRef = doc(collection(db, "student_ledger"));
       const invoiceRef = doc(collection(db, "invoices"));
       const now = new Date().toISOString();
-
-      const myAllocations = previewAllocation.allocations.filter(a => a.paymentId === 'preview');
-      const allocatedChargeIds = myAllocations.map(a => a.chargeId);
-
-      const myAllocationsForInvoice = myAllocations.map(a => {
-        const charge = currentLedger.find(c => c.id === a.chargeId);
-        let label = charge ? charge.label : a.componentId;
-        if (label === 'September' || label.toLowerCase().includes('september')) {
-          label = label.toLowerCase().includes('late fee') ? 'Late Fee - October / अक्टूबर लेट फीस' : 'October Installment / अक्टूबर की किस्त';
-        }
-        return {
-          chargeId: a.chargeId,
-          componentId: a.componentId,
-          amount: a.amount,
-          label: label
-        };
-      });
-
-      const advanceAdded = previewAllocation.advanceCredit - (currentSummary?.advanceCredit || 0);
-      if (advanceAdded > 0) {
-        myAllocationsForInvoice.push({
-          chargeId: 'advance',
-          componentId: 'advance',
-          amount: advanceAdded,
-          label: 'Advance Payment / अग्रिम भुगतान'
-        });
-      }
+      const allocatedChargeIds = myAllocations.filter(a => a.chargeId !== 'advance').map(a => a.chargeId);
 
       // Prevent duplicate receipt submission
       const existingInvoiceQ = query(collection(db, "invoices"), where("receiptId", "==", receiptNumber.trim()), where("schoolId", "==", currentSchool));
@@ -610,11 +898,26 @@ function RecordPayment({ subOnNavigate, dict, prefilledStudentId, selectedSchool
           amount: val,
           status: 'Paid',
           schoolId: currentSchool,
-          allocations: myAllocationsForInvoice
+          allocations: myAllocations
         });
       });
       
-      alert(`Payment of ₹${val} recorded successfully!`);
+      const recordedReceiptData = {
+        invoice: {
+          receiptId: receiptNumber.trim(),
+          receiptNo: receiptNumber.trim(),
+          amount: val,
+          date: now,
+          student: selectedStudentObj?.name || '',
+          class: selectedStudentObj?.class || '',
+          allocations: myAllocations,
+          schoolId: currentSchool,
+          paymentMode: 'Cash'
+        },
+        student: selectedStudentObj,
+        schoolName: SCHOOLS.find(s => s.id === currentSchool)?.name || currentSchool
+      };
+      setReceiptModalData(recordedReceiptData);
       setManualAllocations({});
       setReceiptNumber('');
       setRefreshTrigger(prev => prev + 1);
@@ -726,145 +1029,372 @@ function RecordPayment({ subOnNavigate, dict, prefilledStudentId, selectedSchool
 
         {/* 4. FEE RECORD STATEMENT */}
         {!selectedStudentId ? (
-          <div style={{ textAlign: 'center', padding: '40px 20px', color: 'var(--text-secondary)', background: 'var(--bg-secondary)', borderRadius: 8 }}>
-            <AlertCircle size={32} style={{ margin: '0 auto 12px', opacity: 0.6 }} />
-            <p style={{ margin: 0, fontWeight: 600 }}>Please select a School, Class, and Student above to view fee record and collect payments.</p>
+          <div style={{ textAlign: 'center', padding: '40px 20px', color: 'var(--text-secondary)', background: 'var(--bg-secondary)', borderRadius: 12, border: '1px dashed var(--border-light)' }}>
+            <AlertCircle size={36} style={{ margin: '0 auto 12px', opacity: 0.6, color: 'var(--brand-primary)' }} />
+            <p style={{ margin: 0, fontWeight: 700, fontSize: 14 }}>
+              {lang === 'hi' ? 'कृपया शुल्क विवरण देखने एवं भुगतान दर्ज करने के लिए ऊपर स्कूल, कक्षा और विद्यार्थी का चयन करें।' : 'Please select a School, Class, and Student above to view fee record and collect payments.'}
+            </p>
           </div>
         ) : currentSummary ? (
           <>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14, flexWrap: 'wrap', gap: 8 }}>
-              <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)' }}>
-                Student: <strong>{selectedStudentObj?.name}</strong> | Class: <strong>{selectedStudentObj?.class}</strong> {selectedStudentObj?.section ? `(${selectedStudentObj?.section})` : ''} {selectedStudentObj?.roll ? `| Roll: ${selectedStudentObj?.roll}` : ''}
-              </span>
-              <span className="badge" style={{ backgroundColor: 'var(--bg-secondary)', fontSize: 12 }}>
+            {/* Student Profile Card Banner */}
+            <div style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              marginBottom: 18,
+              padding: '14px 18px',
+              background: 'linear-gradient(135deg, rgba(30, 58, 138, 0.06) 0%, rgba(15, 23, 42, 0.02) 100%)',
+              border: '1px solid rgba(30, 58, 138, 0.15)',
+              borderRadius: 12,
+              flexWrap: 'wrap',
+              gap: 12
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <div style={{
+                  width: 42,
+                  height: 42,
+                  borderRadius: '50%',
+                  background: 'var(--brand-primary, #1e3a8a)',
+                  color: '#ffffff',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontWeight: 900,
+                  fontSize: 16
+                }}>
+                  {selectedStudentObj?.name ? selectedStudentObj.name[0].toUpperCase() : 'S'}
+                </div>
+                <div>
+                  <div style={{ fontSize: 15, fontWeight: 800, color: 'var(--text-primary)' }}>
+                    {selectedStudentObj?.name}
+                  </div>
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)', display: 'flex', gap: 8, alignItems: 'center', marginTop: 2 }}>
+                    <span>{lang === 'hi' ? 'कक्षा:' : 'Class:'} <strong>{selectedStudentObj?.class}</strong> {selectedStudentObj?.section ? `(${selectedStudentObj.section})` : ''}</span>
+                    {selectedStudentObj?.roll && <span>• {lang === 'hi' ? 'रोल:' : 'Roll:'} <strong>{selectedStudentObj.roll}</strong></span>}
+                  </div>
+                </div>
+              </div>
+              <span className="badge" style={{ backgroundColor: 'rgba(30, 58, 138, 0.1)', color: 'var(--brand-primary, #1e3a8a)', border: '1px solid rgba(30, 58, 138, 0.25)', fontSize: 12, fontWeight: 700, padding: '4px 12px', borderRadius: 20 }}>
                 {SCHOOLS.find(s => s.id === currentSchool)?.name || currentSchool}
               </span>
             </div>
 
-            <div style={{ padding: 16, background: 'var(--bg-secondary)', borderRadius: 8, marginBottom: 20 }}>
-              <div data-testid="debug-summary" style={{ display: 'none' }}>{JSON.stringify(currentSummary)}</div>
-              <h3 style={{ marginTop: 0 }}>{dict.financialSummary}</h3>
-              <table className="modern-table" style={{ fontSize: 12 }}>
-                <thead>
-                  <tr>
-                    <th>{dict.feeCategory}</th>
-                    <th>Total Due</th>
-                    <th>Previously Paid</th>
-                    <th>Collecting Now</th>
-                    <th>Balance</th>
-                    <th>Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {currentSummary.ledger.map((c, index) => {
-                    let isPreviousFullyCovered = true;
-                    for (let i = 0; i < index; i++) {
-                      const prevCharge = currentSummary.ledger[i];
-                      const prevInput = Number(manualAllocations[prevCharge.id]) || 0;
-                      if (prevCharge.netDue > 0 && prevInput < prevCharge.netDue) {
-                        isPreviousFullyCovered = false;
-                        break;
-                      }
-                    }
-                    
-                    const isFullyPaid = c.netDue === 0;
-                    const isInputDisabled = isFullyPaid || !isPreviousFullyCovered;
-
-                    const collectingNowAmount = manualAllocations[c.id] !== undefined ? manualAllocations[c.id] : '';
-                    const balanceAfter = c.netDue - (Number(collectingNowAmount) || 0);
-                    
-                    let displayLabel = c.label;
-                    if (displayLabel === 'September' || displayLabel.toLowerCase().includes('september')) {
-                      displayLabel = displayLabel.toLowerCase().includes('late fee') ? 'Late Fee - October / अक्टूबर लेट फीस' : 'October Installment / अक्टूबर की किस्त';
-                    }
-
-                    return (
-                      <tr key={c.id}>
-                        <td>{displayLabel}</td>
-                        <td>₹{c.originalAmount - (c.allocatedAdjusted || 0)}</td>
-                        <td style={{ color: 'var(--success)' }}>₹{c.allocatedPaid}</td>
-                        <td style={{ color: 'var(--brand-primary)', fontWeight: 'bold' }}>
-                          <input
-                            type="number"
-                            className="form-input"
-                            style={{ width: 120, padding: '4px 8px', borderColor: isInputDisabled ? 'transparent' : 'var(--brand-primary)' }}
-                            disabled={isInputDisabled}
-                            max={c.netDue}
-                            value={collectingNowAmount}
-                            onChange={e => {
-                              let val = e.target.value;
-                              if (val !== '' && Number(val) > c.netDue) val = c.netDue;
-                              setManualAllocations(prev => ({ ...prev, [c.id]: val }));
-                            }}
-                            placeholder={isFullyPaid ? "Paid" : "₹ 0"}
-                          />
-                        </td>
-                        <td style={{ fontWeight: 'bold' }}>₹{balanceAfter}</td>
-                        <td>
-                           <span className={`badge ${balanceAfter === 0 ? 'success' : balanceAfter < (c.originalAmount - (c.allocatedAdjusted || 0)) ? 'warning' : 'danger'}`}>
-                             {balanceAfter === 0 ? 'PAID' : balanceAfter < (c.originalAmount - (c.allocatedAdjusted || 0)) ? 'PARTIAL' : 'DUE'}
-                           </span>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                  {(() => {
-                    let allChargesFullyCovered = true;
-                    for (const c of currentSummary.ledger) {
-                      if (c.netDue > 0 && (Number(manualAllocations[c.id]) || 0) < c.netDue) {
-                        allChargesFullyCovered = false;
-                        break;
-                      }
-                    }
-                    const advanceVal = manualAllocations['advance'] !== undefined ? manualAllocations['advance'] : '';
-                    
-                    return (
-                      <tr>
-                        <td style={{ fontWeight: 'bold', color: 'var(--success)' }}>Advance Payment / अग्रिम भुगतान</td>
-                        <td>-</td>
-                        <td>-</td>
-                        <td>
-                          <input
-                             type="number"
-                             className="form-input"
-                             style={{ width: 120, padding: '4px 8px', borderColor: !allChargesFullyCovered ? 'transparent' : 'var(--brand-primary)' }}
-                             disabled={!allChargesFullyCovered}
-                             value={advanceVal}
-                             onChange={e => setManualAllocations(prev => ({ ...prev, 'advance': e.target.value }))}
-                             placeholder="₹ 0"
-                          />
-                        </td>
-                        <td colSpan="2">-</td>
-                      </tr>
-                    );
-                  })()}
-                </tbody>
-              </table>
-              <div style={{ marginTop: 10, fontSize: 16, fontWeight: 'bold', color: 'var(--danger)' }}>
-                {dict.outstandingDue}: ₹{currentSummary.totalDue}
+            {/* Financial Summary Table Container */}
+            <div style={{
+              background: 'var(--bg-secondary)',
+              borderRadius: 14,
+              border: '1px solid var(--border-light, #e2e8f0)',
+              boxShadow: '0 4px 20px rgba(0, 0, 0, 0.03)',
+              overflow: 'hidden',
+              marginBottom: 20
+            }}>
+              <div style={{ padding: '14px 18px', borderBottom: '1px solid var(--border-light)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <h3 style={{ margin: 0, fontSize: 15, fontWeight: 800, color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <CreditCard size={18} style={{ color: 'var(--brand-primary)' }} />
+                  {dict.financialSummary}
+                </h3>
               </div>
-              {currentSummary.advanceCredit > 0 && (
-                <div style={{ color: 'var(--success)', fontWeight: 'bold' }}>{dict.walletBalance}: ₹{currentSummary.advanceCredit}</div>
-              )}
-            </div>
 
-            {/* PAYMENT INPUT */}
-            <div style={{ display: 'flex', gap: 16, marginBottom: 20 }}>
-              <div style={{ flex: 1 }}>
-                <label className="form-label">{dict.amountReceived} (Auto-Sum)</label>
-                <div style={{ fontSize: 24, fontWeight: '900', padding: '10px 0', color: 'var(--success)' }}>
-                  ₹ {paymentAmount}
+              <div style={{ overflowX: 'auto' }}>
+                <table className="modern-table" style={{ fontSize: 12, width: '100%', margin: 0 }}>
+                  <thead>
+                    <tr style={{ background: 'rgba(0, 0, 0, 0.02)' }}>
+                      <th style={{ padding: '10px 14px', textAlign: 'left' }}>{dict.feeCategory}</th>
+                      <th style={{ padding: '10px 14px', textAlign: 'right', width: 110 }}>{lang === 'hi' ? 'कुल देय' : 'Total Due'}</th>
+                      <th style={{ padding: '10px 14px', textAlign: 'right', width: 110 }}>{lang === 'hi' ? 'पूर्व जमा' : 'Previously Paid'}</th>
+                      <th style={{ padding: '10px 14px', textAlign: 'center', width: 130 }}>{lang === 'hi' ? 'वर्तमान जमा' : 'Collecting Now'}</th>
+                      <th style={{ padding: '10px 14px', textAlign: 'right', width: 110 }}>{lang === 'hi' ? 'शेष राशि' : 'Balance'}</th>
+                      <th style={{ padding: '10px 14px', textAlign: 'center', width: 90 }}>{lang === 'hi' ? 'स्थिति' : 'Status'}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(() => {
+                      let academicHeaderRendered = false;
+                      let transportHeaderRendered = false;
+
+                      return currentSummary.ledger.map((c, index) => {
+                        const isTransport = c.componentId === 'transport';
+                        let isPreviousFullyCovered = true;
+                        for (let i = 0; i < index; i++) {
+                          const prevCharge = currentSummary.ledger[i];
+                          const prevIsTransport = prevCharge.componentId === 'transport';
+                          if (isTransport === prevIsTransport) {
+                            const prevInput = Number(manualAllocations[prevCharge.id]) || 0;
+                            if (prevCharge.netDue > 0 && prevInput < prevCharge.netDue) {
+                              isPreviousFullyCovered = false;
+                              break;
+                            }
+                          }
+                        }
+                        
+                        const isFullyPaid = c.netDue === 0;
+                        const isInputDisabled = isFullyPaid || !isPreviousFullyCovered;
+
+                        const collectingNowAmount = manualAllocations[c.id] !== undefined ? manualAllocations[c.id] : '';
+                        const balanceAfter = c.netDue - (Number(collectingNowAmount) || 0);
+                        
+                        const displayLabel = getCleanFeeLabel(c.label, lang, c.componentId);
+
+                        const showAcademicHeader = !isTransport && !academicHeaderRendered;
+                        if (showAcademicHeader) academicHeaderRendered = true;
+
+                        const showTransportHeader = isTransport && !transportHeaderRendered;
+                        if (showTransportHeader) transportHeaderRendered = true;
+
+                        const badgeLabel = isTransport ? (lang === 'hi' ? 'परिवहन' : 'Transport') : (lang === 'hi' ? 'शैक्षणिक' : 'Academic');
+                        const statusLabel = balanceAfter === 0 
+                          ? (lang === 'hi' ? 'पूर्ण जमा' : 'PAID') 
+                          : balanceAfter < (c.originalAmount - (c.allocatedAdjusted || 0)) 
+                            ? (lang === 'hi' ? 'आंशिक' : 'PARTIAL') 
+                            : (lang === 'hi' ? 'बाकी' : 'DUE');
+
+                        return (
+                          <React.Fragment key={c.id}>
+                            {showAcademicHeader && (
+                              <tr style={{ background: 'linear-gradient(90deg, rgba(59, 130, 246, 0.08) 0%, rgba(59, 130, 246, 0.01) 100%)', borderTop: '2px solid rgba(59, 130, 246, 0.25)' }}>
+                                <td colSpan="6" style={{ padding: '8px 14px', fontWeight: 800, color: 'var(--brand-primary)', fontSize: 12, letterSpacing: '0.3px' }}>
+                                  📚 {lang === 'hi' ? 'शैक्षणिक शुल्क (क्रमबद्ध)' : 'Academic Fees (Sequential Waterfall)'}
+                                </td>
+                              </tr>
+                            )}
+                            {showTransportHeader && (
+                              <tr style={{ background: 'linear-gradient(90deg, rgba(245, 158, 11, 0.08) 0%, rgba(245, 158, 11, 0.01) 100%)', borderTop: '2px solid rgba(245, 158, 11, 0.3)' }}>
+                                <td colSpan="6" style={{ padding: '8px 14px', fontWeight: 800, color: '#d97706', fontSize: 12, letterSpacing: '0.3px' }}>
+                                  🚌 {lang === 'hi' ? 'परिवहन शुल्क (स्वतंत्र)' : 'Transport Fees (Independent Waterfall)'}
+                                </td>
+                              </tr>
+                            )}
+                            <tr style={{ borderBottom: '1px solid var(--border-light)' }}>
+                              <td style={{ padding: '10px 14px' }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                  {isTransport ? (
+                                    <span className="badge" style={{ backgroundColor: 'rgba(245, 158, 11, 0.12)', color: '#b45309', border: '1px solid rgba(245, 158, 11, 0.3)', fontSize: 11, fontWeight: 700, padding: '2px 8px', borderRadius: 12 }}>
+                                      {badgeLabel}
+                                    </span>
+                                  ) : (
+                                    <span className="badge" style={{ backgroundColor: 'rgba(59, 130, 246, 0.08)', color: 'var(--brand-primary)', border: '1px solid rgba(59, 130, 246, 0.25)', fontSize: 11, fontWeight: 700, padding: '2px 8px', borderRadius: 12 }}>
+                                      {badgeLabel}
+                                    </span>
+                                  )}
+                                  <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>{displayLabel}</span>
+                                </div>
+                              </td>
+                              <td style={{ padding: '10px 14px', textAlign: 'right', fontWeight: 600 }}>₹{Number(c.originalAmount - (c.allocatedAdjusted || 0)).toLocaleString('en-IN')}</td>
+                              <td style={{ padding: '10px 14px', textAlign: 'right', color: 'var(--success, #10b981)', fontWeight: 700 }}>₹{Number(c.allocatedPaid).toLocaleString('en-IN')}</td>
+                              <td style={{ padding: '10px 14px', textAlign: 'center' }}>
+                                <input
+                                  type="number"
+                                  className="form-input"
+                                  style={{
+                                    width: 110,
+                                    padding: '5px 8px',
+                                    textAlign: 'right',
+                                    fontWeight: 700,
+                                    borderRadius: 6,
+                                    borderColor: isInputDisabled ? 'transparent' : 'var(--brand-primary)',
+                                    backgroundColor: isInputDisabled ? 'rgba(0,0,0,0.03)' : '#ffffff'
+                                  }}
+                                  disabled={isInputDisabled}
+                                  min="0"
+                                  max={c.netDue}
+                                  value={collectingNowAmount}
+                                  onKeyDown={e => {
+                                    if (e.key === '-' || e.key === 'e' || e.key === 'E' || e.key === '+') {
+                                      e.preventDefault();
+                                    }
+                                  }}
+                                  onChange={e => {
+                                    let val = e.target.value;
+                                    if (val !== '') {
+                                      const num = Number(val);
+                                      if (isNaN(num) || num < 0) {
+                                        val = '0';
+                                      } else if (num > c.netDue) {
+                                        val = String(c.netDue);
+                                      }
+                                    }
+                                    setManualAllocations(prev => ({ ...prev, [c.id]: val }));
+                                  }}
+                                  placeholder={isFullyPaid ? (lang === 'hi' ? 'जमा' : 'Paid') : '₹ 0'}
+                                />
+                              </td>
+                              <td style={{ padding: '10px 14px', textAlign: 'right', fontWeight: 800, color: balanceAfter === 0 ? 'var(--success, #10b981)' : 'var(--text-primary)' }}>
+                                ₹{Number(balanceAfter).toLocaleString('en-IN')}
+                              </td>
+                              <td style={{ padding: '10px 14px', textAlign: 'center' }}>
+                                 <span className={`badge ${balanceAfter === 0 ? 'success' : balanceAfter < (c.originalAmount - (c.allocatedAdjusted || 0)) ? 'warning' : 'danger'}`} style={{ fontSize: 10, padding: '3px 8px', borderRadius: 10, fontWeight: 700 }}>
+                                   {statusLabel}
+                                 </span>
+                              </td>
+                            </tr>
+                          </React.Fragment>
+                        );
+                      });
+                    })()}
+                    {(() => {
+                      let allChargesFullyCovered = true;
+                      for (const c of currentSummary.ledger) {
+                        if (c.netDue > 0 && (Number(manualAllocations[c.id]) || 0) < c.netDue) {
+                          allChargesFullyCovered = false;
+                          break;
+                        }
+                      }
+                      const advanceVal = manualAllocations['advance'] !== undefined ? manualAllocations['advance'] : '';
+                      
+                      return (
+                        <>
+                          <tr style={{ background: 'linear-gradient(90deg, rgba(16, 185, 129, 0.08) 0%, rgba(16, 185, 129, 0.01) 100%)', borderTop: '2px solid rgba(16, 185, 129, 0.25)' }}>
+                            <td colSpan="6" style={{ padding: '8px 14px', fontWeight: 800, color: 'var(--success, #10b981)', fontSize: 12 }}>
+                              💰 {lang === 'hi' ? 'अग्रिम जमा (वॉलेट)' : 'Advance Credit (Wallet)'}
+                            </td>
+                          </tr>
+                          <tr style={{ borderBottom: '1px solid var(--border-light)' }}>
+                            <td style={{ padding: '10px 14px', fontWeight: 700, color: 'var(--success, #10b981)' }}>
+                              {lang === 'hi' ? 'अग्रिम भुगतान' : 'Advance Payment'}
+                            </td>
+                            <td style={{ padding: '10px 14px', textAlign: 'right', color: 'var(--text-secondary)' }}>-</td>
+                            <td style={{ padding: '10px 14px', textAlign: 'right', color: 'var(--text-secondary)' }}>-</td>
+                            <td style={{ padding: '10px 14px', textAlign: 'center' }}>
+                              <input
+                                 type="number"
+                                 className="form-input"
+                                 style={{
+                                   width: 110,
+                                   padding: '5px 8px',
+                                   textAlign: 'right',
+                                   fontWeight: 700,
+                                   borderRadius: 6,
+                                   borderColor: !allChargesFullyCovered ? 'transparent' : 'var(--brand-primary)',
+                                   backgroundColor: !allChargesFullyCovered ? 'rgba(0,0,0,0.03)' : '#ffffff'
+                                 }}
+                                 disabled={!allChargesFullyCovered}
+                                 min="0"
+                                 value={advanceVal}
+                                 onKeyDown={e => {
+                                   if (e.key === '-' || e.key === 'e' || e.key === 'E' || e.key === '+') {
+                                     e.preventDefault();
+                                   }
+                                 }}
+                                 onChange={e => {
+                                   let val = e.target.value;
+                                   if (val !== '') {
+                                     const num = Number(val);
+                                     if (isNaN(num) || num < 0) {
+                                       val = '0';
+                                     }
+                                   }
+                                   setManualAllocations(prev => ({ ...prev, 'advance': val }));
+                                 }}
+                                 placeholder="₹ 0"
+                              />
+                            </td>
+                            <td colSpan="2" style={{ padding: '10px 14px', textAlign: 'center', color: 'var(--text-secondary)' }}>-</td>
+                          </tr>
+                        </>
+                      );
+                    })()}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* KPI Summary Strip */}
+              <div style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+                gap: 12,
+                padding: 16,
+                background: 'rgba(0, 0, 0, 0.02)',
+                borderTop: '1px solid var(--border-light)'
+              }}>
+                <div style={{ background: '#ffffff', padding: '12px 16px', borderRadius: 10, border: '1px solid rgba(239, 68, 68, 0.2)' }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--danger, #ef4444)', textTransform: 'uppercase' }}>
+                    {dict.outstandingDue}
+                  </div>
+                  <div style={{ fontSize: 18, fontWeight: 900, color: 'var(--danger, #ef4444)', marginTop: 4 }}>
+                    ₹ {currentSummary.totalDue.toLocaleString('en-IN')}
+                  </div>
+                </div>
+
+                <div style={{ background: '#ffffff', padding: '12px 16px', borderRadius: 10, border: '1px solid rgba(16, 185, 129, 0.2)' }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--success, #10b981)', textTransform: 'uppercase' }}>
+                    {dict.walletBalance}
+                  </div>
+                  <div style={{ fontSize: 18, fontWeight: 900, color: 'var(--success, #10b981)', marginTop: 4 }}>
+                    ₹ {(currentSummary.advanceCredit || 0).toLocaleString('en-IN')}
+                  </div>
+                </div>
+
+                <div style={{ background: '#ffffff', padding: '12px 16px', borderRadius: 10, border: '1px solid rgba(30, 58, 138, 0.25)' }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--brand-primary, #1e3a8a)', textTransform: 'uppercase' }}>
+                    {dict.amountReceived} ({lang === 'hi' ? 'कुल योग' : 'Auto-Sum'})
+                  </div>
+                  <div style={{ fontSize: 20, fontWeight: 900, color: 'var(--brand-primary, #1e3a8a)', marginTop: 4 }}>
+                    ₹ {paymentAmount.toLocaleString('en-IN')}
+                  </div>
                 </div>
               </div>
-              <div style={{ flex: 1 }}>
-                <label className="form-label">{dict.receiptVoucherNo}</label>
-                <input type="text" className="form-input" value={receiptNumber} onChange={e => setReceiptNumber(e.target.value)} placeholder="Physical Book #" />
+            </div>
+
+            {/* PAYMENT EXECUTION PANEL */}
+            <div style={{
+              background: '#ffffff',
+              borderRadius: 14,
+              border: '1px solid var(--border-light, #e2e8f0)',
+              padding: 20,
+              boxShadow: '0 4px 16px rgba(0, 0, 0, 0.03)',
+              marginBottom: 20
+            }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16, alignItems: 'center' }}>
+                <div>
+                  <label className="form-label" style={{ fontWeight: 700, fontSize: 12 }}>
+                    {dict.receiptVoucherNo} <span style={{ color: 'var(--danger)' }}>*</span>
+                  </label>
+                  <input
+                    type="text"
+                    className="form-input"
+                    value={receiptNumber}
+                    onChange={e => setReceiptNumber(e.target.value)}
+                    placeholder={lang === 'hi' ? 'रसीद बुक नंबर दर्ज करें' : 'Physical Receipt Book #'}
+                    style={{ fontWeight: 600 }}
+                  />
+                </div>
+
+                <div style={{ display: 'flex', alignItems: 'flex-end' }}>
+                  <button
+                    className="btn-primary"
+                    style={{
+                      width: '100%',
+                      padding: '12px 20px',
+                      fontSize: 14,
+                      fontWeight: 800,
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: 8,
+                      borderRadius: 8
+                    }}
+                    onClick={handleRecordPayment}
+                    disabled={isProcessing || !paymentAmount || !receiptNumber}
+                  >
+                    <CheckCircle size={18} />
+                    {isProcessing 
+                      ? (lang === 'hi' ? 'जमा हो रहा है...' : 'Recording...') 
+                      : (lang === 'hi' ? 'रसीद काटें और शुल्क जमा करें' : 'Record Payment & Cut Receipt')}
+                  </button>
+                </div>
               </div>
             </div>
 
-            <button className="btn-primary" onClick={handleRecordPayment} disabled={isProcessing || !paymentAmount || !receiptNumber}>
-              {isProcessing ? 'Recording...' : dict.recordFeePayment}
-            </button>
+            {/* RECEIPT MODAL */}
+            {receiptModalData && (
+              <ReceiptModal
+                receiptData={receiptModalData}
+                lang={lang}
+                onClose={() => setReceiptModalData(null)}
+                onPrintPDF={(data) => generateFeeReceipt(data.invoice, data.student, data.schoolName, lang)}
+              />
+            )}
           </>
         ) : (
           <div style={{ textAlign: 'center', padding: '30px 0', color: 'var(--text-secondary)' }}>
@@ -1305,15 +1835,47 @@ function InvoicesModule({ subOnNavigate, userPermissions, dict, selectedSchool, 
   const deletedCount = useMemo(() => invoices.filter(i => i.deleted).length, [invoices]);
 
   const handleSoftDeleteInvoice = async (invoiceId) => {
-    if (!window.confirm('Move this receipt to Recycle Bin?')) return;
+    const inv = invoices.find(i => i.id === invoiceId);
+    const recNum = inv?.receiptId || inv?.receiptNo || inv?.receiptNumber || invoiceId;
+    const studentName = inv?.student || 'Student';
+
+    const confirmMsg = `Are you sure you want to move receipt "${recNum}" (${studentName}) to the Recycle Bin?\nThis will remove it from the student's transaction history and restore their pending due balance.\n\nक्या आप वाकई रसीद "${recNum}" (${studentName}) को रीसायकल बिन में भेजना चाहते हैं?\nयह छात्र के लेन-देन इतिहास से हट जाएगी और उनकी बकाया राशि पुनः जुड़ जाएगी।`;
+
+    if (!window.confirm(confirmMsg)) return;
+
     try {
       await updateDoc(doc(db, 'invoices', invoiceId), {
         deleted: true,
+        status: 'deleted',
         deletedAt: serverTimestamp(),
         deletedBy: currentUser?.email || currentUser?.uid || 'Admin'
       });
-      setInvoices(prev => prev.map(inv => inv.id === invoiceId ? { ...inv, deleted: true } : inv));
-      alert('Receipt moved to Recycle Bin.');
+
+      try {
+        if (recNum) {
+          const ledgerQ = query(collection(db, 'student_ledger'), where('receiptNumber', '==', recNum));
+          const ledgerSnap = await getDocs(ledgerQ);
+          const updatePromises = ledgerSnap.docs.map(d =>
+            updateDoc(doc(db, 'student_ledger', d.id), {
+              deleted: true,
+              status: 'deleted',
+              deletedAt: serverTimestamp(),
+              deletedBy: currentUser?.email || currentUser?.uid || 'Admin'
+            })
+          );
+          await Promise.all(updatePromises);
+        }
+      } catch (ledgerErr) {
+        console.warn('Could not sync soft-delete to student_ledger:', ledgerErr);
+      }
+
+      setInvoices(prev => prev.map(item => item.id === invoiceId ? { ...item, deleted: true, status: 'deleted' } : item));
+
+      window.dispatchEvent(new CustomEvent('receipt_deleted_or_restored', {
+        detail: { invoiceId, receiptNumber: recNum, studentId: inv?.studentId }
+      }));
+
+      alert(`Receipt "${recNum}" moved to Recycle Bin.\nरसीद "${recNum}" को रीसायकल बिन में स्थानांतरित कर दिया गया है।`);
     } catch (err) {
       console.error('Failed to delete receipt:', err);
       alert('Failed to delete receipt: ' + err.message);
@@ -1321,15 +1883,47 @@ function InvoicesModule({ subOnNavigate, userPermissions, dict, selectedSchool, 
   };
 
   const handleRestoreInvoice = async (invoiceId) => {
-    if (!window.confirm('Restore this receipt back to active records?')) return;
+    const inv = invoices.find(i => i.id === invoiceId);
+    const recNum = inv?.receiptId || inv?.receiptNo || inv?.receiptNumber || invoiceId;
+    const studentName = inv?.student || 'Student';
+
+    const confirmMsg = `Are you sure you want to restore receipt "${recNum}" (${studentName}) back to active records?\nThis will add it back to the student's transaction history and deduct it from their pending due balance.\n\nक्या आप वाकई रसीद "${recNum}" (${studentName}) को वापस सक्रिय रिकॉर्ड में पुनर्स्थापित करना चाहते हैं?\nयह छात्र के लेन-देन इतिहास में वापस आ जाएगी और उनकी बकाया राशि कम हो जाएगी।`;
+
+    if (!window.confirm(confirmMsg)) return;
+
     try {
       await updateDoc(doc(db, 'invoices', invoiceId), {
         deleted: false,
+        status: 'Paid',
         restoredAt: serverTimestamp(),
         restoredBy: currentUser?.email || currentUser?.uid || 'Admin'
       });
-      setInvoices(prev => prev.map(inv => inv.id === invoiceId ? { ...inv, deleted: false } : inv));
-      alert('Receipt restored successfully.');
+
+      try {
+        if (recNum) {
+          const ledgerQ = query(collection(db, 'student_ledger'), where('receiptNumber', '==', recNum));
+          const ledgerSnap = await getDocs(ledgerQ);
+          const updatePromises = ledgerSnap.docs.map(d =>
+            updateDoc(doc(db, 'student_ledger', d.id), {
+              deleted: false,
+              status: 'completed',
+              restoredAt: serverTimestamp(),
+              restoredBy: currentUser?.email || currentUser?.uid || 'Admin'
+            })
+          );
+          await Promise.all(updatePromises);
+        }
+      } catch (ledgerErr) {
+        console.warn('Could not sync restore to student_ledger:', ledgerErr);
+      }
+
+      setInvoices(prev => prev.map(item => item.id === invoiceId ? { ...item, deleted: false, status: 'Paid' } : item));
+
+      window.dispatchEvent(new CustomEvent('receipt_deleted_or_restored', {
+        detail: { invoiceId, receiptNumber: recNum, studentId: inv?.studentId }
+      }));
+
+      alert(`Receipt "${recNum}" restored successfully.\nरसीद "${recNum}" सफलतापूर्वक पुनर्स्थापित कर दी गई है।`);
     } catch (err) {
       console.error('Failed to restore receipt:', err);
       alert('Failed to restore receipt: ' + err.message);
@@ -1338,14 +1932,38 @@ function InvoicesModule({ subOnNavigate, userPermissions, dict, selectedSchool, 
 
   const handlePermanentDeleteInvoice = async (invoiceId) => {
     if (!isOwnerOnly(currentUser)) {
-      alert('Only Owners/Directors can permanently delete records from Recycle Bin.');
+      alert('Only Owners/Directors can permanently delete records from Recycle Bin.\nकेवल मालिक/निदेशक ही रीसायकल बिन से रिकॉर्ड स्थायी रूप से हटा सकते हैं।');
       return;
     }
-    if (!window.confirm('WARNING: This action is PERMANENT and CANNOT be undone.\nAre you sure you want to permanently delete this receipt?')) return;
+    const inv = invoices.find(i => i.id === invoiceId);
+    const recNum = inv?.receiptId || inv?.receiptNo || inv?.receiptNumber || invoiceId;
+    const studentName = inv?.student || 'Student';
+
+    const confirmMsg = `⚠️ WARNING: This action is PERMANENT and CANNOT be undone!\nAre you sure you want to permanently delete receipt "${recNum}" (${studentName})?\n\n⚠️ चेतावनी: यह कार्रवाई स्थायी है और इसे वापस नहीं किया जा सकता!\nक्या आप वाकई रसीद "${recNum}" (${studentName}) को हमेशा के लिए हटाना चाहते हैं?`;
+
+    if (!window.confirm(confirmMsg)) return;
+
     try {
       await deleteDoc(doc(db, 'invoices', invoiceId));
-      setInvoices(prev => prev.filter(inv => inv.id !== invoiceId));
-      alert('Receipt permanently deleted.');
+
+      try {
+        if (recNum) {
+          const ledgerQ = query(collection(db, 'student_ledger'), where('receiptNumber', '==', recNum));
+          const ledgerSnap = await getDocs(ledgerQ);
+          const deletePromises = ledgerSnap.docs.map(d => deleteDoc(doc(db, 'student_ledger', d.id)));
+          await Promise.all(deletePromises);
+        }
+      } catch (ledgerErr) {
+        console.warn('Could not permanently delete from student_ledger:', ledgerErr);
+      }
+
+      setInvoices(prev => prev.filter(item => item.id !== invoiceId));
+
+      window.dispatchEvent(new CustomEvent('receipt_deleted_or_restored', {
+        detail: { invoiceId, receiptNumber: recNum, studentId: inv?.studentId }
+      }));
+
+      alert(`Receipt "${recNum}" permanently deleted.\nरसीद "${recNum}" स्थायी रूप से हटा दी गई है।`);
     } catch (err) {
       console.error('Failed to permanently delete receipt:', err);
       alert('Failed to delete receipt: ' + err.message);
@@ -1801,7 +2419,7 @@ function InvoicesModule({ subOnNavigate, userPermissions, dict, selectedSchool, 
                           <button
                             className="btn-secondary"
                             style={{ padding: '6px 12px', fontSize: 12, display: 'inline-flex', alignItems: 'center', gap: 6 }}
-                            onClick={() => generateFeeReceipt(inv, { name: inv.student, class: inv.class, section: inv.section, id: inv.studentId, contact: inv.contact }, invSchoolName)}
+                            onClick={() => generateFeeReceipt(inv, { name: inv.student, class: inv.class, section: inv.section, id: inv.studentId, contact: inv.contact }, invSchoolName, lang)}
                             title="Print / Download Receipt"
                           >
                             <Printer size={14} /> Print

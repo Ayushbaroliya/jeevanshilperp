@@ -31,6 +31,19 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
   const [selectedClass, setSelectedClass] = useState(null);
   const [selectedSection, setSelectedSection] = useState('All');
   const [isAddingStudent, setIsAddingStudent] = useState(false);
+  const [refreshTrigger, setRefreshTrigger] = useState(0);
+
+  useEffect(() => {
+    const handleReceiptChange = () => {
+      setRefreshTrigger(prev => prev + 1);
+    };
+    window.addEventListener('receipt_deleted_or_restored', handleReceiptChange);
+    window.addEventListener('refresh_financials', handleReceiptChange);
+    return () => {
+      window.removeEventListener('receipt_deleted_or_restored', handleReceiptChange);
+      window.removeEventListener('refresh_financials', handleReceiptChange);
+    };
+  }, []);
   const [studentName, setStudentName] = useState('');
   const [address, setAddress] = useState('');
   const [isTransportApplied, setIsTransportApplied] = useState(false);
@@ -195,9 +208,15 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
             chargeQuery = query(chargeQuery, where('academicYearId', '==', canonicalYearId));
           }
 
+          let invoiceQuery = collection(db, 'invoices');
+          if (selectedSchool && selectedSchool !== 'ALL') {
+            invoiceQuery = query(invoiceQuery, where('schoolId', '==', selectedSchool));
+          }
+
           const queries = [
             getDocs(q),
             getDocs(query(collection(db, 'student_ledger'), where('type', '==', 'credit'))),
+            getDocs(invoiceQuery),
             getDocs(query(collection(db, 'fee_adjustments'), where('status', '==', 'approved'))),
             getDocs(chargeQuery)
           ];
@@ -205,18 +224,72 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
           const results = await Promise.all(queries);
           const querySnapshot = results[0];
           const paymentSnap = results[1];
-          const adjustmentSnap = results[2];
-          const chargesSnap = results[3];
-          
+          const invoiceSnap = results[2];
+          const adjustmentSnap = results[3];
+          const chargesSnap = results[4];
+
+          // 1. Gather all deleted receipt numbers from both collections
+          const deletedReceiptNums = new Set();
+          invoiceSnap.forEach(d => {
+            const data = d.data();
+            const recNum = data.receiptId || data.receiptNo || data.receiptNumber;
+            if (data.deleted || data.isDeleted || data.status === 'deleted') {
+              if (recNum) deletedReceiptNums.add(recNum);
+            }
+          });
+          paymentSnap.forEach(d => {
+            const data = d.data();
+            const recNum = data.receiptNumber || data.receiptId;
+            if (data.deleted || data.isDeleted || data.status === 'deleted') {
+              if (recNum) deletedReceiptNums.add(recNum);
+            }
+          });
+
+          // 2. Build non-deleted payments per student
           const paymentsByStudent = {};
-          paymentSnap.forEach(d => { const p = d.data(); (paymentsByStudent[p.studentId] ||= []).push(p); });
-          
+          const seenReceiptKeys = new Set();
+
+          invoiceSnap.forEach(d => {
+            const data = d.data();
+            const recNum = data.receiptId || data.receiptNo || data.receiptNumber;
+            if (!data.deleted && !data.isDeleted && data.status !== 'deleted' && (!recNum || !deletedReceiptNums.has(recNum))) {
+              if (data.studentId) {
+                (paymentsByStudent[data.studentId] ||= []).push({ id: d.id, ...data });
+                if (recNum) seenReceiptKeys.add(`${data.studentId}_${recNum}`);
+              }
+            }
+          });
+
+          paymentSnap.forEach(d => {
+            const data = d.data();
+            const recNum = data.receiptNumber || data.receiptId;
+            if (!data.deleted && !data.isDeleted && data.status !== 'deleted' && (!recNum || !deletedReceiptNums.has(recNum))) {
+              if (data.studentId) {
+                const key = recNum ? `${data.studentId}_${recNum}` : null;
+                if (!key || !seenReceiptKeys.has(key)) {
+                  (paymentsByStudent[data.studentId] ||= []).push({ id: d.id, ...data });
+                  if (key) seenReceiptKeys.add(key);
+                }
+              }
+            }
+          });
+
           const adjustmentsByStudent = {};
-          adjustmentSnap.forEach(d => { const a = d.data(); (adjustmentsByStudent[a.studentId] ||= []).push(a); });
+          adjustmentSnap.forEach(d => {
+            const a = d.data();
+            if (!a.deleted && !a.isDeleted && a.status === 'approved') {
+              (adjustmentsByStudent[a.studentId] ||= []).push(a);
+            }
+          });
 
           const chargesByStudent = {};
           if (chargesSnap) {
-            chargesSnap.forEach(d => { const c = d.data(); (chargesByStudent[c.studentId] ||= []).push({ id: d.id, ...c }); });
+            chargesSnap.forEach(d => {
+              const c = d.data();
+              if (!c.deleted && !c.isDeleted && c.status !== 'deleted') {
+                (chargesByStudent[c.studentId] ||= []).push({ id: d.id, ...c });
+              }
+            });
           }
 
           const loadedStudents = [];
@@ -258,7 +331,7 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
       };
       fetchStudents();
     }
-  }, [selectedClass, selectedSection, selectedSchool, teacherAssignments, classSettings]);
+  }, [selectedClass, selectedSection, selectedSchool, teacherAssignments, classSettings, refreshTrigger]);
 
   // Filter loaded students by the global top search bar query
   const filteredStudents = searchQuery.trim()
@@ -485,21 +558,78 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
           chargeQuery = query(chargeQuery, where('academicYearId', '==', canonicalYearId));
         }
 
-        const [querySnapshot, paymentSnap, adjustmentSnap, chargeSnap] = await Promise.all([
+        let addInvoiceQuery = collection(db, 'invoices');
+        if (targetSchool && targetSchool !== 'ALL') {
+          addInvoiceQuery = query(addInvoiceQuery, where('schoolId', '==', targetSchool));
+        }
+
+        const [querySnapshot, paymentSnap, invoiceSnap, adjustmentSnap, chargeSnap] = await Promise.all([
           getDocs(q),
           getDocs(query(collection(db, 'student_ledger'), where('type', '==', 'credit'))),
+          getDocs(addInvoiceQuery),
           getDocs(query(collection(db, 'fee_adjustments'), where('status', '==', 'approved'))),
           getDocs(chargeQuery)
         ]);
-        
+
+        const deletedReceiptNums = new Set();
+        invoiceSnap.forEach(d => {
+          const data = d.data();
+          const recNum = data.receiptId || data.receiptNo || data.receiptNumber;
+          if (data.deleted || data.isDeleted || data.status === 'deleted') {
+            if (recNum) deletedReceiptNums.add(recNum);
+          }
+        });
+        paymentSnap.forEach(d => {
+          const data = d.data();
+          const recNum = data.receiptNumber || data.receiptId;
+          if (data.deleted || data.isDeleted || data.status === 'deleted') {
+            if (recNum) deletedReceiptNums.add(recNum);
+          }
+        });
+
         const paymentsByStudent = {};
-        paymentSnap.forEach(d => { const p = d.data(); (paymentsByStudent[p.studentId] ||= []).push(p); });
-        
+        const seenReceiptKeys = new Set();
+
+        invoiceSnap.forEach(d => {
+          const data = d.data();
+          const recNum = data.receiptId || data.receiptNo || data.receiptNumber;
+          if (!data.deleted && !data.isDeleted && data.status !== 'deleted' && (!recNum || !deletedReceiptNums.has(recNum))) {
+            if (data.studentId) {
+              (paymentsByStudent[data.studentId] ||= []).push({ id: d.id, ...data });
+              if (recNum) seenReceiptKeys.add(`${data.studentId}_${recNum}`);
+            }
+          }
+        });
+
+        paymentSnap.forEach(d => {
+          const data = d.data();
+          const recNum = data.receiptNumber || data.receiptId;
+          if (!data.deleted && !data.isDeleted && data.status !== 'deleted' && (!recNum || !deletedReceiptNums.has(recNum))) {
+            if (data.studentId) {
+              const key = recNum ? `${data.studentId}_${recNum}` : null;
+              if (!key || !seenReceiptKeys.has(key)) {
+                (paymentsByStudent[data.studentId] ||= []).push({ id: d.id, ...data });
+                if (key) seenReceiptKeys.add(key);
+              }
+            }
+          }
+        });
+
         const adjustmentsByStudent = {};
-        adjustmentSnap.forEach(d => { const a = d.data(); (adjustmentsByStudent[a.studentId] ||= []).push(a); });
+        adjustmentSnap.forEach(d => {
+          const a = d.data();
+          if (!a.deleted && !a.isDeleted && a.status === 'approved') {
+            (adjustmentsByStudent[a.studentId] ||= []).push(a);
+          }
+        });
 
         const chargesByStudent = {};
-        chargeSnap.forEach(d => { const c = d.data(); (chargesByStudent[c.studentId] ||= []).push({ id: d.id, ...c }); });
+        chargeSnap.forEach(d => {
+          const c = d.data();
+          if (!c.deleted && !c.isDeleted && c.status !== 'deleted') {
+            (chargesByStudent[c.studentId] ||= []).push({ id: d.id, ...c });
+          }
+        });
 
         const loadedStudents = [];
         querySnapshot.forEach((doc) => {
@@ -566,7 +696,8 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
   };
 
   const handleSoftDeleteStudent = async (studentId, name, studentSchool) => {
-    if (window.confirm(`Move student "${name}" to Deleted Students (Recycle Bin)?\n\nThis will safely remove them from active student lists, searches, dropdowns, and class rosters while keeping all historical financial and attendance records intact.`)) {
+    const confirmMsg = `Are you sure you want to move student "${name}" to Deleted Students (Recycle Bin)?\nThis will safely remove them from active student lists, searches, and rosters while keeping historical financial and attendance records intact.\n\nक्या आप वाकई छात्र "${name}" को हटाए गए छात्रों (रीसायकल बिन) में भेजना चाहते हैं?\nयह उन्हें सक्रिय छात्र सूची से हटा देगा, जबकि उनके पिछले रिकॉर्ड सुरक्षित रहेंगे।`;
+    if (window.confirm(confirmMsg)) {
       try {
         await updateDoc(doc(db, "students", studentId), {
           status: 'Deleted',
@@ -597,7 +728,8 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
   };
 
   const handleRestoreStudent = async (student) => {
-    if (window.confirm(`Restore student "${student.name}" back to active records in ${student.class || 'their class'}?`)) {
+    const confirmMsg = `Are you sure you want to restore student "${student.name}" back to active records in ${student.class || "their class"}?\n\nक्या आप वाकई छात्र "${student.name}" को वापस सक्रिय रिकॉर्ड में पुनर्स्थापित करना चाहते हैं?`;
+    if (window.confirm(confirmMsg)) {
       try {
         await updateDoc(doc(db, "students", student.id), {
           status: 'Active',
@@ -634,7 +766,8 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
       return;
     }
 
-    const confirmed = window.confirm("This permanently deletes the student record and cannot be undone. Continue?");
+    const confirmMsg = `⚠️ WARNING: This action is PERMANENT and CANNOT be undone!\nAre you sure you want to permanently delete student "${student.name}" and all their records?\n\n⚠️ चेतावनी: यह कार्रवाई स्थायी है और इसे वापस नहीं किया जा सकता!\nक्या आप वाकई छात्र "${student.name}" का रिकॉर्ड हमेशा के लिए हटाना चाहते हैं?`;
+    const confirmed = window.confirm(confirmMsg);
     if (!confirmed) return;
 
     try {
@@ -931,21 +1064,78 @@ export function StudentsDirectory({ onNavigate, lang, classes, sections, userPer
         where('academicYearId', '==', canonicalYearId)
       );
 
-      const [studentSnap, paymentSnap, adjustmentSnap, chargesSnap] = await Promise.all([
+      let exportInvoiceQuery = collection(db, 'invoices');
+      if (selectedSchool && selectedSchool !== 'ALL') {
+        exportInvoiceQuery = query(exportInvoiceQuery, where('schoolId', '==', selectedSchool));
+      }
+
+      const [studentSnap, paymentSnap, invoiceSnap, adjustmentSnap, chargesSnap] = await Promise.all([
         getDocs(studentQ),
         getDocs(query(collection(db, 'student_ledger'), where('type', '==', 'credit'))),
+        getDocs(exportInvoiceQuery),
         getDocs(query(collection(db, 'fee_adjustments'), where('status', '==', 'approved'))),
         getDocs(chargeQ)
       ]);
 
+      const deletedReceiptNums = new Set();
+      invoiceSnap.forEach(d => {
+        const data = d.data();
+        const recNum = data.receiptId || data.receiptNo || data.receiptNumber;
+        if (data.deleted || data.isDeleted || data.status === 'deleted') {
+          if (recNum) deletedReceiptNums.add(recNum);
+        }
+      });
+      paymentSnap.forEach(d => {
+        const data = d.data();
+        const recNum = data.receiptNumber || data.receiptId;
+        if (data.deleted || data.isDeleted || data.status === 'deleted') {
+          if (recNum) deletedReceiptNums.add(recNum);
+        }
+      });
+
       const paymentsByStudent = {};
-      paymentSnap.forEach(d => { const p = d.data(); (paymentsByStudent[p.studentId] ||= []).push(p); });
+      const seenReceiptKeys = new Set();
+
+      invoiceSnap.forEach(d => {
+        const data = d.data();
+        const recNum = data.receiptId || data.receiptNo || data.receiptNumber;
+        if (!data.deleted && !data.isDeleted && data.status !== 'deleted' && (!recNum || !deletedReceiptNums.has(recNum))) {
+          if (data.studentId) {
+            (paymentsByStudent[data.studentId] ||= []).push({ id: d.id, ...data });
+            if (recNum) seenReceiptKeys.add(`${data.studentId}_${recNum}`);
+          }
+        }
+      });
+
+      paymentSnap.forEach(d => {
+        const data = d.data();
+        const recNum = data.receiptNumber || data.receiptId;
+        if (!data.deleted && !data.isDeleted && data.status !== 'deleted' && (!recNum || !deletedReceiptNums.has(recNum))) {
+          if (data.studentId) {
+            const key = recNum ? `${data.studentId}_${recNum}` : null;
+            if (!key || !seenReceiptKeys.has(key)) {
+              (paymentsByStudent[data.studentId] ||= []).push({ id: d.id, ...data });
+              if (key) seenReceiptKeys.add(key);
+            }
+          }
+        }
+      });
 
       const adjustmentsByStudent = {};
-      adjustmentSnap.forEach(d => { const a = d.data(); (adjustmentsByStudent[a.studentId] ||= []).push(a); });
+      adjustmentSnap.forEach(d => {
+        const a = d.data();
+        if (!a.deleted && !a.isDeleted && a.status === 'approved') {
+          (adjustmentsByStudent[a.studentId] ||= []).push(a);
+        }
+      });
 
       const chargesByStudent = {};
-      chargesSnap.forEach(d => { const c = d.data(); (chargesByStudent[c.studentId] ||= []).push({ id: d.id, ...c }); });
+      chargesSnap.forEach(d => {
+        const c = d.data();
+        if (!c.deleted && !c.isDeleted && c.status !== 'deleted') {
+          (chargesByStudent[c.studentId] ||= []).push({ id: d.id, ...c });
+        }
+      });
 
       const allActiveStudents = [];
       studentSnap.forEach(docSnap => {
@@ -1847,29 +2037,91 @@ export function StudentLedger({ onNavigate, lang = 'en', activeStudent, userPerm
   const [calendarDays, setCalendarDays] = useState([]);
   const [selectedExamView, setSelectedExamView] = useState('Quarterly');
   const examOptions = ['Quarterly', 'Half Yearly', 'Final Exam'];
+  const [financialsRefreshTrigger, setFinancialsRefreshTrigger] = useState(0);
+
+  useEffect(() => {
+    const handleReceiptChange = () => {
+      setFinancialsRefreshTrigger(c => c + 1);
+    };
+    window.addEventListener('receipt_deleted_or_restored', handleReceiptChange);
+    window.addEventListener('refresh_financials', handleReceiptChange);
+    return () => {
+      window.removeEventListener('receipt_deleted_or_restored', handleReceiptChange);
+      window.removeEventListener('refresh_financials', handleReceiptChange);
+    };
+  }, []);
 
   
-    const handleDeleteReceipt = async (inv) => {
-    if (window.confirm(`Move receipt ${inv.receiptId || inv.receiptNo || ''} to Recycle Bin?`)) {
-      try {
-        if (inv.id && !inv.id.startsWith('WAIVER')) {
+  const handleDeleteReceipt = async (inv) => {
+    if (!inv) return;
+    const recNum = inv.receiptId || inv.receiptNo || inv.receiptNumber || inv.id || '';
+    const confirmMsg = `Are you sure you want to move receipt "${recNum}" to the Recycle Bin?\nThis will remove it from the student's transaction history and restore their pending due balance.\n\nक्या आप वाकई रसीद "${recNum}" को रीसायकल बिन में भेजना चाहते हैं?\nयह छात्र के लेन-देन इतिहास से हट जाएगी और उनकी बकाया राशि पुनः जुड़ जाएगी।`;
+
+    if (!window.confirm(confirmMsg)) return;
+
+    try {
+      if (inv.id && !inv.id.startsWith('WAIVER')) {
+        try {
           await updateDoc(doc(db, 'invoices', inv.id), {
             deleted: true,
+            status: 'deleted',
             deletedAt: serverTimestamp(),
-            deletedBy: currentUser?.email || currentUser?.uid || 'Unknown'
+            deletedBy: currentUser?.email || currentUser?.uid || 'Admin'
           });
+        } catch (e) {
+          console.warn('Could not update invoices doc directly:', e);
         }
-        alert(`Receipt moved to Recycle Bin.`);
-        setPaymentHistory(prev => prev.filter(p => p.id !== inv.id));
-      } catch (err) {
-        console.error(err);
-        alert('Error deleting receipt: ' + err.message);
       }
+
+      if (recNum) {
+        try {
+          const ledgerQ = query(collection(db, 'student_ledger'), where('receiptNumber', '==', recNum));
+          const ledgerSnap = await getDocs(ledgerQ);
+          const updatePromises = ledgerSnap.docs.map(d =>
+            updateDoc(doc(db, 'student_ledger', d.id), {
+              deleted: true,
+              status: 'deleted',
+              deletedAt: serverTimestamp(),
+              deletedBy: currentUser?.email || currentUser?.uid || 'Admin'
+            })
+          );
+          await Promise.all(updatePromises);
+        } catch (ledgerErr) {
+          console.warn('Could not sync delete to student_ledger:', ledgerErr);
+        }
+
+        try {
+          const invByIdQ = query(collection(db, 'invoices'), where('receiptId', '==', recNum));
+          const invByIdSnap = await getDocs(invByIdQ);
+          const invPromises = invByIdSnap.docs.map(d =>
+            updateDoc(doc(db, 'invoices', d.id), {
+              deleted: true,
+              status: 'deleted',
+              deletedAt: serverTimestamp(),
+              deletedBy: currentUser?.email || currentUser?.uid || 'Admin'
+            })
+          );
+          await Promise.all(invPromises);
+        } catch (e) {}
+      }
+
+      window.dispatchEvent(new CustomEvent('receipt_deleted_or_restored', {
+        detail: { receiptNumber: recNum, studentId: activeStudent?.id }
+      }));
+
+      setFinancialsRefreshTrigger(prev => prev + 1);
+
+      alert(`Receipt "${recNum}" moved to Recycle Bin.\nरसीद "${recNum}" को रीसायकल बिन में स्थानांतरित कर दिया गया है।`);
+    } catch (err) {
+      console.error(err);
+      alert('Error deleting receipt: ' + err.message);
     }
   };
-const handleProfileDelete = async () => {
+
+  const handleProfileDelete = async () => {
     if (!activeStudent?.id) return;
-    if (window.confirm(`Move student "${studentName}" to Deleted Students (Recycle Bin)?\n\nThis will safely remove them from active student lists and fee rosters while preserving all historical payment receipts and attendance records.`)) {
+    const confirmMsg = `Are you sure you want to move student "${studentName}" to Deleted Students (Recycle Bin)?\nThis will safely remove them from active student lists and fee rosters while preserving all historical payment receipts and attendance records.\n\nक्या आप वाकई छात्र "${studentName}" को हटाए गए छात्रों (रीसायकल बिन) में भेजना चाहते हैं?\nयह उन्हें सक्रिय छात्र सूची से हटा देगा, जबकि उनके पिछले सभी रिकॉर्ड सुरक्षित रहेंगे।`;
+    if (window.confirm(confirmMsg)) {
       try {
         await updateDoc(doc(db, "students", activeStudent.id), {
           status: 'Deleted',
@@ -1985,24 +2237,6 @@ const handleProfileDelete = async () => {
   // ── Fetch financial data (invoices / payments) ─────────────────
   useEffect(() => {
     if (!activeStudent?.id) return;
-      const handleSoftDeleteInvoice = async (invoiceId) => {
-    if (!invoiceId) return;
-    if (!window.confirm('Are you sure you want to delete this receipt? It will be moved to the Recycle Bin.')) return;
-    try {
-      await updateDoc(doc(db, 'invoices', invoiceId), {
-        deleted: true,
-        deletedAt: serverTimestamp(),
-        deletedBy: currentUser?.email || currentUser?.uid || 'Unknown'
-      });
-      alert('Receipt moved to Recycle Bin.');
-      // Refresh financials
-      const fetchEvent = new Event('refresh_financials');
-      window.dispatchEvent(fetchEvent);
-    } catch (err) {
-      console.error('Failed to delete receipt:', err);
-      alert('Failed to delete receipt.');
-    }
-  };
 
     const fetchFinancials = async () => {
       try {
@@ -2010,29 +2244,77 @@ const handleProfileDelete = async () => {
         if (activeStudent.schoolId) {
           invoiceQ = query(invoiceQ, where('schoolId', '==', activeStudent.schoolId));
         }
-        const snap = await getDocs(invoiceQ);
-        let invoices = snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(inv => !inv.deleted);
 
-        // Fallback: If no invoices found in invoices collection, check student_ledger for credit transactions
-        if (invoices.length === 0) {
-          let ledgerQ = query(collection(db, 'student_ledger'), where('studentId', '==', activeStudent.id), where('type', '==', 'credit'));
-          if (activeStudent.schoolId) {
-            ledgerQ = query(ledgerQ, where('schoolId', '==', activeStudent.schoolId));
-          }
-          const ledgerSnap = await getDocs(ledgerQ);
-          invoices = ledgerSnap.docs.map(d => {
-            const data = d.data();
-            return {
-              id: d.id,
-              receiptNo: data.receiptNumber || data.receiptId || d.id.slice(0, 10),
-              receiptId: data.receiptNumber || data.receiptId || d.id.slice(0, 10),
-              amount: data.amount,
-              date: data.date,
-              status: 'Paid',
-              allocations: data.allocations || []
-            };
-          });
+        let ledgerQ = query(collection(db, 'student_ledger'), where('studentId', '==', activeStudent.id), where('type', '==', 'credit'));
+        if (activeStudent.schoolId) {
+          ledgerQ = query(ledgerQ, where('schoolId', '==', activeStudent.schoolId));
         }
+
+        const [snap, ledgerSnap] = await Promise.all([
+          getDocs(invoiceQ),
+          getDocs(ledgerQ)
+        ]);
+
+        // 1. Gather all deleted receipt numbers
+        const deletedReceiptNums = new Set();
+        snap.docs.forEach(d => {
+          const dt = d.data();
+          const recNum = dt.receiptId || dt.receiptNo || dt.receiptNumber;
+          if (dt.deleted || dt.isDeleted || dt.status === 'deleted') {
+            if (recNum) deletedReceiptNums.add(recNum);
+          }
+        });
+        ledgerSnap.docs.forEach(d => {
+          const dt = d.data();
+          const recNum = dt.receiptNumber || dt.receiptId;
+          if (dt.deleted || dt.isDeleted || dt.status === 'deleted') {
+            if (recNum) deletedReceiptNums.add(recNum);
+          }
+        });
+
+        // 2. Gather non-deleted invoices and non-deleted ledger credits
+        const activeInvoices = [];
+        const seenReceiptKeys = new Set();
+
+        snap.docs.forEach(d => {
+          const dt = d.data();
+          const recNum = dt.receiptId || dt.receiptNo || dt.receiptNumber;
+          if (!dt.deleted && !dt.isDeleted && dt.status !== 'deleted' && (!recNum || !deletedReceiptNums.has(recNum))) {
+            activeInvoices.push({
+              id: d.id,
+              ...dt,
+              receiptNo: recNum || d.id.slice(0, 10),
+              receiptId: recNum || d.id.slice(0, 10),
+              amount: dt.amount,
+              date: dt.date,
+              status: dt.status || 'Paid',
+              allocations: dt.allocations || []
+            });
+            if (recNum) seenReceiptKeys.add(recNum);
+          }
+        });
+
+        ledgerSnap.docs.forEach(d => {
+          const dt = d.data();
+          const recNum = dt.receiptNumber || dt.receiptId;
+          if (!dt.deleted && !dt.isDeleted && dt.status !== 'deleted' && (!recNum || !deletedReceiptNums.has(recNum))) {
+            if (!recNum || !seenReceiptKeys.has(recNum)) {
+              activeInvoices.push({
+                id: d.id,
+                ...dt,
+                receiptNo: recNum || d.id.slice(0, 10),
+                receiptId: recNum || d.id.slice(0, 10),
+                amount: dt.amount,
+                date: dt.date,
+                status: 'Paid',
+                allocations: dt.allocations || []
+              });
+              if (recNum) seenReceiptKeys.add(recNum);
+            }
+          }
+        });
+
+        let invoices = activeInvoices;
 
         // Fetch fee adjustments (waivers) to include in the ledger history
         let adjustmentQ = query(collection(db, 'fee_adjustments'), where('studentId', '==', activeStudent.id), where('status', '==', 'approved'));
@@ -2044,7 +2326,7 @@ const handleProfileDelete = async () => {
           getDocs(query(collection(db, 'fee_charges'), where('studentId', '==', activeStudent.id)))
         ]);
 
-        const rawAdjustments = adjSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+        const rawAdjustments = adjSnap.docs.map(d => ({ id: d.id, ...d.data() })).filter(a => !a.deleted && !a.isDeleted && a.status === 'approved');
         const adjustments = rawAdjustments.map(data => ({
           id: data.id,
           date: data.createdAt || data.date,
@@ -2067,12 +2349,12 @@ const handleProfileDelete = async () => {
         setTotalPaid(paid);
         setPaymentHistory(combinedHistory);
 
-        const dbCharges = chargeSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+        const dbCharges = chargeSnap.docs.map(d => ({ id: d.id, ...d.data() })).filter(c => !c.deleted && !c.isDeleted && c.status !== 'deleted');
 
         if (dbCharges.length > 0) {
           const res = applyPaymentsAndAdjustments(dbCharges, invoices, rawAdjustments);
           const summary = summarizeDues(activeStudent, res.ledger, res.advanceCredit);
-          
+
           setLiveDue(summary.totalDue);
           setTotalPaid(summary.totalPaid);
           setWalletBalance(summary.advanceCredit);
@@ -2132,7 +2414,7 @@ const handleProfileDelete = async () => {
       }
     };
     fetchFinancials();
-  }, [activeStudent?.id, activeStudent?.schoolId]);
+  }, [activeStudent?.id, activeStudent?.schoolId, financialsRefreshTrigger]);
 
   // ── Calendar data for modal ────────────────────────────────────
   useEffect(() => {

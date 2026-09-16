@@ -32,29 +32,183 @@ export const isAdmissionCharge = (c) => {
   return false;
 };
 
+export const isTransportCharge = (c) => {
+  if (!c) return false;
+  if (c.componentId === 'transport') return true;
+  const label = (c.label || '').toLowerCase();
+  const id = (c.id || '').toLowerCase();
+  return label.includes('transport') || id.includes('transport') || label.includes('परिवहन');
+};
+
+export const parseChargeDueDate = (dateStr) => {
+  if (!dateStr) return 0;
+  // Handle formats like AY_2026_27-07-10 or 2026-07-10
+  const clean = String(dateStr).replace(/^AY_\d{4}_\d{2,4}-/, '2026-');
+  const t = new Date(clean).getTime();
+  return isNaN(t) ? 0 : t;
+};
+
+export const getChargeCanonicalRank = (c) => {
+  if (!c) return 999;
+  const isTransport = isTransportCharge(c);
+  const label = (c.label || '').toLowerCase();
+  const isPenalty = c.type === 'penalty' || label.includes('late fee') || label.includes('विलंब शुल्क');
+  const isArrears = c.type === 'arrears' || label.includes('arrears') || label.includes('previous year');
+
+  if (!isTransport) {
+    // ── ACADEMIC GROUP ──
+    // 1. Admission Fee ALWAYS on top
+    if (isAdmissionCharge(c)) return 10;
+    // 2. Arrears / Previous Year
+    if (isArrears) return 20;
+
+    const isExam = c.componentId === 'exam' || label.includes('exam') || label.includes('परीक्षा');
+
+    // 3. July Installment / First Installment
+    if (!isExam && (label.includes('july') || label.includes('1st installment') || label.includes('first installment') || String(c.dueDate).includes('-07-'))) {
+      return isPenalty ? 115 : 110;
+    }
+
+    // 4. Second Installment / October (or legacy September)
+    if (!isExam && (label.includes('october') || label.includes('अक्टूबर') || label.includes('september') || label.includes('2nd installment') || label.includes('second installment') || String(c.dueDate).includes('-10-') || String(c.dueDate).includes('-09-'))) {
+      return isPenalty ? 125 : 120;
+    }
+
+    // 5. Examination Fee (Systematically placed between second and third installment)
+    if (isExam) {
+      return isPenalty ? 135 : 130;
+    }
+
+    // 6. Third Installment / December
+    if (label.includes('december') || label.includes('दिसंबर') || label.includes('3rd installment') || label.includes('third installment') || String(c.dueDate).includes('-12-')) {
+      return isPenalty ? 145 : 140;
+    }
+
+    // 7. Other Academic Charges
+    if (isPenalty) return 190;
+    return 150;
+  } else {
+    // ── TRANSPORT GROUP ──
+    // 1. 1st Installment
+    if (label.includes('1st installment') || label.includes('first installment') || label.includes('july') || String(c.dueDate).includes('-07-')) {
+      return isPenalty ? 215 : 210;
+    }
+    // 2. 2nd Installment
+    if (label.includes('2nd installment') || label.includes('second installment') || label.includes('october') || String(c.dueDate).includes('-10-')) {
+      return isPenalty ? 225 : 220;
+    }
+    // 3. 3rd Installment
+    if (label.includes('3rd installment') || label.includes('third installment') || label.includes('december') || String(c.dueDate).includes('-12-')) {
+      return isPenalty ? 235 : 230;
+    }
+    if (isPenalty) return 290;
+    return 250;
+  }
+};
+
+export function getCleanFeeLabel(label, lang = 'en', componentId = '') {
+  if (!label) return '';
+  const isHi = lang === 'hi';
+  const lower = String(label).toLowerCase();
+
+  // 1. Admission Fee
+  if (lower.includes('admission') || componentId === 'admission') {
+    return isHi ? 'प्रवेश शुल्क (एकमुश्त)' : 'Admission Fee (One Time)';
+  }
+
+  // 2. Late Fee / Penalty
+  if (lower.includes('late fee') || lower.includes('विलंब')) {
+    if (lower.includes('october') || lower.includes('अक्टूबर') || lower.includes('september')) {
+      return isHi ? 'विलंब शुल्क (अक्टूबर)' : 'Late Fee (October)';
+    }
+    if (lower.includes('december') || lower.includes('दिसंबर')) {
+      return isHi ? 'विलंब शुल्क (दिसंबर)' : 'Late Fee (December)';
+    }
+    return isHi ? 'विलंब शुल्क' : 'Late Fee';
+  }
+
+  // 3. Exam Fee
+  if (lower.includes('exam') || lower.includes('परीक्षा') || componentId === 'exam') {
+    if (lower.includes('december') || lower.includes('दिसंबर')) {
+      return isHi ? 'परीक्षा शुल्क - दिसंबर' : 'Examination Fee - December';
+    }
+    return isHi ? 'परीक्षा शुल्क' : 'Examination Fee';
+  }
+
+  // 4. Advance Payment
+  if (lower.includes('advance') || componentId === 'advance') {
+    return isHi ? 'अग्रिम भुगतान' : 'Advance Payment';
+  }
+
+  // 5. Transport Fee
+  if (lower.includes('transport') || componentId === 'transport' || lower.includes('परिवहन')) {
+    let instNumber = '';
+    if (lower.includes('1st') || lower.includes('first')) instNumber = '1';
+    else if (lower.includes('2nd') || lower.includes('second')) instNumber = '2';
+    else if (lower.includes('3rd') || lower.includes('third')) instNumber = '3';
+
+    const match = label.match(/Transport Fee \((.*)\) -/i);
+    let routeName = match ? match[1].trim() : '';
+
+    if (routeName) {
+      if (isHi && typeof TRANSPORT_ROUTES !== 'undefined' && TRANSPORT_ROUTES) {
+        const allRoutes = [...(TRANSPORT_ROUTES.SCH_01 || []), ...(TRANSPORT_ROUTES.SCH_03 || [])];
+        const found = allRoutes.find(r => r.name === routeName || r.nameEn === routeName);
+        if (found && found.nameHi) {
+          routeName = found.nameHi;
+        }
+      }
+      if (instNumber) {
+        return isHi 
+          ? `परिवहन शुल्क (${routeName}) - किस्त ${instNumber}` 
+          : `Transport Fee (${routeName}) - Installment ${instNumber}`;
+      }
+      return isHi ? `परिवहन शुल्क (${routeName})` : `Transport Fee (${routeName})`;
+    }
+
+    if (instNumber) {
+      return isHi ? `परिवहन शुल्क - किस्त ${instNumber}` : `Transport Fee - Installment ${instNumber}`;
+    }
+    return isHi ? 'परिवहन शुल्क' : 'Transport Fee';
+  }
+
+  // 6. Tuition Installments
+  if (lower.includes('tuition') || componentId === 'tuition' || (!lower.includes('transport') && !lower.includes('exam'))) {
+    if (lower.includes('july') || lower.includes('जुलाई') || lower.includes('1st installment') || lower.includes('first installment')) {
+      return isHi ? 'शिक्षण शुल्क - जुलाई किस्त' : 'Tuition Fee - July Installment';
+    }
+    if (lower.includes('october') || lower.includes('अक्टूबर') || lower.includes('september') || lower.includes('2nd installment') || lower.includes('second installment')) {
+      return isHi ? 'शिक्षण शुल्क - अक्टूबर किस्त' : 'Tuition Fee - October Installment';
+    }
+    if (lower.includes('december') || lower.includes('दिसंबर') || lower.includes('3rd installment') || lower.includes('third installment')) {
+      return isHi ? 'शिक्षण शुल्क - दिसंबर किस्त' : 'Tuition Fee - December Installment';
+    }
+  }
+
+  // Generic fallback if label has a slash 'English / Hindi':
+  if (label.includes(' / ')) {
+    const parts = label.split(' / ');
+    if (isHi && parts[1]) return parts[1].trim();
+    if (!isHi && parts[0]) return parts[0].trim();
+  }
+
+  return label;
+}
+
 export const sortLedgerCharges = (list) => {
   if (!Array.isArray(list)) return [];
   return [...list].sort((a, b) => {
-    // 1. Admission Fee ALWAYS on top (even when added to existing students)
-    const aAdm = isAdmissionCharge(a);
-    const bAdm = isAdmissionCharge(b);
-    if (aAdm && !bAdm) return -1;
-    if (!aAdm && bAdm) return 1;
+    // 1. Canonical rank (groups Academic first in requested order, then Transport in requested order)
+    const rankA = getChargeCanonicalRank(a);
+    const rankB = getChargeCanonicalRank(b);
+    if (rankA !== rankB) return rankA - rankB;
 
-    // 2. Previous Year Due (arrears)
-    if (a.type === 'arrears' && b.type !== 'arrears') return -1;
-    if (b.type === 'arrears' && a.type !== 'arrears') return 1;
+    // 2. Oldest charge by sanitized dueDate
+    const timeA = parseChargeDueDate(a.dueDate);
+    const timeB = parseChargeDueDate(b.dueDate);
+    if (timeA !== timeB && timeA > 0 && timeB > 0) return timeA - timeB;
 
-    // 3. Oldest charge by dueDate
-    const timeA = new Date(a.dueDate).getTime();
-    const timeB = new Date(b.dueDate).getTime();
-    if (!isNaN(timeA) && !isNaN(timeB) && timeA !== timeB) return timeA - timeB;
-
-    // 4. Penalties (Late Fees) last
-    if (a.type === 'penalty' && b.type !== 'penalty') return 1;
-    if (b.type === 'penalty' && a.type !== 'penalty') return -1;
-
-    // 5. Lexical tiebreak
+    // 3. Lexical tiebreak
     return (a.id || '').localeCompare(b.id || '');
   });
 };
@@ -204,6 +358,7 @@ export function applyPaymentsAndAdjustments(charges, payments = [], adjustments 
 
   // Apply fee adjustments (concessions / waivers) first
   for (const adj of adjustments) {
+    if (adj.deleted || adj.isDeleted || adj.status === 'deleted') continue;
     if (adj.chargeId) {
       const target = ledger.find(c => c.id === adj.chargeId);
       if (target && target.netDue > 0) {
@@ -221,32 +376,72 @@ export function applyPaymentsAndAdjustments(charges, payments = [], adjustments 
   );
 
   for (const payment of sortedPayments) {
-    let remaining = Number(payment.amount);
-    if (remaining <= 0) continue;
+    if (payment.deleted || payment.isDeleted || payment.status === 'deleted') continue;
+    const paymentAmt = Number(payment.amount);
+    if (isNaN(paymentAmt) || paymentAmt <= 0) continue;
 
-    ledger = sortLedgerCharges(ledger);
+    const hasAuthoritativeAllocations = Array.isArray(payment.allocations) && payment.allocations.length > 0;
 
-    for (const charge of ledger) {
-      if (remaining <= 0) break;
-      if (charge.netDue <= 0) continue;
+    if (hasAuthoritativeAllocations) {
+      // ── Authoritative Charge-Level Allocations ──
+      // CRITICAL SAFETY: Treat allocations as authoritative. NEVER silently re-waterfall.
+      for (const alloc of payment.allocations) {
+        const allocAmt = Number(alloc.amount);
+        if (isNaN(allocAmt) || allocAmt <= 0) continue;
 
-      const allocate = Math.min(charge.netDue, remaining);
-      charge.allocatedPaid += allocate;
-      charge.netDue -= allocate;
-      remaining -= allocate;
+        if (alloc.chargeId === 'advance') {
+          advanceCredit += allocAmt;
+          allAllocations.push({
+            paymentId: payment.id,
+            chargeId: 'advance',
+            amount: allocAmt,
+            componentId: 'advance'
+          });
+          continue;
+        }
 
-      updateChargeStatus(charge);
+        const target = ledger.find(c => c.id === alloc.chargeId);
+        if (target) {
+          const allocate = Math.min(target.netDue, allocAmt);
+          target.allocatedPaid += allocate;
+          target.netDue -= allocate;
+          updateChargeStatus(target);
 
-      allAllocations.push({
-        paymentId: payment.id,
-        chargeId: charge.id,
-        amount: allocate,
-        componentId: charge.componentId
-      });
-    }
+          allAllocations.push({
+            paymentId: payment.id,
+            chargeId: target.id,
+            amount: allocate,
+            componentId: target.componentId
+          });
+        }
+      }
+    } else {
+      // ── Legacy Waterfall Fallback (ONLY for historical payments without allocations) ──
+      let remaining = paymentAmt;
+      ledger = sortLedgerCharges(ledger);
 
-    if (remaining > 0) {
-      advanceCredit += remaining;
+      for (const charge of ledger) {
+        if (remaining <= 0) break;
+        if (charge.netDue <= 0) continue;
+
+        const allocate = Math.min(charge.netDue, remaining);
+        charge.allocatedPaid += allocate;
+        charge.netDue -= allocate;
+        remaining -= allocate;
+
+        updateChargeStatus(charge);
+
+        allAllocations.push({
+          paymentId: payment.id,
+          chargeId: charge.id,
+          amount: allocate,
+          componentId: charge.componentId
+        });
+      }
+
+      if (remaining > 0) {
+        advanceCredit += remaining;
+      }
     }
   }
 
